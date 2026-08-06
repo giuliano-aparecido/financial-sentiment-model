@@ -59,6 +59,11 @@ DIRECTION_RE = re.compile(r'"direction"\s*:\s*"(BULLISH|BEARISH|NEUTRAL)"')
 EVAL_SAMPLE_PER_SOURCE = 100
 VAL_FILES = {"synthetic": "dataset_val.jsonl", "real": "dataset_val_real.jsonl"}
 
+# How many full generations to keep and print per (source, expected,
+# predicted) wrong-answer combination - see evaluate_model.py's comment
+# above the same constant for why.
+SAMPLE_MISCLASSIFICATIONS_PER_PAIR = 3
+
 random.seed(42)
 eval_rows = []
 for source, path in VAL_FILES.items():
@@ -106,6 +111,7 @@ def is_valid_json(text):
 def run_eval(label):
     per_source = {s: {"total": 0, "correct": 0, "json_ok": 0} for s in VAL_FILES}
     confusion = {s: {} for s in VAL_FILES}  # source -> (expected, predicted-or-None) -> count
+    samples = {s: {} for s in VAL_FILES}  # source -> (expected, predicted-or-None) -> [(row, raw_text), ...]
 
     for i, row in enumerate(eval_rows, 1):
         text = generate_response(row)
@@ -116,9 +122,15 @@ def run_eval(label):
 
         stats = per_source[source]
         stats["total"] += 1
-        stats["correct"] += (pred == exp)
+        is_correct = (pred == exp)
+        stats["correct"] += is_correct
         stats["json_ok"] += is_valid_json(text)
         confusion[source][(exp, pred)] = confusion[source].get((exp, pred), 0) + 1
+
+        if not is_correct:
+            bucket = samples[source].setdefault((exp, pred), [])
+            if len(bucket) < SAMPLE_MISCLASSIFICATIONS_PER_PAIR:
+                bucket.append((row, text))
 
         if i % 20 == 0:
             done_correct = sum(s["correct"] for s in per_source.values())
@@ -139,6 +151,16 @@ def run_eval(label):
         print(f"Confusion for {source} (expected -> predicted: count):")
         for (exp, pred), count in sorted(source_confusion.items()):
             print(f"  {exp:<8} -> {pred or 'UNPARSEABLE':<12} {count}")
+    print()
+
+    print(f"----- Sample misclassifications for {label} (up to {SAMPLE_MISCLASSIFICATIONS_PER_PAIR} per source/expected/predicted) -----")
+    for source, source_samples in samples.items():
+        for (exp, pred), rows in sorted(source_samples.items()):
+            for row, text in rows:
+                print(f"\n[{source}] expected {exp} -> predicted {pred or 'UNPARSEABLE'} | ticker={row['ticker']}")
+                print(f"User Question: {row['user_query']}")
+                print(f"News:\n{row['news']}")
+                print(f"Model output:\n{text}")
     print()
     return per_source
 
