@@ -12,9 +12,10 @@ practice of doing it properly, not because it needs to scale.
 ## What this produces
 
 A LoRA-fine-tuned instruction model (Llama 3.2 3B by default; a few other
-open models are supported via `MODEL_REGISTRY` in `train_model.py`) that
-reads a stock ticker, an optional user question, and a block of recent news
-headlines, and outputs structured JSON:
+open models are supported via `MODEL_REGISTRY` in `gpu/train_model.py` /
+`tpu/train_model.py`) that reads a stock ticker, an optional user
+question, and a block of recent news headlines, and outputs structured
+JSON:
 
 ```json
 {
@@ -36,10 +37,14 @@ needs a matching change.
 
 ## Pipeline (run each of these as its own Colab cell, in order)
 
+Steps 1-3 are hardware-agnostic and identical either way. Steps 4-5 branch
+depending on which free Colab accelerator you're using — pick **one** of
+`gpu/` or `tpu/`, not both, for a given training run.
+
 1. **`!pip install -q yfinance httpx feedparser`** — dependencies for the
-   real-data generator (step 3). `train_model.py` installs its own
-   dependencies (`unsloth`, `trl`, `peft`, `accelerate`, `bitsandbytes`) at
-   the top of that file, so nothing extra is needed for steps 4-5.
+   real-data generator (step 3). The training script for whichever
+   accelerator you pick installs its own dependencies at the top of that
+   file, so nothing extra is needed for steps 4-5.
 2. **`generate_synthetic_dataset.py`** — offline, deterministic, no
    dependencies beyond the standard library. Writes `dataset_train.jsonl` /
    `dataset_val.jsonl`. Takes a few seconds.
@@ -51,20 +56,51 @@ needs a matching change.
    and noticeably slower than step 2 — expect several minutes given the
    number of tickers and historical windows it scans; this is expected, not
    a hang.
-4. **`train_model.py`** — loads the base model, adds a LoRA adapter, mixes
-   both datasets from steps 2-3, fine-tunes with early stopping, and pushes
-   the merged result to your Hugging Face account.
-5. **`evaluate_model.py`** — must run in the **same Colab session**
+4. **`gpu/train_model.py`** (T4) or **`tpu/train_model.py`** (v5e-1) —
+   loads the base model, adds a LoRA adapter, mixes both datasets from
+   steps 2-3, fine-tunes with early stopping, and pushes the result to
+   your Hugging Face account.
+5. **`gpu/evaluate_model.py`** or **`tpu/evaluate_model.py`** (match
+   whichever you used for step 4) — must run in the **same Colab session**
    immediately after step 4 (it reuses `model`/`tokenizer`/`alpaca_prompt`
    still in memory). Reports direction accuracy — not loss, see
    `docs/training-results-analysis.md` for why that distinction matters —
    split by dataset source and by class, plus a base-model (untrained)
    comparison so you know how much the fine-tune actually helped.
 
-`evaluate_base_model_only.py` is a standalone fallback: if you need just
-the base-model comparison on its own (e.g. the tuned pass already ran in an
-earlier session), it reloads the pushed model straight from Hugging Face
-rather than requiring the training cell's variables still in memory.
+`evaluate_base_model_only.py` (in the matching `gpu/` or `tpu/` directory)
+is a standalone fallback: if you need just the base-model comparison on
+its own (e.g. the tuned pass already ran in an earlier session), it
+reloads the pushed model straight from Hugging Face rather than requiring
+the training cell's variables still in memory.
+
+### GPU (`gpu/`) vs TPU (`tpu/`)
+
+The two paths are **not** just a device-name swap. `unsloth` (fast LoRA
+loading/training) and `bitsandbytes` (4-bit quantization) are both
+CUDA-only — Colab's free TPU v5e-1 tier has no support for either, so
+`tpu/`'s scripts are a separate implementation on plain `transformers` +
+`peft` + `trl`, training in bf16 with no quantization instead.
+
+Practical consequences:
+
+- `tpu/`'s `MODEL_REGISTRY` only has working entries for `llama-3.2-3b`
+  and `apertus-0.5b` — the default `llama-3.2-3b` repo is swapped to a
+  non-quantized bf16 mirror. `apertus-8b`, `qwen-2.5-7b`, and `mistral-7b`
+  are listed but blocked with a clear error if selected: bf16 with no
+  quantization makes 7B/8B a tight-to-unsafe fit on a single v5e-1's 16GB
+  HBM, and qwen/mistral have no confirmed non-quantized mirror.
+- `tpu/train_model.py` installs no `unsloth`/`bitsandbytes` — just
+  `transformers peft trl accelerate datasets` (plus whatever `torch_xla`
+  build Colab's TPU runtime already ships).
+- Both paths push an **adapter-only** model to the same naming scheme
+  (`{HF_USER}/{model}-financial-reasoner-v3`), except the TPU path adds a
+  `-tpu` suffix so a TPU run never overwrites a GPU-trained adapter at the
+  same name, or vice versa.
+- The TPU path hasn't been run end-to-end on real TPU hardware yet — the
+  GPU path is the proven one. If you hit an issue running `tpu/`'s
+  scripts, that's expected first-run friction, not necessarily something
+  you did wrong.
 
 ## Required Colab Secrets (environment variables)
 
@@ -92,7 +128,8 @@ whole point of pulling them from Colab Secrets instead.
   (derived from actual subsequent price movement, not a human judgment) —
   noisier, but real language the synthetic templates can't fully capture.
   Both write the identical `{ticker, user_query, news, output}` schema so
-  `train_model.py` can concatenate them with no reconciliation step.
+  either `train_model.py` (`gpu/` or `tpu/`) can concatenate them with no
+  reconciliation step.
 - **Real data is undersampled to balance classes, never duplicated**, to
   avoid teaching the model to memorize repeated rows. The cost is fewer
   total real-data rows; see `generate_real_dataset.py`'s docstring for the
@@ -107,11 +144,13 @@ whole point of pulling them from Colab Secrets instead.
   explanation was more specific — see `docs/training-results-analysis.md`.
   Evaluate on direction accuracy (`evaluate_model.py`), not loss.
 - **Completion-only loss masking has a real tokenizer gotcha.** The
-  instruction/response markers passed to `train_on_responses_only` must
-  match the *exact* tokenization of the prompt template, including
-  incidental whitespace — a mismatched marker silently masks 100% of the
-  training signal rather than erroring loudly. See the comment above that
-  call in `train_model.py` for the specific bug this project hit.
+  instruction/response markers (passed to unsloth's
+  `train_on_responses_only` in `gpu/train_model.py`, or to trl's
+  `DataCollatorForCompletionOnlyLM` in `tpu/train_model.py`) must match
+  the *exact* tokenization of the prompt template, including incidental
+  whitespace — a mismatched marker silently masks 100% of the training
+  signal rather than erroring loudly. See the comment above that call in
+  either file for the specific bug this project hit.
 - **The trained model has a measured NEUTRAL-hedging bias** on real,
   ambiguous headlines (below-random-chance accuracy on real validation data
   in the first trained model). `docs/dataset-fix-plan.md` documents the
@@ -120,7 +159,10 @@ whole point of pulling them from Colab Secrets instead.
 ## docs/
 
 - `llm-training-primer.md` — a from-zero explanation of what every part of
-  `train_model.py` does, for anyone reading this without an ML background.
+  `gpu/train_model.py` does, for anyone reading this without an ML
+  background. Written against the GPU/unsloth path; `tpu/train_model.py`
+  swaps the same conceptual steps onto a different toolchain (see the
+  "GPU vs TPU" section above).
 - `training-results-analysis.md` — why the first training run's loss
   curves were misleading, and what to measure instead.
 - `dataset-fix-plan.md` — the diagnosis and fix plan for the real-data

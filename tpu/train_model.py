@@ -1,0 +1,308 @@
+!pip install -q -U transformers peft trl accelerate datasets
+
+# torch_xla is expected to already be present and version-matched in a
+# Colab TPU v5e-1 runtime - pip-installing it separately here risks
+# pairing it with a mismatched torch build. If this import fails, the
+# runtime isn't actually set to TPU (Runtime > Change runtime type),
+# not a missing-package problem to pip install around.
+import torch
+import torch_xla.core.xla_model as xm
+
+from peft import LoraConfig, get_peft_model
+from transformers import AutoModelForCausalLM, AutoTokenizer
+from trl import SFTTrainer, SFTConfig, DataCollatorForCompletionOnlyLM
+from datasets import load_dataset
+
+MODEL_CHOICE = "llama-3.2-3b"
+
+MODEL_REGISTRY = {
+
+    "llama-3.2-3b": {
+
+        # Swapped from unsloth/Llama-3.2-3B-Instruct-bnb-4bit (the GPU
+        # script's repo) to the non-quantized bf16 mirror - bitsandbytes
+        # (and its pre-quantized checkpoints) has no TPU backend, so
+        # training here runs in plain bf16 instead of 4-bit.
+        "repo": "unsloth/Llama-3.2-3B-Instruct",
+
+        "target_modules": ["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"],
+
+        "max_seq_length": 2048,
+
+    },
+
+    "apertus-0.5b": {
+
+        "repo": "swiss-ai/Apertus-v1.1-0.5B-Instruct",
+
+        "target_modules": ["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"],
+
+        "max_seq_length": 2048,
+
+    },
+
+    # Not enabled on the TPU path: bf16 with no quantization available
+    # (bitsandbytes is CUDA-only) makes 7B/8B a tight-to-unsafe fit on a
+    # single v5e-1's 16GB HBM, and qwen/mistral additionally have no
+    # confirmed non-quantized mirror the way llama-3.2-3b does. Kept as
+    # explicit entries with repo=None so picking one fails with a clear
+    # message below instead of a confusing bitsandbytes import error deep
+    # inside from_pretrained.
+    "apertus-8b": {
+        "repo": None,
+        "blocked_reason": "bf16 8B params is a tight/unsafe fit on a single v5e-1's 16GB HBM alongside LoRA optimizer state and activations - not validated here.",
+    },
+
+    "qwen-2.5-7b": {
+        "repo": None,
+        "blocked_reason": "unsloth only publishes this as -bnb-4bit (bitsandbytes-only, no TPU support) - no non-quantized mirror confirmed.",
+    },
+
+    "mistral-7b": {
+        "repo": None,
+        "blocked_reason": "unsloth only publishes this as -bnb-4bit (bitsandbytes-only, no TPU support) - no non-quantized mirror confirmed.",
+    },
+
+}
+
+selected_config = MODEL_REGISTRY[MODEL_CHOICE]
+
+if selected_config["repo"] is None:
+    raise ValueError(f"{MODEL_CHOICE!r} isn't supported on the TPU path yet: {selected_config['blocked_reason']}")
+
+MODEL_NAME = selected_config["repo"]
+
+MAX_SEQ_LENGTH = selected_config["max_seq_length"]
+
+TARGET_MODULES = selected_config["target_modules"]
+
+print(f"Loading Model Family: {MODEL_CHOICE} -> {MODEL_NAME}")
+
+# 3. Load model in bf16 onto the TPU device (no quantization - bitsandbytes
+# has no TPU backend, and TPU v5e supports bf16 natively)
+
+device = xm.xla_device()
+
+tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME)
+
+model = AutoModelForCausalLM.from_pretrained(
+    MODEL_NAME,
+    torch_dtype=torch.bfloat16,
+).to(device)
+
+# 4. Add LoRA Adapters
+
+lora_config = LoraConfig(
+
+    r = 16,
+
+    target_modules = TARGET_MODULES,
+
+    lora_alpha = 16,
+
+    lora_dropout = 0.05,  # The train/eval loss gap from an early run
+                          # (0.12 vs ~0.4) is a real generalization gap,
+                          # likely template memorization given the
+                          # dataset's limited scenario count relative to
+                          # multiple epochs of repetition. Dropout is a
+                          # standard, low-cost regularizer against exactly
+                          # that.
+
+    bias = "none",
+
+    task_type = "CAUSAL_LM",
+
+)
+
+model = get_peft_model(model, lora_config)
+
+# Required for gradients to reach the LoRA layers when the base model is
+# frozen and gradient checkpointing is on. unsloth's get_peft_model does
+# this internally; vanilla peft does not.
+model.enable_input_require_grads()
+
+# 5. Load and format dataset (upload all four files below to Colab -
+# dataset_train.jsonl/dataset_val.jsonl from generate_synthetic_dataset.py,
+# dataset_train_real.jsonl/dataset_val_real.jsonl from
+# generate_real_dataset.py)
+#
+# Mixes the synthetic dataset with the real, proxy-labeled one -
+# load_dataset accepts a list of files per split and concatenates them, so
+# this is the whole mechanism. Both generators produce the identical
+# {ticker, user_query, news, output} schema on purpose, specifically so
+# this merge needs no reconciliation. The real dataset is already
+# rebalanced by direction on the train side and left at its natural
+# distribution on the val side (see that generator's docstring) - nothing
+# further to do here. load_dataset("json", ...) handles JSON Lines
+# natively.
+dataset_dict = load_dataset(
+    "json",
+    data_files={
+        "train": ["dataset_train.jsonl", "dataset_train_real.jsonl"],
+        "validation": ["dataset_val.jsonl", "dataset_val_real.jsonl"],
+    },
+)
+
+# alpaca_prompt's ### Input: section is built with the exact same structure
+# as the live inference prompt in financial-sentiment-api's
+# app/services/inference.py (Target Stock / User Question / Recent News &
+# Results) - the ticker and user question need to be part of what the model
+# learns to read, since that's what it's actually given in production.
+# Keep this in sync any time inference.py's prompt changes (and in sync
+# with ../gpu/train_model.py's copy of this same string - see
+# CONTRIBUTING.md); the "CRITICAL SENTIMENT RULES" block matches
+# inference.py's current state (a rule covering "beat but cut
+# guidance"-style cases is kept here pending mixed-signal examples proving
+# out in eval before also dropping it from inference.py).
+alpaca_prompt = """Below is an instruction that describes a task, paired with an input that provides further context. Write a response that appropriately completes the request.
+
+### Instruction:
+
+Analyze the following financial news and output JSON containing the impacted stock ticker, detailed reasoning, directional sentiment (BULLISH/BEARISH/NEUTRAL), and confidence score.
+
+CRITICAL SENTIMENT RULES:
+
+1. Weigh guidance cuts and revenue misses higher than minor operational wins.
+
+### Input:
+
+Target Stock: {}
+User Question: {}
+Recent News & Results:
+{}
+
+### Response:
+
+{}"""
+
+def format_prompts(examples):
+
+    texts = []
+
+    for ticker, user_query, news, output in zip(examples["ticker"], examples["user_query"], examples["news"], examples["output"]):
+
+        text = alpaca_prompt.format(ticker, user_query, news, output) + tokenizer.eos_token
+
+        texts.append(text)
+
+    return { "text" : texts }
+
+dataset_dict = dataset_dict.map(format_prompts, batched = True)
+
+train_dataset = dataset_dict["train"]
+eval_dataset = dataset_dict["validation"]
+
+# 6. Set up Trainer using SFTConfig
+from transformers import EarlyStoppingCallback
+
+# Completion-only loss masking - the vanilla-peft/trl equivalent of
+# unsloth's train_on_responses_only (unsloth-only, not available here).
+# IMPORTANT: these markers must match the LITERAL text exactly, including
+# incidental whitespace - alpaca_prompt has a blank line after each
+# header, so the actual text is "### Instruction:\n\n" / "###
+# Response:\n\n" (double newline), not "### Instruction:\n" / "###
+# Response:\n" (single newline). This is not cosmetic to a BPE tokenizer:
+# ":\n\n" tokenizes as one atomic token distinct from ":\n", so a
+# single-newline marker will never be found in the tokenized data at all,
+# silently masking every sample's loss to -100. Verify any change here by
+# loading the target model's tokenizer, tokenizing the marker in isolation
+# and embedded in a real formatted example, and confirming the token
+# sequence actually appears - don't assume a string that "looks like a
+# substring" tokenizes as one.
+collator = DataCollatorForCompletionOnlyLM(
+    instruction_template = "### Instruction:\n\n",
+    response_template = "### Response:\n\n",
+    tokenizer = tokenizer,
+)
+
+trainer = SFTTrainer(
+    model = model,
+    tokenizer = tokenizer,
+    train_dataset = train_dataset,
+    eval_dataset = eval_dataset,  # Without this, nothing measures whether
+                                   # the model generalized beyond the
+                                   # training examples. The generator holds
+                                   # out specific tickers/templates for
+                                   # exactly this purpose.
+    dataset_text_field = "text",
+    max_seq_length = MAX_SEQ_LENGTH,
+    dataset_num_proc = 2,
+    packing = False,
+    data_collator = collator,
+    args = SFTConfig(
+        per_device_train_batch_size = 2,
+        gradient_accumulation_steps = 4,
+        warmup_steps = 5,
+        # num_train_epochs is an upper-bound safety ceiling, not the actual
+        # target - early stopping below decides the real stopping point,
+        # based on eval_loss rather than a guessed epoch/step count. See
+        # docs/training-results-analysis.md for why direction accuracy
+        # (evaluate_model.py), not this loss curve, is what should actually
+        # decide whether a given run is good.
+        num_train_epochs = 5,
+        eval_strategy = "steps",
+        eval_steps = 50,
+        # weight_decay is a standard, low-cost regularizer alongside
+        # lora_dropout, for the same train/eval loss gap reason noted above.
+        weight_decay = 0.01,
+        # save_strategy/save_steps must match eval_strategy/eval_steps for
+        # load_best_model_at_end to work - the Trainer needs a checkpoint
+        # saved at the exact step an eval was run in order to reload it.
+        # save_total_limit keeps disk usage bounded given how often this
+        # saves.
+        save_strategy = "steps",
+        save_steps = 50,
+        save_total_limit = 3,
+        # Stop training at the point of best eval_loss instead of blindly
+        # running num_train_epochs - directly addresses overfitting rather
+        # than just guessing a smaller epoch count.
+        load_best_model_at_end = True,
+        metric_for_best_model = "eval_loss",
+        greater_is_better = False,
+        learning_rate = 2e-4,
+        # TPU v5e supports bf16 natively; there's no CUDA device here to
+        # query, so (unlike the GPU script) this isn't conditional.
+        fp16 = False,
+        bf16 = True,
+        # adamw_8bit is a bitsandbytes optimizer (CUDA-only) - plain
+        # adamw_torch instead.
+        optim = "adamw_torch",
+        gradient_checkpointing = True,
+        logging_steps = 1,
+        output_dir = "outputs",
+    ),
+    # Stops training once eval_loss hasn't improved for 3 consecutive evals
+    # (3 x eval_steps=50 = 150 steps of no improvement), rather than
+    # training all the way to num_train_epochs regardless.
+    callbacks = [EarlyStoppingCallback(early_stopping_patience = 3)],
+)
+
+# 7. Train & Push Adapter to Hugging Face
+
+trainer.train()
+
+# Pull credentials from Colab's own Secrets manager rather than hardcoding
+# them - anything written into a saved/shared .py file is one accidental
+# commit or shared-Colab-link away from being a real leaked credential.
+# Click the key icon in the left sidebar, add secrets named HF_TOKEN (a
+# write-access token) and HF_USER (your Hugging Face username), and grant
+# this notebook access when prompted - do this BEFORE an unattended run;
+# the permission grant is interactive and will block userdata.get(...)
+# otherwise. See the README's "Required Colab Secrets" section.
+from google.colab import userdata
+HF_TOKEN = userdata.get("HF_TOKEN")
+
+HF_USER = userdata.get("HF_USER")
+
+# "-tpu" suffix keeps this from silently overwriting the already-pushed
+# GPU-trained adapter at the plain "-v3" name.
+HF_REPO = f"{HF_USER}/{MODEL_CHOICE}-financial-reasoner-v3-tpu"
+
+# model.push_to_hub_merged(..., save_method="lora") in the GPU script
+# pushes the adapter only, not a merged model, despite the method name -
+# confirmed via unsloth's docs/issues. A PeftModel's own push_to_hub does
+# the same adapter-only push, which is what's actually served in
+# production (financial-sentiment-api points its inference URL directly
+# at this repo).
+model.push_to_hub(HF_REPO, token = HF_TOKEN)
+tokenizer.push_to_hub(HF_REPO, token = HF_TOKEN)

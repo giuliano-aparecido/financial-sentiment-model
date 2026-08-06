@@ -29,16 +29,22 @@ so there's nothing meaningful to mock or run in CI. Instead:
   feedparser`) and sanity-check the output — row counts, a few sample rows,
   and that `python -m py_compile <file>` passes.
 - If you change the prompt template (`alpaca_prompt`) or the output JSON
-  schema in `train_model.py`, keep it in sync with
-  `financial-sentiment-api`'s `app/services/inference.py` — a mismatch
-  there silently trains the model on a different shape than it's actually
-  served with in production.
-- If you change anything that affects `train_on_responses_only`'s
-  `instruction_part`/`response_part` markers, re-verify the tokenization
+  schema, keep three files in sync: `gpu/train_model.py`,
+  `tpu/train_model.py`, and `financial-sentiment-api`'s
+  `app/services/inference.py` — a mismatch anywhere in that trio silently
+  trains or serves a different shape than the other two expect. The
+  gpu/tpu split introduced this three-way duplication, so this is exactly
+  the kind of drift to check for on any prompt/schema change.
+- If you change anything that affects the instruction/response markers
+  used for completion-only loss masking (`train_on_responses_only`'s
+  `instruction_part`/`response_part` in `gpu/train_model.py`, or
+  `DataCollatorForCompletionOnlyLM`'s `instruction_template`/
+  `response_template` in `tpu/train_model.py`), re-verify the tokenization
   match locally (load the target model's tokenizer, tokenize the marker in
   isolation and embedded in a real formatted example, confirm the token
-  sequence actually appears) — see the comment above that call for why this
-  is a real, silent-failure-prone gotcha, not a hypothetical one.
+  sequence actually appears) — see the comment above that call in either
+  file for why this is a real, silent-failure-prone gotcha, not a
+  hypothetical one.
 
 ## What a good PR description covers
 
