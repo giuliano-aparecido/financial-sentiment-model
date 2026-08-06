@@ -122,6 +122,7 @@ Output: two JSONL files, named by OUTPUT_TRAIN_FILE/OUTPUT_VAL_FILE below
 
 import datetime
 import json
+import os
 import random
 import time
 import urllib.parse
@@ -141,13 +142,22 @@ except ImportError as e:
 # and Kaggle (Add-ons -> Secrets) - same pattern the run/ serving scripts
 # use for HF_TOKEN/NGROK_AUTH_TOKEN, reused here for GEMINI_API_KEY. Get a
 # free key at https://aistudio.google.com/apikey.
+#
+# Checking whether `google.colab` IMPORTS is not a reliable way to detect
+# Colab vs Kaggle - confirmed live: some Kaggle base images ship a
+# google-colab package too, so the import succeeds there, and the
+# ModuleNotFoundError this used to branch on never fires. The actual
+# Colab RPC then just hangs and times out ("Secrets can only be fetched
+# when running from the Colab UI") instead of falling through to
+# kaggle_secrets. KAGGLE_KERNEL_RUN_TYPE is set by Kaggle's own runtime
+# on every notebook, so check that directly instead of inferring the
+# platform from import success.
 def get_secret(name):
-    try:
-        from google.colab import userdata
-        return userdata.get(name)
-    except ModuleNotFoundError:
+    if os.environ.get("KAGGLE_KERNEL_RUN_TYPE"):
         from kaggle_secrets import UserSecretsClient
         return UserSecretsClient().get_secret(name)
+    from google.colab import userdata
+    return userdata.get(name)
 
 # genai.Client() with no api_key reads GEMINI_API_KEY from the environment,
 # but Colab/Kaggle secrets aren't environment variables - passed explicitly.

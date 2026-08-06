@@ -5,6 +5,7 @@
 # pairing it with a mismatched torch build. If this import fails, the
 # runtime isn't actually set to TPU (Runtime > Change runtime type),
 # not a missing-package problem to pip install around.
+import os
 import torch
 import torch_xla.core.xla_model as xm
 
@@ -281,18 +282,30 @@ trainer = SFTTrainer(
 
 trainer.train()
 
-# Pull credentials from Colab's own Secrets manager rather than hardcoding
-# them - anything written into a saved/shared .py file is one accidental
-# commit or shared-Colab-link away from being a real leaked credential.
-# Click the key icon in the left sidebar, add secrets named HF_TOKEN (a
-# write-access token) and HF_USER (your Hugging Face username), and grant
-# this notebook access when prompted - do this BEFORE an unattended run;
-# the permission grant is interactive and will block userdata.get(...)
-# otherwise. See the README's "Required Colab Secrets" section.
-from google.colab import userdata
-HF_TOKEN = userdata.get("HF_TOKEN")
+# Pull credentials from Colab/Kaggle's own Secrets manager rather than
+# hardcoding them - anything written into a saved/shared .py file is one
+# accidental commit or shared-notebook-link away from being a real leaked
+# credential. Add secrets named HF_TOKEN (a write-access token) and
+# HF_USER (your Hugging Face username), and grant this notebook access
+# when prompted - do this BEFORE an unattended run; the permission grant
+# is interactive and will block otherwise. See the README's "Required
+# Colab Secrets" section.
+#
+# Checking whether `google.colab` IMPORTS is not a reliable way to detect
+# Colab vs Kaggle - some Kaggle base images ship a google-colab package
+# too, so the import succeeds there and userdata.get() just hangs and
+# times out instead of raising. KAGGLE_KERNEL_RUN_TYPE is set by Kaggle's
+# own runtime on every notebook - check that directly instead.
+def get_secret(name):
+    if os.environ.get("KAGGLE_KERNEL_RUN_TYPE"):
+        from kaggle_secrets import UserSecretsClient
+        return UserSecretsClient().get_secret(name)
+    from google.colab import userdata
+    return userdata.get(name)
 
-HF_USER = userdata.get("HF_USER")
+HF_TOKEN = get_secret("HF_TOKEN")
+
+HF_USER = get_secret("HF_USER")
 
 # "-tpu" suffix keeps this from silently overwriting the already-pushed
 # GPU-trained adapter at the plain "-v3" name.

@@ -6,10 +6,25 @@
 # untrained baseline for comparison, without redoing the tuned pass.
 
 import json
+import os
 import random
 import re
 
 import torch
+
+
+# Checking whether `google.colab` IMPORTS is not a reliable way to detect
+# Colab vs Kaggle - some Kaggle base images ship a google-colab package
+# too, so the import succeeds there and userdata.get() just hangs and
+# times out instead of raising. KAGGLE_KERNEL_RUN_TYPE is set by Kaggle's
+# own runtime on every notebook - check that directly instead.
+def get_secret(name):
+    if os.environ.get("KAGGLE_KERNEL_RUN_TYPE"):
+        from kaggle_secrets import UserSecretsClient
+        return UserSecretsClient().get_secret(name)
+    from google.colab import userdata
+    return userdata.get(name)
+
 
 try:
     model, tokenizer
@@ -17,13 +32,12 @@ try:
 except NameError:
     print("Model not in memory (new or crashed session) - reloading the "
           "already-trained, already-pushed model from Hugging Face...")
-    from google.colab import userdata
     from peft import AutoPeftModelForCausalLM
     from transformers import AutoTokenizer
     import torch_xla.core.xla_model as xm
 
     MODEL_CHOICE = "llama-3.2-3b"
-    HF_USER = userdata.get("HF_USER")
+    HF_USER = get_secret("HF_USER")
     # Matches the "-tpu" suffix train_model.py pushes to, so this reloads
     # the TPU-trained adapter rather than the GPU-trained one at "-v3".
     HF_REPO = f"{HF_USER}/{MODEL_CHOICE}-financial-reasoner-v3-tpu"
