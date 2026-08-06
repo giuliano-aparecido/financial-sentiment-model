@@ -26,8 +26,13 @@ so there's nothing meaningful to mock or run in CI. Instead:
 - If you change a generator script, run it locally (both are plain Python;
   `generate_synthetic_dataset.py` needs no dependencies beyond the standard
   library, `generate_real_dataset.py` needs `pip install yfinance httpx
-  feedparser`) and sanity-check the output — row counts, a few sample rows,
-  and that `python -m py_compile <file>` passes.
+  feedparser google-genai` and a `GEMINI_API_KEY` env var) and sanity-check
+  the output — row counts, a few sample rows, and that
+  `python -m py_compile <file>` passes. Without a Gemini key you can still
+  `py_compile` and read through the diff, but can't confirm
+  `generate_grounded_reasoning` actually produces sensible text end to end
+  — say so explicitly in the PR description rather than claiming it was
+  tested if it wasn't.
 - If you change the prompt template (`alpaca_prompt`) or the output JSON
   schema, keep three files in sync: `gpu/train_model.py`,
   `tpu/train_model.py`, and `financial-sentiment-api`'s
