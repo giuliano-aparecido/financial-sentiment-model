@@ -26,6 +26,25 @@ back at only 25.0% direction accuracy on real val (below the 33% random-
 guess baseline for a 3-way choice, and well below the 86.0% the same model
 got on synthetic val):
 
+0. `reasoning` is now written by Gemini (see generate_grounded_reasoning),
+   grounded in the actual headline, instead of the fixed template this
+   file used before ("Over the N trading days following this news, TICKER
+   moved X.X%, which resolves as DIRECTION..."). That template never
+   referenced headline content at all, so the real portion of training
+   taught the model to recall a memorized per-ticker (%, direction) pair
+   instead of reading the news - confirmed live: a TPU-trained model's
+   misclassified real rows showed the identical "+3.4% -> BULLISH" text
+   for the same ticker across three unrelated headlines. direction and
+   confidence are still derived purely from the price-move proxy below,
+   unchanged - only the reasoning TEXT is regenerated to actually discuss
+   the headline. The prompt explicitly tells Gemini the direction was
+   already decided from price data it doesn't have access to, and to
+   name the headline as a weak/indirect signal rather than invent a
+   strong causal story when the connection isn't obvious - the same
+   "don't fabricate a hand-verified causal read" concern the old
+   template's disclaimer was protecting, just solved by writing
+   headline-grounded text instead of refusing to engage with the
+   headline at all.
 1. TICKERS expanded 20 -> 40. Real data volume is capped by how much
    Google News actually returns per ticker/window, so growing the
    TRAINING supplement without duplicating rows (see rebalance_by_direction
@@ -74,12 +93,20 @@ JSONL rows are interchangeable and can be concatenated/mixed for training:
 
     data_files={"train": ["dataset_train.jsonl", "dataset_train_real.jsonl"], ...}
 
-Requirements: `pip install yfinance httpx feedparser`, network access.
+Requirements: `pip install yfinance httpx feedparser google-genai`, network
+access, and a Gemini API key (GEMINI_API_KEY) - see generate_grounded_
+reasoning for where that's read from and why the model choice is
+gemini-2.5-flash-lite specifically.
 Unlike the synthetic generator, this is NOT reproducible/deterministic -
 querying the same historical window twice can return different results as
-Google's index changes. Both yfinance and Google News RSS are unofficial/
+Google's index changes, and Gemini's reasoning text varies run to run even
+for the same headline (direction/confidence do not - those stay purely
+proxy-derived). Both yfinance and Google News RSS are unofficial/
 undocumented access - this script fails soft (skips and logs a warning)
-rather than crashing on a per-ticker or per-window fetch failure.
+rather than crashing on a per-ticker or per-window fetch failure; the
+Gemini call fails soft too (falls back to the old template text for that
+one row) rather than aborting a multi-hundred-row unattended run over a
+transient API error.
 
 Runtime note: with TICKERS x LOOKBACK_WEEKS now 40 x 18 = 720 weekly
 windows, and NEWS_REQUEST_DELAY_SECONDS=1.0 between each, the news-fetch
@@ -103,11 +130,36 @@ try:
     import feedparser
     import httpx
     import yfinance as yf
+    from google import genai
 except ImportError as e:
     raise SystemExit(
         f"This script needs a package that isn't installed ({e.name}). "
-        "Run: pip install yfinance httpx feedparser"
+        "Run: pip install yfinance httpx feedparser google-genai"
     )
+
+# get_secret() works on both Colab (Secrets, key icon in the left sidebar)
+# and Kaggle (Add-ons -> Secrets) - same pattern the run/ serving scripts
+# use for HF_TOKEN/NGROK_AUTH_TOKEN, reused here for GEMINI_API_KEY. Get a
+# free key at https://aistudio.google.com/apikey.
+def get_secret(name):
+    try:
+        from google.colab import userdata
+        return userdata.get(name)
+    except ModuleNotFoundError:
+        from kaggle_secrets import UserSecretsClient
+        return UserSecretsClient().get_secret(name)
+
+# genai.Client() with no api_key reads GEMINI_API_KEY from the environment,
+# but Colab/Kaggle secrets aren't environment variables - passed explicitly.
+_gemini_client = genai.Client(api_key=get_secret("GEMINI_API_KEY"))
+
+# flash-lite: this is a short, repetitive, low-complexity writing task
+# (headline + ticker + an already-decided direction -> 2-3 sentences) -
+# the cheapest current Gemini tier fits it, not a reason to reach for a
+# larger model. ($0.10/$0.40 per 1M input/output tokens as of the pricing
+# checked when this was written - re-verify at https://ai.google.dev/gemini-api/docs/pricing
+# if it's been a while.)
+GEMINI_MODEL = "gemini-2.5-flash-lite"
 
 random.seed(42)
 
@@ -329,6 +381,61 @@ def build_news_block(primary_headline_line):
     return "\n".join(lines)
 
 
+def _template_reasoning(ticker, direction, pct_change, actual_window_days):
+    # The original mechanism, kept only as generate_grounded_reasoning's
+    # fallback for when the Gemini call itself fails - see that function's
+    # docstring for why this text alone was the root cause of the model
+    # learning to recall a memorized per-ticker answer instead of reading
+    # the headline. Losing headline-grounding on an occasional row (a
+    # transient API hiccup) is an acceptable degradation; losing it on
+    # every row (the old default) is what broke real-data generalization.
+    day_word = "trading day" if actual_window_days == 1 else "trading days"
+    return (
+        f"Over the {actual_window_days} {day_word} following this news, "
+        f"{ticker} moved {pct_change * 100:+.1f}%, which resolves as {direction}. "
+        f"This label reflects the market's actual subsequent move, not a "
+        f"hand-verified causal read of the headline itself."
+    )
+
+
+GEMINI_REASONING_PROMPT = """You are labeling training data for a financial-news sentiment model.
+
+You are given a stock ticker, a real news headline about it, and a directional label (BULLISH, BEARISH, or NEUTRAL). That label was already determined from the stock's ACTUAL subsequent price move over the next few trading days - not from reading the headline. You do not have access to that price data, and you must not reference it, invent a percentage move, or write anything implying you know what the stock did afterward.
+
+Write 2-3 sentences of reasoning that:
+- Reads the headline itself and explains why this kind of news is plausibly consistent with a {direction} outlook - the way a financial analyst would talk through the headline, not the outcome.
+- Does not invent facts, numbers, or details that are not in the headline.
+- If the headline's content does not obviously support {direction} (this happens often - many price moves in a short window are unrelated to the nearest headline), say so plainly - call it a weak or indirect signal rather than forcing a confident causal claim that isn't there.
+
+Ticker: {ticker}
+Headline: {headline}
+Direction: {direction}
+
+Output ONLY the reasoning text - no preamble, no headers, no quotes around it."""
+
+
+def generate_grounded_reasoning(ticker, title, direction, pct_change, actual_window_days):
+    """Replaces the old fixed template (ticker + price move + direction,
+    never the headline itself) with headline-grounded reasoning from
+    Gemini. That template was confirmed live as the root cause of a
+    trained model reproducing an identical memorized answer for a given
+    ticker across unrelated headlines - see the module docstring's item 0.
+    Falls back to the template on any API failure (network error, empty
+    response, safety block, etc.) so one bad call doesn't abort an
+    unattended multi-hundred-row run - matching this file's existing
+    fails-soft policy for yfinance/RSS."""
+    prompt = GEMINI_REASONING_PROMPT.format(ticker=ticker, headline=title, direction=direction)
+    try:
+        response = _gemini_client.models.generate_content(model=GEMINI_MODEL, contents=prompt)
+        text = (response.text or "").strip()
+        if not text:
+            raise ValueError("empty response")
+        return text
+    except Exception as e:
+        print(f"    Warning: Gemini reasoning call failed for {ticker!r} ({e!r}) - using template fallback.")
+        return _template_reasoning(ticker, direction, pct_change, actual_window_days)
+
+
 def make_real_example(ticker, ticker_obj, title, publisher, published_at):
     """Returns (example_or_None, skip_reason). skip_reason is None on
     success, otherwise whatever label_from_forward_return reported."""
@@ -340,13 +447,7 @@ def make_real_example(ticker, ticker_obj, title, publisher, published_at):
     headline_line = f"- [{date_str}] {title} - {publisher}"
 
     confidence = confidence_from_move(direction, pct_change)
-    day_word = "trading day" if actual_window_days == 1 else "trading days"
-    reasoning = (
-        f"Over the {actual_window_days} {day_word} following this news, "
-        f"{ticker} moved {pct_change * 100:+.1f}%, which resolves as {direction}. "
-        f"This label reflects the market's actual subsequent move, not a "
-        f"hand-verified causal read of the headline itself."
-    )
+    reasoning = generate_grounded_reasoning(ticker, title, direction, pct_change, actual_window_days)
 
     output_payload = {
         "impacted_stocks": [

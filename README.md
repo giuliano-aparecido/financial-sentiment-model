@@ -41,10 +41,10 @@ Steps 1-3 are hardware-agnostic and identical either way. Steps 4-5 branch
 depending on which free Colab accelerator you're using — pick **one** of
 `gpu/` or `tpu/`, not both, for a given training run.
 
-1. **`!pip install -q yfinance httpx feedparser`** — dependencies for the
-   real-data generator (step 3). The training script for whichever
-   accelerator you pick installs its own dependencies at the top of that
-   file, so nothing extra is needed for steps 4-5.
+1. **`!pip install -q yfinance httpx feedparser google-genai`** —
+   dependencies for the real-data generator (step 3). The training script
+   for whichever accelerator you pick installs its own dependencies at the
+   top of that file, so nothing extra is needed for steps 4-5.
 2. **`generate_synthetic_dataset.py`** — offline, deterministic, no
    dependencies beyond the standard library. Writes `dataset_train.jsonl` /
    `dataset_val.jsonl`. Takes a few seconds.
@@ -52,10 +52,12 @@ depending on which free Colab accelerator you're using — pick **one** of
    Google News RSS and real subsequent price moves from `yfinance`, and
    derives BULLISH/BEARISH/NEUTRAL labels from what the stock actually did
    afterward. Writes `dataset_train_real.jsonl` / `dataset_val_real.jsonl`.
-   Not deterministic (depends on what Google's index currently returns),
-   and noticeably slower than step 2 — expect several minutes given the
-   number of tickers and historical windows it scans; this is expected, not
-   a hang.
+   Not deterministic (depends on what Google's index currently returns, and
+   Gemini's reasoning text varies run to run for the same headline), and
+   noticeably slower than step 2 — expect several minutes given the number
+   of tickers and historical windows it scans, plus one Gemini call per
+   kept headline; this is expected, not a hang. Requires a `GEMINI_API_KEY`
+   secret — see below.
 4. **`gpu/train_model.py`** (T4) or **`tpu/train_model.py`** (v5e-1) —
    loads the base model, adds a LoRA adapter, mixes both datasets from
    steps 2-3, fine-tunes with early stopping, and pushes the result to
@@ -114,9 +116,10 @@ running the whole notebook unattended via "Run all."
 |---|---|
 | `HF_TOKEN` | A Hugging Face **write**-access token, used to push the fine-tuned model. |
 | `HF_USER` | Your Hugging Face username, used to build the target repo name (`{HF_USER}/{model}-financial-reasoner-v3`). |
+| `GEMINI_API_KEY` | A free key from [aistudio.google.com/apikey](https://aistudio.google.com/apikey), used by `generate_real_dataset.py` to write headline-grounded `reasoning` text (`gemini-2.5-flash-lite` — cost for the whole real dataset is well under $1). |
 
-Neither value is ever written into any file in this repo — that's the
-whole point of pulling them from Colab Secrets instead.
+None of these values are ever written into any file in this repo — that's
+the whole point of pulling them from Colab/Kaggle Secrets instead.
 
 ## Key design decisions
 
@@ -155,6 +158,18 @@ whole point of pulling them from Colab Secrets instead.
   ambiguous headlines (below-random-chance accuracy on real validation data
   in the first trained model). `docs/dataset-fix-plan.md` documents the
   diagnosis and the dataset changes made in response.
+- **Real data's `reasoning` text is LLM-written and headline-grounded, not
+  a fixed template.** The original template (`ticker moved X% -> DIRECTION`)
+  never referenced the headline at all — confirmed live as the cause of a
+  second failure mode (a *different* trained model reproducing an
+  identical memorized answer per ticker regardless of what headline it was
+  given, rather than reading it). `generate_real_dataset.py`'s
+  `generate_grounded_reasoning` calls Gemini (`gemini-2.5-flash-lite`) with
+  the headline and the already-decided direction, explicitly telling it not
+  to reference the future price move it doesn't have — direction/confidence
+  stay purely proxy-derived, only the reasoning text changes. Falls back to
+  the old template on an API failure so one bad call doesn't abort a
+  multi-hundred-row run.
 
 ## docs/
 
