@@ -96,7 +96,7 @@ JSONL rows are interchangeable and can be concatenated/mixed for training:
 Requirements: `pip install yfinance httpx feedparser google-genai`, network
 access, and a Gemini API key (GEMINI_API_KEY) - see generate_grounded_
 reasoning for where that's read from and why the model choice is
-gemini-2.5-flash-lite specifically.
+gemini-3.5-flash-lite specifically.
 Unlike the synthetic generator, this is NOT reproducible/deterministic -
 querying the same historical window twice can return different results as
 Google's index changes, and Gemini's reasoning text varies run to run even
@@ -156,10 +156,14 @@ _gemini_client = genai.Client(api_key=get_secret("GEMINI_API_KEY"))
 # flash-lite: this is a short, repetitive, low-complexity writing task
 # (headline + ticker + an already-decided direction -> 2-3 sentences) -
 # the cheapest current Gemini tier fits it, not a reason to reach for a
-# larger model. ($0.10/$0.40 per 1M input/output tokens as of the pricing
-# checked when this was written - re-verify at https://ai.google.dev/gemini-api/docs/pricing
-# if it's been a while.)
-GEMINI_MODEL = "gemini-2.5-flash-lite"
+# larger model. $0.30/$2.50 per 1M input/output tokens as of the pricing
+# checked when this was written (gemini-2.5-flash-lite, the even cheaper
+# tier at $0.10/$0.40, returns a 404 - "no longer available to new users" -
+# confirmed against a real key) - re-verify at
+# https://ai.google.dev/gemini-api/docs/pricing if it's been a while, and
+# if this model name 404s the same way, that's Google retiring another
+# generation, not a bug here.
+GEMINI_MODEL = "gemini-3.5-flash-lite"
 
 random.seed(42)
 

@@ -116,7 +116,7 @@ running the whole notebook unattended via "Run all."
 |---|---|
 | `HF_TOKEN` | A Hugging Face **write**-access token, used to push the fine-tuned model. |
 | `HF_USER` | Your Hugging Face username, used to build the target repo name (`{HF_USER}/{model}-financial-reasoner-v3`). |
-| `GEMINI_API_KEY` | A free key from [aistudio.google.com/apikey](https://aistudio.google.com/apikey), used by `generate_real_dataset.py` to write headline-grounded `reasoning` text (`gemini-2.5-flash-lite` — cost for the whole real dataset is well under $1). |
+| `GEMINI_API_KEY` | A free key from [aistudio.google.com/apikey](https://aistudio.google.com/apikey), used by `generate_real_dataset.py` to write headline-grounded `reasoning` text (`gemini-3.5-flash-lite` — cost for the whole real dataset is well under $1). |
 
 None of these values are ever written into any file in this repo — that's
 the whole point of pulling them from Colab/Kaggle Secrets instead.
@@ -164,7 +164,7 @@ the whole point of pulling them from Colab/Kaggle Secrets instead.
   second failure mode (a *different* trained model reproducing an
   identical memorized answer per ticker regardless of what headline it was
   given, rather than reading it). `generate_real_dataset.py`'s
-  `generate_grounded_reasoning` calls Gemini (`gemini-2.5-flash-lite`) with
+  `generate_grounded_reasoning` calls Gemini (`gemini-3.5-flash-lite`) with
   the headline and the already-decided direction, explicitly telling it not
   to reference the future price move it doesn't have — direction/confidence
   stay purely proxy-derived, only the reasoning text changes. Falls back to
