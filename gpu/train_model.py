@@ -1,6 +1,7 @@
 !pip install "unsloth[colab-new] @ git+https://github.com/unslothai/unsloth.git"
 !pip install --no-deps trl peft accelerate bitsandbytes
 
+import os
 import torch
 from unsloth import FastLanguageModel
 from trl import SFTTrainer, SFTConfig
@@ -278,18 +279,31 @@ trainer = train_on_responses_only(
 
 trainer.train()
 
-# Pull credentials from Colab's own Secrets manager rather than hardcoding
-# them - anything written into a saved/shared .py file is one accidental
-# commit or shared-Colab-link away from being a real leaked credential.
-# Click the key icon in the left sidebar, add secrets named HF_TOKEN (a
-# write-access token) and HF_USER (your Hugging Face username), and grant
-# this notebook access when prompted - do this BEFORE an unattended run;
-# the permission grant is interactive and will block userdata.get(...)
-# otherwise. See the README's "Required Colab Secrets" section.
-from google.colab import userdata
-HF_TOKEN = userdata.get("HF_TOKEN")
+# Pull credentials from Colab/Kaggle's own Secrets manager rather than
+# hardcoding them - anything written into a saved/shared .py file is one
+# accidental commit or shared-notebook-link away from being a real leaked
+# credential. Add secrets named HF_TOKEN (a write-access token) and
+# HF_USER (your Hugging Face username), and grant this notebook access
+# when prompted - do this BEFORE an unattended run; the permission grant
+# is interactive and will block otherwise. See the README's "Required
+# Colab Secrets" section.
+#
+# Checking whether `google.colab` IMPORTS is not a reliable way to detect
+# Colab vs Kaggle - some Kaggle base images ship a google-colab package
+# too (Kaggle also offers T4/P100 GPUs, so this path can run there too),
+# so the import succeeds and userdata.get() just hangs and times out
+# instead of raising. KAGGLE_KERNEL_RUN_TYPE is set by Kaggle's own
+# runtime on every notebook - check that directly instead.
+def get_secret(name):
+    if os.environ.get("KAGGLE_KERNEL_RUN_TYPE"):
+        from kaggle_secrets import UserSecretsClient
+        return UserSecretsClient().get_secret(name)
+    from google.colab import userdata
+    return userdata.get(name)
 
-HF_USER = userdata.get("HF_USER")
+HF_TOKEN = get_secret("HF_TOKEN")
+
+HF_USER = get_secret("HF_USER")
 
 HF_REPO = f"{HF_USER}/{MODEL_CHOICE}-financial-reasoner-v3"
 

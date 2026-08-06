@@ -7,6 +7,7 @@ from fastapi import FastAPI
 from pydantic import BaseModel
 from unsloth import FastLanguageModel
 import asyncio
+import os
 import threading    # ← ADD THIS LINE
 import time         # ← ADD THIS LINE
 
@@ -14,13 +15,22 @@ import time         # ← ADD THIS LINE
 # and Kaggle (Add-ons -> Secrets) - same secret name, different underlying
 # API. update_backend.py's cell later in this same session reuses this
 # function too, the same way it already reuses `endpoint` below.
+#
+# Checking whether `google.colab` IMPORTS is not a reliable way to detect
+# Colab vs Kaggle - confirmed live: some Kaggle base images ship a
+# google-colab package too, so the import succeeds there, and the
+# ModuleNotFoundError this used to branch on never fires. The actual
+# Colab RPC then just hangs and times out ("Secrets can only be fetched
+# when running from the Colab UI") instead of falling through to
+# kaggle_secrets. KAGGLE_KERNEL_RUN_TYPE is set by Kaggle's own runtime
+# on every notebook, so check that directly instead of inferring the
+# platform from import success.
 def get_secret(name):
-    try:
-        from google.colab import userdata
-        return userdata.get(name)
-    except ModuleNotFoundError:
+    if os.environ.get("KAGGLE_KERNEL_RUN_TYPE"):
         from kaggle_secrets import UserSecretsClient
         return UserSecretsClient().get_secret(name)
+    from google.colab import userdata
+    return userdata.get(name)
 
 # 1. Load fine-tuned weights directly from Hugging Face
 HF_USER = get_secret("HF_USER")
