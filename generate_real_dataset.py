@@ -112,9 +112,13 @@ Runtime note: with TICKERS x LOOKBACK_WEEKS now 40 x 18 = 720 weekly
 windows, and NEWS_REQUEST_DELAY_SECONDS=1.0 between each, the news-fetch
 phase alone is >=12 minutes of politeness delay before counting actual
 request latency or the price-history calls on top - expect a notably
-longer run than earlier, smaller configurations. This is expected, not a
-hang; the per-ticker incremental writes and try/except (see
-generate_and_write) mean a slow run is safe to leave unattended.
+longer run than earlier, smaller configurations. GEMINI_REQUEST_DELAY_SECONDS
+(4.5s, sized for the free tier's 15-requests/minute cap on
+gemini-3.5-flash-lite - see the comment above that constant) adds roughly
+another 4.5s per kept headline on top of that, since a Gemini call happens
+once per row now. This is expected, not a hang; the per-ticker incremental
+writes and try/except (see generate_and_write) mean a slow run is safe to
+leave unattended.
 
 Output: two JSONL files, named by OUTPUT_TRAIN_FILE/OUTPUT_VAL_FILE below
 (default: dataset_train_real.jsonl and dataset_val_real.jsonl).
@@ -124,6 +128,7 @@ import datetime
 import json
 import os
 import random
+import re
 import time
 import urllib.parse
 
@@ -174,6 +179,18 @@ _gemini_client = genai.Client(api_key=get_secret("GEMINI_API_KEY"))
 # if this model name 404s the same way, that's Google retiring another
 # generation, not a bug here.
 GEMINI_MODEL = "gemini-3.5-flash-lite"
+
+# Confirmed live: the FREE TIER caps gemini-3.5-flash-lite at 15 requests
+# per minute (generativelanguage.googleapis.com/generate_content_free_tier_requests).
+# With zero pacing between calls, a run blows through that almost
+# immediately and every call after the first ~15 falls back to the
+# template - silently defeating the whole point of this feature (100% of
+# rows end up ungrounded again, just without an obvious error). 60/15 = 4s
+# minimum between calls; this adds margin. If GEMINI_API_KEY has billing
+# enabled, this limit is much higher and the delay can be lowered - check
+# https://ai.google.dev/gemini-api/docs/rate-limits for the current tier.
+GEMINI_REQUEST_DELAY_SECONDS = 4.5
+GEMINI_MAX_RETRIES = 2
 
 random.seed(42)
 
@@ -428,26 +445,57 @@ Direction: {direction}
 Output ONLY the reasoning text - no preamble, no headers, no quotes around it."""
 
 
+def _retry_delay_seconds(error_text, default=10.0):
+    # google-genai's 429 error message embeds Google's own suggested wait
+    # as a JSON-ish string, e.g. "'retryDelay': '46s'" - pull that out and
+    # honor it instead of guessing a fixed backoff. Falls back to a fixed
+    # default if the message shape ever changes (string-matched, not
+    # parsed as real JSON, since this is on the exception's str(), not a
+    # structured field the SDK is documented to expose).
+    match = re.search(r"retryDelay['\"]?\s*:\s*['\"](\d+(?:\.\d+)?)s", error_text)
+    return float(match.group(1)) if match else default
+
+
 def generate_grounded_reasoning(ticker, title, direction, pct_change, actual_window_days):
     """Replaces the old fixed template (ticker + price move + direction,
     never the headline itself) with headline-grounded reasoning from
     Gemini. That template was confirmed live as the root cause of a
     trained model reproducing an identical memorized answer for a given
     ticker across unrelated headlines - see the module docstring's item 0.
-    Falls back to the template on any API failure (network error, empty
-    response, safety block, etc.) so one bad call doesn't abort an
-    unattended multi-hundred-row run - matching this file's existing
-    fails-soft policy for yfinance/RSS."""
+
+    Confirmed live: the free tier's 15-requests/minute cap gets hit almost
+    immediately with no pacing, and every call after that silently fell
+    back to the template - defeating the whole point of this function
+    without ever raising an error you'd notice. A 429/RESOURCE_EXHAUSTED
+    is retried (honoring Google's suggested retryDelay) up to
+    GEMINI_MAX_RETRIES times before giving up; every other failure (network
+    error, empty response, safety block, etc.) falls back to the template
+    immediately, same as before, so one non-recoverable bad call still
+    can't abort an unattended multi-hundred-row run. Paces itself to
+    GEMINI_REQUEST_DELAY_SECONDS between calls either way, to avoid
+    re-triggering the same limit on the next row."""
     prompt = GEMINI_REASONING_PROMPT.format(ticker=ticker, headline=title, direction=direction)
-    try:
-        response = _gemini_client.models.generate_content(model=GEMINI_MODEL, contents=prompt)
-        text = (response.text or "").strip()
-        if not text:
-            raise ValueError("empty response")
-        return text
-    except Exception as e:
-        print(f"    Warning: Gemini reasoning call failed for {ticker!r} ({e!r}) - using template fallback.")
-        return _template_reasoning(ticker, direction, pct_change, actual_window_days)
+    reasoning = _template_reasoning(ticker, direction, pct_change, actual_window_days)
+    for attempt in range(GEMINI_MAX_RETRIES + 1):
+        try:
+            response = _gemini_client.models.generate_content(model=GEMINI_MODEL, contents=prompt)
+            text = (response.text or "").strip()
+            if not text:
+                raise ValueError("empty response")
+            reasoning = text
+            break
+        except Exception as e:
+            error_text = str(e)
+            is_rate_limited = "RESOURCE_EXHAUSTED" in error_text or "429" in error_text
+            if is_rate_limited and attempt < GEMINI_MAX_RETRIES:
+                wait = _retry_delay_seconds(error_text)
+                print(f"    Gemini rate limit hit for {ticker!r} - waiting {wait:.0f}s before retry {attempt + 1}/{GEMINI_MAX_RETRIES}...")
+                time.sleep(wait)
+                continue
+            print(f"    Warning: Gemini reasoning call failed for {ticker!r} ({e!r}) - using template fallback.")
+            break
+    time.sleep(GEMINI_REQUEST_DELAY_SECONDS)
+    return reasoning
 
 
 def make_real_example(ticker, ticker_obj, title, publisher, published_at):
