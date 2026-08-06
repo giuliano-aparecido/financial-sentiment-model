@@ -325,7 +325,7 @@ def fetch_headlines_for_window(ticker, name, after_date, before_date):
         response.raise_for_status()
         feed = feedparser.parse(response.content)
     except Exception as e:
-        print(f"    Warning: Google News RSS fetch failed for {ticker} {after_date}..{before_date}: {e}")
+        print(f"    Warning: Google News RSS fetch failed for {ticker} {after_date}..{before_date}: {e}", flush=True)
         return []
 
     results = []
@@ -368,7 +368,7 @@ def label_from_forward_return(ticker_obj, published_at):
     try:
         hist = ticker_obj.history(start=start_date, end=end_date)
     except Exception as e:
-        print(f"    Warning: price history fetch failed: {e}")
+        print(f"    Warning: price history fetch failed: {e}", flush=True)
         return None, None, None, "history_fetch_failed"
 
     if len(hist) < 2:
@@ -489,10 +489,10 @@ def generate_grounded_reasoning(ticker, title, direction, pct_change, actual_win
             is_rate_limited = "RESOURCE_EXHAUSTED" in error_text or "429" in error_text
             if is_rate_limited and attempt < GEMINI_MAX_RETRIES:
                 wait = _retry_delay_seconds(error_text)
-                print(f"    Gemini rate limit hit for {ticker!r} - waiting {wait:.0f}s before retry {attempt + 1}/{GEMINI_MAX_RETRIES}...")
+                print(f"    Gemini rate limit hit for {ticker!r} - waiting {wait:.0f}s before retry {attempt + 1}/{GEMINI_MAX_RETRIES}...", flush=True)
                 time.sleep(wait)
                 continue
-            print(f"    Warning: Gemini reasoning call failed for {ticker!r} ({e!r}) - using template fallback.")
+            print(f"    Warning: Gemini reasoning call failed for {ticker!r} ({e!r}) - using template fallback.", flush=True)
             break
     time.sleep(GEMINI_REQUEST_DELAY_SECONDS)
     return reasoning
@@ -554,7 +554,7 @@ def generate_and_write():
     total_val = 0
 
     for ticker, name in TICKERS:
-        print(f"Fetching {ticker} ({name})...")
+        print(f"Fetching {ticker} ({name})...", flush=True)
         try:
             ticker_examples = []
             ticker_obj = yf.Ticker(ticker)
@@ -564,12 +564,23 @@ def generate_and_write():
             kept = 0
             ticker_skips = {}
 
-            for after_date, before_date in weekly_windows():
+            for window_i, (after_date, before_date) in enumerate(weekly_windows(), 1):
                 if kept >= MAX_HEADLINES_PER_TICKER:
                     break
 
                 headlines = fetch_headlines_for_window(ticker, name, after_date, before_date)
                 time.sleep(NEWS_REQUEST_DELAY_SECONDS)
+
+                # Per-window/per-headline output - without this, a ticker
+                # can go silent for minutes at a time (each headline now
+                # costs a real Gemini call: GEMINI_REQUEST_DELAY_SECONDS at
+                # minimum, up to tens of seconds more on a rate-limit
+                # retry) with nothing printed to distinguish "still
+                # working" from "hung". Confirmed live: an interrupted run
+                # that looked stuck for over a minute turned out to be mid-
+                # loop, already well past the fetch, just silently working
+                # through headlines one at a time.
+                print(f"    window {window_i}/{LOOKBACK_WEEKS} ({after_date}..{before_date}): {len(headlines)} headlines", flush=True)
 
                 for title, publisher, published_at in headlines:
                     if kept >= MAX_HEADLINES_PER_TICKER:
@@ -584,12 +595,14 @@ def generate_and_write():
                     if example:
                         ticker_examples.append(example)
                         kept += 1
+                        print(f"      [{kept}/{MAX_HEADLINES_PER_TICKER}] kept: {title[:70]!r}", flush=True)
                     else:
                         ticker_skips[skip_reason] = ticker_skips.get(skip_reason, 0) + 1
                         skip_reason_totals[skip_reason] = skip_reason_totals.get(skip_reason, 0) + 1
+                        print(f"      skipped ({skip_reason}): {title[:70]!r}", flush=True)
 
             skip_summary = ", ".join(f"{reason}={count}" for reason, count in ticker_skips.items())
-            print(f"  {kept} labeled examples, {len(seen_titles)} unique headlines seen" + (f" (skipped: {skip_summary})" if skip_summary else ""))
+            print(f"  {kept} labeled examples, {len(seen_titles)} unique headlines seen" + (f" (skipped: {skip_summary})" if skip_summary else ""), flush=True)
 
             target_file = OUTPUT_VAL_FILE if is_val else OUTPUT_TRAIN_FILE
             append_examples(target_file, ticker_examples)
@@ -601,14 +614,14 @@ def generate_and_write():
         except Exception as e:
             # Whatever prior tickers already wrote stays on disk; this
             # ticker is skipped entirely and the run moves on.
-            print(f"  Warning: {ticker} failed unexpectedly, skipping it: {e!r}")
+            print(f"  Warning: {ticker} failed unexpectedly, skipping it: {e!r}", flush=True)
             continue
 
     if skip_reason_totals:
         print()
         print("Skip reasons across all tickers:", skip_reason_totals)
 
-    print(f"Collected {total_train} raw train examples, {total_val} val examples (before rebalancing)")
+    print(f"Collected {total_train} raw train examples, {total_val} val examples (before rebalancing)", flush=True)
 
 
 def direction_of(example):
@@ -638,7 +651,7 @@ def rebalance_by_direction(examples):
     random.shuffle(rebalanced)
 
     before = {d: len(rows) for d, rows in by_direction.items()}
-    print(f"Rebalanced train set by direction: {before} -> {minority_count} each ({minority_count * len(by_direction)} total)")
+    print(f"Rebalanced train set by direction: {before} -> {minority_count} each ({minority_count * len(by_direction)} total)", flush=True)
     return rebalanced
 
 
@@ -666,8 +679,8 @@ def main():
     with open(OUTPUT_VAL_FILE) as f:
         val_count = sum(1 for _ in f)
 
-    print(f"Wrote {OUTPUT_TRAIN_FILE}: {train_count} examples (rebalanced)")
-    print(f"Wrote {OUTPUT_VAL_FILE}:   {val_count} examples (held-out tickers: {sorted(VAL_HOLDOUT_TICKERS)}, natural/unbalanced distribution)")
+    print(f"Wrote {OUTPUT_TRAIN_FILE}: {train_count} examples (rebalanced)", flush=True)
+    print(f"Wrote {OUTPUT_VAL_FILE}:   {val_count} examples (held-out tickers: {sorted(VAL_HOLDOUT_TICKERS)}, natural/unbalanced distribution)", flush=True)
 
 
 if __name__ == "__main__":
