@@ -1,0 +1,511 @@
+"""
+Financial sentiment training dataset generator - REAL DATA variant
+
+Companion to generate_synthetic_dataset.py (fully synthetic, offline,
+deterministic). This version pulls REAL historical news headlines from
+Google News RSS and REAL subsequent price movement from yfinance for each
+ticker, and derives the BULLISH/BEARISH/NEUTRAL label from what the stock
+actually did in the days after the headline - not from a hand-authored,
+causally-verified judgment the way the synthetic dataset's labels are
+written.
+
+This is a proxy-labeling approach, and it's a genuinely different kind of
+signal than the synthetic dataset, not just a "more realistic" version of
+it: any single label here is noisy - a lot of a stock's price movement in
+a given window has nothing to do with the specific headline it's paired
+with. The bet is that across enough examples, real language patterns that
+do correlate with subsequent direction are still there for the model to
+find, even though no single row is a verified causal claim the way the
+synthetic dataset's rows are. Treat accuracy on this dataset's own
+validation split with that in mind - it's measuring "does the model find
+the same correlations in the label noise," not "is the model's causal
+reasoning correct."
+
+History, most recent first - after the first trained model's eval came
+back at only 25.0% direction accuracy on real val (below the 33% random-
+guess baseline for a 3-way choice, and well below the 86.0% the same model
+got on synthetic val):
+
+1. TICKERS expanded 20 -> 40. Real data volume is capped by how much
+   Google News actually returns per ticker/window, so growing the
+   TRAINING supplement without duplicating rows (see rebalance_by_direction
+   below - duplication was deliberately ruled out earlier) requires a
+   bigger raw pool to draw from, not just a higher per-ticker cap.
+2. LOOKBACK_WEEKS 8 -> 18 and MAX_HEADLINES_PER_TICKER 30 -> 50, for the
+   same reason - more historical windows scanned per ticker, more raw
+   headlines available to become the post-rebalance train set.
+3. BULLISH_THRESHOLD/BEARISH_THRESHOLD are now more visibly a label-quality
+   knob, with OUTPUT_TRAIN_FILE/OUTPUT_VAL_FILE broken out as their own
+   constants specifically so a stricter-threshold comparison run (e.g.
+   +/-0.03 or +/-0.04 instead of the default +/-0.02) can write to
+   different filenames instead of overwriting the default run. See the
+   "Threshold experiment" note below the constants.
+
+Earlier history: this script originally used yfinance's Ticker.news for
+headlines, which only returns the current "latest ~10" items with no
+historical/date-range support - most of what it returned was too recent to
+have a forward price window yet. Switched to Google News RSS, queried for
+specific past date windows using Google's undocumented `after:`/`before:`
+search operators, which lets us deliberately query already-old windows so
+forward price data already exists for nearly everything returned. yfinance
+still supplies price history for the label - nothing about that half
+changed.
+
+`after:`/`before:` are NOT officially documented by Google and could
+change or get blocked without notice - same fragility production's own
+news fetch already accepts. Day-level granularity only (no time-of-day),
+and any single query is capped at ~100 results, which is why this scans
+multiple narrow weekly windows per ticker rather than one big range.
+
+The train split is rebalanced to equal BULLISH/BEARISH/NEUTRAL counts by
+undersampling (see rebalance_by_direction) before being written - real
+market data over any specific historical window is rarely naturally
+balanced. The val split is deliberately left at its natural/unbalanced
+distribution - eval numbers should reflect real-world performance, not a
+distribution forced to look nicer than reality. (This natural imbalance -
+the val set skews BEARISH-heavy - is itself part of why a model with a
+"default to NEUTRAL when unsure" habit scored so poorly on it; see
+docs/training-results-analysis.md.)
+
+Output schema, ### Input: field structure, and user_query phrasing all
+match generate_synthetic_dataset.py exactly (down to reusing its
+NOISE_HEADLINES and USER_QUESTION_TEMPLATES verbatim), so both datasets'
+JSONL rows are interchangeable and can be concatenated/mixed for training:
+
+    data_files={"train": ["dataset_train.jsonl", "dataset_train_real.jsonl"], ...}
+
+Requirements: `pip install yfinance httpx feedparser`, network access.
+Unlike the synthetic generator, this is NOT reproducible/deterministic -
+querying the same historical window twice can return different results as
+Google's index changes. Both yfinance and Google News RSS are unofficial/
+undocumented access - this script fails soft (skips and logs a warning)
+rather than crashing on a per-ticker or per-window fetch failure.
+
+Runtime note: with TICKERS x LOOKBACK_WEEKS now 40 x 18 = 720 weekly
+windows, and NEWS_REQUEST_DELAY_SECONDS=1.0 between each, the news-fetch
+phase alone is >=12 minutes of politeness delay before counting actual
+request latency or the price-history calls on top - expect a notably
+longer run than earlier, smaller configurations. This is expected, not a
+hang; the per-ticker incremental writes and try/except (see
+generate_and_write) mean a slow run is safe to leave unattended.
+
+Output: two JSONL files, named by OUTPUT_TRAIN_FILE/OUTPUT_VAL_FILE below
+(default: dataset_train_real.jsonl and dataset_val_real.jsonl).
+"""
+
+import datetime
+import json
+import random
+import time
+import urllib.parse
+
+try:
+    import feedparser
+    import httpx
+    import yfinance as yf
+except ImportError as e:
+    raise SystemExit(
+        f"This script needs a package that isn't installed ({e.name}). "
+        "Run: pip install yfinance httpx feedparser"
+    )
+
+random.seed(42)
+
+# (ticker, company name) - name improves Google News query precision over
+# a bare ticker symbol alone (e.g. "DIS" is ambiguous, "Walt Disney" isn't).
+# Real tickers only - the synthetic generator's invented ones (ZVEX, QRNL,
+# etc.) obviously have no real news or price history to query. All large,
+# liquid, heavily-covered names so Google News RSS has enough to return per
+# window.
+TICKERS = [
+    ("AAPL", "Apple"), ("TSLA", "Tesla"), ("NVDA", "Nvidia"), ("AMZN", "Amazon"),
+    ("MSFT", "Microsoft"), ("GOOGL", "Alphabet"), ("META", "Meta Platforms"), ("AMD", "AMD"),
+    ("JPM", "JPMorgan Chase"), ("DIS", "Walt Disney"), ("NFLX", "Netflix"), ("INTC", "Intel"),
+    ("CRM", "Salesforce"), ("BA", "Boeing"), ("PYPL", "PayPal"), ("SHOP", "Shopify"),
+    ("UBER", "Uber"), ("SBUX", "Starbucks"), ("COIN", "Coinbase"), ("PLTR", "Palantir"),
+    ("GS", "Goldman Sachs"), ("V", "Visa"), ("MA", "Mastercard"), ("WMT", "Walmart"),
+    ("HD", "Home Depot"), ("KO", "Coca-Cola"), ("PEP", "PepsiCo"), ("MCD", "McDonald's"),
+    ("NKE", "Nike"), ("VZ", "Verizon"), ("CSCO", "Cisco"), ("ORCL", "Oracle"),
+    ("IBM", "IBM"), ("QCOM", "Qualcomm"), ("ADBE", "Adobe"), ("NOW", "ServiceNow"),
+    ("ABNB", "Airbnb"), ("F", "Ford"), ("GM", "General Motors"), ("XOM", "Exxon Mobil"),
+]
+
+# Smaller holdout than the synthetic generator's - real data volume per
+# ticker is naturally lower than a generated quota, so holding out too
+# many tickers leaves too little to actually train on.
+VAL_HOLDOUT_TICKERS = {"META", "BA"}
+
+FORWARD_WINDOW_TRADING_DAYS = 3   # how many trading days after the headline
+                                   # to measure the price move over
+
+# Threshold experiment: this is a genuine label-quality knob. The default
+# (+/-2%) is loose enough that ambiguous, low-conviction moves get labeled
+# with full confidence. Worth generating a second dataset variant at a
+# stricter +/-3% or +/-4% and comparing eval results - fewer real examples,
+# but each one a cleaner signal. To run that comparison without overwriting
+# the default output:
+#
+#   BULLISH_THRESHOLD, BEARISH_THRESHOLD = 0.03, -0.03
+#   OUTPUT_TRAIN_FILE = "dataset_train_real_strict.jsonl"
+#   OUTPUT_VAL_FILE = "dataset_val_real_strict.jsonl"
+#
+# then point the training script's data_files at whichever variant (or
+# both) you want to compare.
+BULLISH_THRESHOLD = 0.02          # forward return >= +2% -> BULLISH
+BEARISH_THRESHOLD = -0.02         # forward return <= -2% -> BEARISH
+                                   # (between the two -> NEUTRAL)
+OUTPUT_TRAIN_FILE = "dataset_train_real.jsonl"
+OUTPUT_VAL_FILE = "dataset_val_real.jsonl"
+
+# How far back, and how close to "now", to search. The gap between
+# SAFETY_BUFFER_DAYS and today guarantees every queried window already has
+# a complete forward price window by the time we look it up.
+LOOKBACK_WEEKS = 18
+SAFETY_BUFFER_DAYS = 14
+MAX_HEADLINES_PER_TICKER = 50
+
+NEWS_REQUEST_DELAY_SECONDS = 1.0   # be polite to Google's unofficial endpoint
+PRICE_REQUEST_DELAY_SECONDS = 0.3  # be polite to yfinance between calls
+
+PUBLISHER_FALLBACK = "Google News"
+
+# Reused verbatim from generate_synthetic_dataset.py so both datasets' news
+# blocks have the same shape - real feeds do mix in unrelated market
+# headlines too, same as the synthetic version simulates.
+NOISE_HEADLINES = [
+    "Fed leaves interest rates unchanged in split decision",
+    "Oil prices dip amid oversupply concerns",
+    "Treasury yields climb on inflation data",
+    "Dollar strengthens against euro after jobs report",
+    "Wall Street mixed as investors await earnings season",
+    "Gold prices hold steady near record highs",
+    "Asian markets close lower on trade tension fears",
+    "Consumer confidence index ticks up slightly",
+    "Housing starts fall for third consecutive month",
+    "Retail sales beat expectations in broad-based gain",
+    "Crude oil rebounds on OPEC+ supply cut signals",
+    "Bond markets rally as recession fears ease",
+]
+NOISE_PUBLISHERS = ["Reuters", "Bloomberg", "MarketWatch", "CNBC"]
+
+# Reused verbatim from generate_synthetic_dataset.py.
+USER_QUESTION_TEMPLATES = [
+    "Will ${ticker} go up or down based on recent news?",
+    "Is {ticker} a buy right now?",
+    "What's the outlook for {ticker} this quarter?",
+    "Should I be worried about my {ticker} position?",
+    "How will the latest news affect ${ticker}?",
+    "Is now a good time to sell {ticker}?",
+    "What's the sentiment on {ticker} today?",
+    "Will {ticker} beat earnings expectations?",
+    "Give me your read on {ticker}.",
+    "",  # some users submit with no real question at all
+]
+
+
+def build_user_query(ticker):
+    template = random.choice(USER_QUESTION_TEMPLATES)
+    return template.format(ticker=ticker) if template else ""
+
+
+def _format_date(dt):
+    # Matches app/services/news.py's entry.get("published", "")[:16] shape
+    # (e.g. "Tue, 05 Aug 2026"), same as the synthetic generator.
+    return f"{dt.strftime('%a')}, {dt.day:02d} {dt.strftime('%b')} {dt.year}"
+
+
+def weekly_windows():
+    """Yields (after_date, before_date) date objects, oldest first, covering
+    LOOKBACK_WEEKS weeks ending SAFETY_BUFFER_DAYS before today."""
+    today = datetime.date.today()
+    window_end = today - datetime.timedelta(days=SAFETY_BUFFER_DAYS)
+    for i in range(LOOKBACK_WEEKS, 0, -1):
+        after = window_end - datetime.timedelta(weeks=i)
+        before = after + datetime.timedelta(weeks=1)
+        yield after, before
+
+
+def fetch_headlines_for_window(ticker, name, after_date, before_date):
+    """Queries Google News RSS for `name`/`ticker` mentions published
+    between after_date and before_date (inclusive/exclusive per Google's
+    own semantics - not precisely documented). Returns a list of
+    (title, publisher, published_at) tuples. Fails soft: returns [] and
+    logs a warning on any fetch/parse error, same pattern as this
+    project's production app/services/news.py.
+    """
+    query = f'"{name}" OR {ticker} stock after:{after_date.isoformat()} before:{before_date.isoformat()}'
+    encoded_query = urllib.parse.quote(query)
+    rss_url = f"https://news.google.com/rss/search?q={encoded_query}&hl=en-US&gl=US&ceid=US:en"
+
+    try:
+        response = httpx.get(rss_url, timeout=10.0)
+        response.raise_for_status()
+        feed = feedparser.parse(response.content)
+    except Exception as e:
+        print(f"    Warning: Google News RSS fetch failed for {ticker} {after_date}..{before_date}: {e}")
+        return []
+
+    results = []
+    for entry in feed.entries:
+        title = entry.get("title", "")
+        if not title:
+            continue
+        publisher = PUBLISHER_FALLBACK
+        # Google News RSS titles are conventionally "Headline - Publisher" -
+        # split it out if present so it matches the synthetic dataset's
+        # separate publisher field instead of duplicating it into the title.
+        if " - " in title:
+            title, _, publisher = title.rpartition(" - ")
+
+        published_at = None
+        if entry.get("published_parsed"):
+            published_at = datetime.datetime(*entry.published_parsed[:6])
+
+        results.append((title, publisher, published_at))
+
+    return results
+
+
+def label_from_forward_return(ticker_obj, published_at):
+    """Returns (direction, pct_change, actual_window_days, skip_reason).
+    skip_reason is None on success, otherwise "no_date",
+    "history_fetch_failed", or "insufficient_history".
+
+    Because callers only pass in headlines from deliberately-old query
+    windows (see weekly_windows/SAFETY_BUFFER_DAYS), the full
+    FORWARD_WINDOW_TRADING_DAYS should be available almost every time. The
+    adaptive/floor-of-1-day behavior is kept as a safety net for edge cases
+    (market holidays, sparse data), not as the primary mechanism.
+    """
+    if published_at is None:
+        return None, None, None, "no_date"
+
+    start_date = published_at.date()
+    end_date = start_date + datetime.timedelta(days=FORWARD_WINDOW_TRADING_DAYS + 4)  # buffer for weekends/holidays
+    try:
+        hist = ticker_obj.history(start=start_date, end=end_date)
+    except Exception as e:
+        print(f"    Warning: price history fetch failed: {e}")
+        return None, None, None, "history_fetch_failed"
+
+    if len(hist) < 2:
+        return None, None, None, "insufficient_history"
+
+    start_price = hist["Close"].iloc[0]
+    end_idx = min(FORWARD_WINDOW_TRADING_DAYS, len(hist) - 1)
+    actual_window_days = end_idx  # how many trading days forward this label actually reflects
+    end_price = hist["Close"].iloc[end_idx]
+    if not start_price:
+        return None, None, None, "insufficient_history"
+
+    pct_change = (end_price - start_price) / start_price
+    if pct_change >= BULLISH_THRESHOLD:
+        direction = "BULLISH"
+    elif pct_change <= BEARISH_THRESHOLD:
+        direction = "BEARISH"
+    else:
+        direction = "NEUTRAL"
+    return direction, pct_change, actual_window_days, None
+
+
+def confidence_from_move(direction, pct_change):
+    # Bigger moves get higher confidence, on the reasoning that a move well
+    # past the threshold is less likely to be pure noise than one that
+    # barely cleared it. Loosely mirrors the synthetic generator's
+    # per-category confidence ranges, not derived from anything rigorous.
+    magnitude = min(abs(pct_change), 0.15) / 0.15  # normalize, cap at a 15% move
+    if direction == "NEUTRAL":
+        return round(0.55 + 0.15 * (1 - magnitude), 2)
+    return round(0.65 + 0.30 * magnitude, 2)
+
+
+def build_news_block(primary_headline_line):
+    lines = [primary_headline_line]
+    n_noise = random.randint(1, 3)
+    for noise in random.sample(NOISE_HEADLINES, n_noise):
+        date = datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(days=random.randint(0, 6))
+        lines.append(f"- [{_format_date(date)}] {noise} - {random.choice(NOISE_PUBLISHERS)}")
+    random.shuffle(lines)  # target headline isn't always first, like real feeds
+    return "\n".join(lines)
+
+
+def make_real_example(ticker, ticker_obj, title, publisher, published_at):
+    """Returns (example_or_None, skip_reason). skip_reason is None on
+    success, otherwise whatever label_from_forward_return reported."""
+    direction, pct_change, actual_window_days, skip_reason = label_from_forward_return(ticker_obj, published_at)
+    if direction is None:
+        return None, skip_reason
+
+    date_str = _format_date(published_at) if published_at else "recent"
+    headline_line = f"- [{date_str}] {title} - {publisher}"
+
+    confidence = confidence_from_move(direction, pct_change)
+    day_word = "trading day" if actual_window_days == 1 else "trading days"
+    reasoning = (
+        f"Over the {actual_window_days} {day_word} following this news, "
+        f"{ticker} moved {pct_change * 100:+.1f}%, which resolves as {direction}. "
+        f"This label reflects the market's actual subsequent move, not a "
+        f"hand-verified causal read of the headline itself."
+    )
+
+    output_payload = {
+        "impacted_stocks": [
+            {
+                "ticker": ticker,
+                "reasoning": reasoning,
+                "direction": direction,
+                "confidence": confidence,
+            }
+        ]
+    }
+
+    example = {
+        "ticker": ticker,
+        "user_query": build_user_query(ticker),
+        "news": build_news_block(headline_line),
+        "output": json.dumps(output_payload, indent=2),
+    }
+    return example, None
+
+
+def append_examples(filepath, examples):
+    with open(filepath, "a") as f:
+        for row in examples:
+            f.write(json.dumps(row) + "\n")
+
+
+def generate_and_write():
+    """Writes each ticker's results to disk as soon as that ticker finishes,
+    instead of accumulating everything in memory and writing once at the
+    end. This is meant to survive an unattended Colab run: if something
+    interrupts the process partway through (a Colab disconnect, an
+    unexpected error on one ticker), whatever tickers already completed
+    are safely on disk rather than lost entirely. Each ticker also runs
+    inside its own try/except so one unexpected failure can't take down
+    the other 39."""
+    open(OUTPUT_TRAIN_FILE, "w").close()
+    open(OUTPUT_VAL_FILE, "w").close()
+
+    skip_reason_totals = {}
+    total_train = 0
+    total_val = 0
+
+    for ticker, name in TICKERS:
+        print(f"Fetching {ticker} ({name})...")
+        try:
+            ticker_examples = []
+            ticker_obj = yf.Ticker(ticker)
+            is_val = ticker in VAL_HOLDOUT_TICKERS
+
+            seen_titles = set()
+            kept = 0
+            ticker_skips = {}
+
+            for after_date, before_date in weekly_windows():
+                if kept >= MAX_HEADLINES_PER_TICKER:
+                    break
+
+                headlines = fetch_headlines_for_window(ticker, name, after_date, before_date)
+                time.sleep(NEWS_REQUEST_DELAY_SECONDS)
+
+                for title, publisher, published_at in headlines:
+                    if kept >= MAX_HEADLINES_PER_TICKER:
+                        break
+                    if title in seen_titles:
+                        continue
+                    seen_titles.add(title)
+
+                    example, skip_reason = make_real_example(ticker, ticker_obj, title, publisher, published_at)
+                    time.sleep(PRICE_REQUEST_DELAY_SECONDS)
+
+                    if example:
+                        ticker_examples.append(example)
+                        kept += 1
+                    else:
+                        ticker_skips[skip_reason] = ticker_skips.get(skip_reason, 0) + 1
+                        skip_reason_totals[skip_reason] = skip_reason_totals.get(skip_reason, 0) + 1
+
+            skip_summary = ", ".join(f"{reason}={count}" for reason, count in ticker_skips.items())
+            print(f"  {kept} labeled examples, {len(seen_titles)} unique headlines seen" + (f" (skipped: {skip_summary})" if skip_summary else ""))
+
+            target_file = OUTPUT_VAL_FILE if is_val else OUTPUT_TRAIN_FILE
+            append_examples(target_file, ticker_examples)
+            if is_val:
+                total_val += len(ticker_examples)
+            else:
+                total_train += len(ticker_examples)
+
+        except Exception as e:
+            # Whatever prior tickers already wrote stays on disk; this
+            # ticker is skipped entirely and the run moves on.
+            print(f"  Warning: {ticker} failed unexpectedly, skipping it: {e!r}")
+            continue
+
+    if skip_reason_totals:
+        print()
+        print("Skip reasons across all tickers:", skip_reason_totals)
+
+    print(f"Collected {total_train} raw train examples, {total_val} val examples (before rebalancing)")
+
+
+def direction_of(example):
+    return json.loads(example["output"])["impacted_stocks"][0]["direction"]
+
+
+def rebalance_by_direction(examples):
+    """Undersamples down to the minority class's count, so BULLISH/BEARISH/
+    NEUTRAL are equally represented. Undersampling (not duplicating the
+    minority classes up) is deliberate - this project has already run into
+    a real overfitting problem from repeated content once (see the
+    synthetic generator's template-count history), and duplicating real
+    rows to pad a minority class would risk the same thing here. The cost
+    is fewer total rows; that's an accepted tradeoff for a dataset this is
+    only ever meant to be a supplement to, not the primary training set."""
+    by_direction = {}
+    for ex in examples:
+        by_direction.setdefault(direction_of(ex), []).append(ex)
+
+    if not by_direction:
+        return examples
+
+    minority_count = min(len(rows) for rows in by_direction.values())
+    rebalanced = []
+    for rows in by_direction.values():
+        rebalanced.extend(random.sample(rows, minority_count))
+    random.shuffle(rebalanced)
+
+    before = {d: len(rows) for d, rows in by_direction.items()}
+    print(f"Rebalanced train set by direction: {before} -> {minority_count} each ({minority_count * len(by_direction)} total)")
+    return rebalanced
+
+
+def rebalance_file_in_place(filepath):
+    with open(filepath) as f:
+        rows = [json.loads(line) for line in f]
+    rebalanced = rebalance_by_direction(rows)
+    with open(filepath, "w") as f:
+        for row in rebalanced:
+            f.write(json.dumps(row) + "\n")
+    return len(rebalanced)
+
+
+def main():
+    generate_and_write()
+
+    # Rebalance train only - an artificially-balanced val set would give a
+    # less honest read of real-world performance than val's actual (skewed)
+    # distribution, which is what the model will actually be judged against.
+    # This reads back whatever actually made it to disk rather than an
+    # in-memory list, so it still produces a correctly-balanced file even if
+    # generate_and_write() above was interrupted partway through.
+    train_count = rebalance_file_in_place(OUTPUT_TRAIN_FILE)
+
+    with open(OUTPUT_VAL_FILE) as f:
+        val_count = sum(1 for _ in f)
+
+    print(f"Wrote {OUTPUT_TRAIN_FILE}: {train_count} examples (rebalanced)")
+    print(f"Wrote {OUTPUT_VAL_FILE}:   {val_count} examples (held-out tickers: {sorted(VAL_HOLDOUT_TICKERS)}, natural/unbalanced distribution)")
+
+
+if __name__ == "__main__":
+    main()
