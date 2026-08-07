@@ -121,12 +121,12 @@ model = FastLanguageModel.get_peft_model(
 # Mixes the synthetic dataset with the real, proxy-labeled one -
 # load_dataset accepts a list of files per split and concatenates them, so
 # this is the whole mechanism. Both generators produce the identical
-# {ticker, user_query, news, output} schema on purpose, specifically so
-# this merge needs no reconciliation. The real dataset is already
-# rebalanced by direction on the train side and left at its natural
-# distribution on the val side (see that generator's docstring) - nothing
-# further to do here. load_dataset("json", ...) handles JSON Lines
-# natively.
+# {ticker, user_query, market_data, valuation, earnings, news, output}
+# schema (v4) on purpose, specifically so this merge needs no
+# reconciliation. The real dataset is already rebalanced by direction on
+# the train side and left at its natural distribution on the val side (see
+# that generator's docstring) - nothing further to do here.
+# load_dataset("json", ...) handles JSON Lines natively.
 dataset_dict = load_dataset(
     "json",
     data_files={
@@ -137,19 +137,21 @@ dataset_dict = load_dataset(
 
 # alpaca_prompt's ### Input: section is built with the exact same structure
 # as the live inference prompt in financial-sentiment-api's
-# app/services/inference.py (Target Stock / User Question / Recent News &
-# Results) - the ticker and user question need to be part of what the model
-# learns to read, since that's what it's actually given in production.
-# Keep this in sync any time inference.py's prompt changes; the "CRITICAL
-# SENTIMENT RULES" block matches inference.py's current state (a rule
-# covering "beat but cut guidance"-style cases is kept here pending
-# mixed-signal examples proving out in eval before also dropping it from
-# inference.py).
+# app/services/inference.py (Target Stock / User Question / Current Market
+# Data / Valuation / Recent Earnings / Recent News & Results) - the model
+# needs to learn to read all of these, since that's what it's actually
+# given in production. Keep this in sync any time inference.py's prompt
+# changes, and in sync with ../tpu/train_model.py's copy of this same
+# string and the ../{gpu,tpu}/evaluate_*.py scripts' copies (see
+# CONTRIBUTING.md's 4-way sync rule); the "CRITICAL SENTIMENT RULES" block
+# matches inference.py's current state (a rule covering "beat but cut
+# guidance"-style cases is kept here pending mixed-signal examples proving
+# out in eval before also dropping it from inference.py).
 alpaca_prompt = """Below is an instruction that describes a task, paired with an input that provides further context. Write a response that appropriately completes the request.
 
 ### Instruction:
 
-Analyze the following financial news and output JSON containing the impacted stock ticker, detailed reasoning, directional sentiment (BULLISH/BEARISH/NEUTRAL), and confidence score.
+Analyze the following financial data and news and output JSON containing the impacted stock ticker, detailed reasoning, directional sentiment (BULLISH/BEARISH/NEUTRAL), confidence score, and a direct answer to the user's question.
 
 CRITICAL SENTIMENT RULES:
 
@@ -159,6 +161,16 @@ CRITICAL SENTIMENT RULES:
 
 Target Stock: {}
 User Question: {}
+
+Current Market Data:
+{}
+
+Valuation:
+{}
+
+Recent Earnings:
+{}
+
 Recent News & Results:
 {}
 
@@ -170,9 +182,13 @@ def format_prompts(examples):
 
     texts = []
 
-    for ticker, user_query, news, output in zip(examples["ticker"], examples["user_query"], examples["news"], examples["output"]):
+    fields = zip(
+        examples["ticker"], examples["user_query"], examples["market_data"],
+        examples["valuation"], examples["earnings"], examples["news"], examples["output"],
+    )
+    for ticker, user_query, market_data, valuation, earnings, news, output in fields:
 
-        text = alpaca_prompt.format(ticker, user_query, news, output) + tokenizer.eos_token
+        text = alpaca_prompt.format(ticker, user_query, market_data, valuation, earnings, news, output) + tokenizer.eos_token
 
         texts.append(text)
 
@@ -305,6 +321,6 @@ HF_TOKEN = get_secret("HF_TOKEN")
 
 HF_USER = get_secret("HF_USER")
 
-HF_REPO = f"{HF_USER}/{MODEL_CHOICE}-financial-reasoner-v3"
+HF_REPO = f"{HF_USER}/{MODEL_CHOICE}-financial-reasoner-v4"
 
 model.push_to_hub_merged(HF_REPO, tokenizer, save_method = "lora", token = HF_TOKEN)

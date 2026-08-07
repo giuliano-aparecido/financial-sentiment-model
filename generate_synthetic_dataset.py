@@ -75,12 +75,29 @@ for the full diagnosis.
    for BULLISH/BEARISH now includes a representative mix of both tiers
    instead of accidentally holding out only whichever tier happens to be
    appended last.
+10. v4: added `market_data`, `valuation`, `earnings` fields to each row and
+    `answer` to the output JSON - the "full analyst pipeline" expansion.
+    Each company's synthetic fundamentals (price, P/E, EPS, dividend yield,
+    52-week range, book value/share) are derived from a single per-ticker
+    random price draw (PRICE_RANGES) so a row's market_data/valuation/
+    earnings blocks stay internally consistent rather than being
+    independently-rolled numbers that could contradict each other. Valuation
+    is a real Graham Number computation (sqrt(22.5 x EPS x book value/share))
+    against the same synthetic price - never LLM-generated or hand-waved.
+    Earnings beat/miss direction matches the example's resolved sentiment
+    direction. Each block independently has a DATA_UNAVAILABLE_PROB chance
+    of rendering as "Data unavailable." so the model is trained on, not just
+    hoped to handle, partial production data gaps. `answer` is a templated
+    1-sentence direct response to `user_query`, looked up by (question type,
+    resolved direction) from ANSWER_TEMPLATES.
 
-Output schema is UNCHANGED from the original -
-{"impacted_stocks": [{"ticker", "reasoning", "direction", "confidence"}]} -
-because app/services/inference.py in financial-sentiment-api parses
-analysis_json["impacted_stocks"][0] directly. Changing this schema requires
-a matching change there; out of scope here.
+Output schema (v4) - {"ticker", "user_query", "market_data", "valuation",
+"earnings", "news", "output"} where output is
+{"impacted_stocks": [{"ticker", "reasoning", "direction", "confidence",
+"answer"}]}. Matches the canonical prompt template shared with
+generate_real_dataset.py, gpu/train_model.py, tpu/train_model.py, and
+financial-sentiment-api's app/services/inference.py - keep all in sync
+(see CONTRIBUTING.md's 4-way sync rule).
 
 Output: two JSONL files (one JSON object per line), train and val.
 """
@@ -139,6 +156,38 @@ INVENTED_COMPANIES = [
 
 ALL_COMPANIES = COMPANIES + INVENTED_COMPANIES
 
+# Per-ticker plausible price bands ($) - the single anchor each company's
+# other synthetic fundamentals (EPS, book value/share, market cap, 52-week
+# range) are derived from, so a given example's market_data/valuation/
+# earnings blocks stay internally consistent with each other instead of
+# being independently rolled numbers that could contradict.
+PRICE_RANGES = {
+    "AAPL": (150.0, 220.0), "TSLA": (180.0, 280.0), "NVDA": (90.0, 160.0),
+    "AMZN": (140.0, 220.0), "MSFT": (350.0, 470.0), "GOOGL": (140.0, 200.0),
+    "META": (400.0, 600.0), "AMD": (100.0, 180.0), "JPM": (180.0, 260.0),
+    "DIS": (85.0, 130.0), "NFLX": (550.0, 750.0), "INTC": (18.0, 35.0),
+    "CRM": (230.0, 330.0), "BA": (150.0, 220.0), "PYPL": (55.0, 90.0),
+    "SHOP": (60.0, 100.0), "UBER": (60.0, 95.0), "SBUX": (75.0, 110.0),
+    "COIN": (150.0, 280.0), "PLTR": (25.0, 45.0),
+    "ZVEX": (15.0, 40.0), "QRNL": (5.0, 20.0), "FLTX": (20.0, 45.0),
+    "NMBS": (10.0, 30.0), "VLTR": (25.0, 60.0), "HRZN": (15.0, 35.0),
+}
+
+# Chance a given block is rendered as "Data unavailable." instead of real
+# content, applied independently per block - mirrors production, where
+# fundamentals/earnings/news are three separate fetches that can each fail
+# on their own (see app/services/fundamentals.py and earnings.py in
+# financial-sentiment-api). Trained on and served identically so the model
+# learns to degrade gracefully rather than only being hoped to.
+DATA_UNAVAILABLE_PROB = 0.15
+
+# Chance a company's synthetic trailing EPS is negative this example -
+# forces the Graham Number valuation into its "not applicable" path (no
+# sqrt of a negative number), matching the real valuation.py's behavior for
+# loss-making companies. Kept low since most real large/mid-caps are
+# profitable most quarters.
+LOSS_MAKING_PROB = 0.08
+
 PUBLISHERS = [
     "Reuters", "Bloomberg", "MarketWatch", "CNBC", "Yahoo Finance",
     "Barron's", "The Motley Fool", "Seeking Alpha", "Business Insider", "AP News",
@@ -186,6 +235,72 @@ USER_QUESTION_TEMPLATES = [
     "Give me your read on {ticker}.",
     "",  # some users submit with no real question at all
 ]
+
+# Index-aligned with USER_QUESTION_TEMPLATES above - each question template
+# maps to exactly one question "type" used to pick the matching answer below.
+QUESTION_TYPES = [
+    "direction", "buy", "outlook", "worry", "impact",
+    "sell", "sentiment", "earnings", "read", "none",
+]
+
+# answer text for the new `answer` output field - direct response to
+# `user_query`, consistent with the resolved direction (BULLISH/BEARISH/
+# NEUTRAL; MIXED_SIGNAL_SCENARIOS resolves to one of these before this
+# lookup happens, so only 3 directions are needed here). One template per
+# (question type, direction) - deliberately plain/formulaic since this is
+# what the model should learn to produce, not literary variety.
+ANSWER_TEMPLATES = {
+    "direction": {
+        "BULLISH": "The recent news points to upward momentum for {ticker}, so the near-term bias leans higher.",
+        "BEARISH": "The recent news points to downward pressure on {ticker}, so the near-term bias leans lower.",
+        "NEUTRAL": "The recent news doesn't point clearly in either direction for {ticker}, so a flat near-term move is the more likely outcome.",
+    },
+    "buy": {
+        "BULLISH": "Yes, the current signals lean favorably enough that {ticker} looks like a reasonable buy here.",
+        "BEARISH": "No, the current signals are negative enough that {ticker} doesn't look like a buy right now.",
+        "NEUTRAL": "It's a close call - nothing here strongly argues for or against buying {ticker} at current levels.",
+    },
+    "outlook": {
+        "BULLISH": "The outlook for {ticker} this quarter looks positive based on the latest developments.",
+        "BEARISH": "The outlook for {ticker} this quarter looks challenged based on the latest developments.",
+        "NEUTRAL": "The outlook for {ticker} this quarter looks steady, without a clear positive or negative catalyst.",
+    },
+    "worry": {
+        "BULLISH": "No significant cause for concern - the latest news on {ticker} is constructive.",
+        "BEARISH": "Some caution is warranted - the latest news on {ticker} raises real concerns.",
+        "NEUTRAL": "Not particularly - nothing in the latest news materially changes the risk picture for {ticker}.",
+    },
+    "impact": {
+        "BULLISH": "The latest news should be a net positive for {ticker}.",
+        "BEARISH": "The latest news should weigh on {ticker}.",
+        "NEUTRAL": "The latest news is unlikely to move {ticker} much either way.",
+    },
+    "sell": {
+        "BULLISH": "Not really - the current signals argue for holding rather than selling {ticker}.",
+        "BEARISH": "It's a reasonable moment to consider trimming {ticker}, given the negative signals.",
+        "NEUTRAL": "There's no strong signal here to justify selling {ticker} now versus holding.",
+    },
+    "sentiment": {
+        "BULLISH": "Sentiment on {ticker} is bullish today.",
+        "BEARISH": "Sentiment on {ticker} is bearish today.",
+        "NEUTRAL": "Sentiment on {ticker} is neutral today.",
+    },
+    "earnings": {
+        "BULLISH": "The signals point toward {ticker} beating expectations.",
+        "BEARISH": "The signals point toward {ticker} falling short of expectations.",
+        "NEUTRAL": "There's no strong signal either way on whether {ticker} beats expectations.",
+    },
+    "read": {
+        "BULLISH": "Overall, {ticker} looks bullish based on the current data and news.",
+        "BEARISH": "Overall, {ticker} looks bearish based on the current data and news.",
+        "NEUTRAL": "Overall, {ticker} looks balanced - no strong read either way right now.",
+    },
+    "none": {
+        "BULLISH": "{ticker} is showing a bullish setup based on current data and news.",
+        "BEARISH": "{ticker} is showing a bearish setup based on current data and news.",
+        "NEUTRAL": "{ticker} looks neutral right now, without a clear directional catalyst.",
+    },
+}
 
 WEEKDAYS = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]
 MONTHS = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"]
@@ -485,8 +600,140 @@ def build_news_block(primary_headlines):
 
 
 def build_user_query(ticker):
-    template = random.choice(USER_QUESTION_TEMPLATES)
-    return template.format(ticker=ticker) if template else ""
+    idx = random.randrange(len(USER_QUESTION_TEMPLATES))
+    template = USER_QUESTION_TEMPLATES[idx]
+    query = template.format(ticker=ticker) if template else ""
+    return query, QUESTION_TYPES[idx]
+
+
+def format_market_cap(value):
+    if value >= 1e12:
+        return f"${value / 1e12:.2f}T"
+    return f"${value / 1e9:.1f}B"
+
+
+def make_fundamentals(company, fields):
+    # Derives every other synthetic fundamental from a single random price
+    # draw so a given example's numbers stay internally consistent (e.g.
+    # price implies EPS implies Graham Number implies over/undervalued -
+    # they can't independently contradict each other the way unrelated
+    # random draws could).
+    ticker = company[0]
+    price_low, price_high = PRICE_RANGES[ticker]
+    price = round(random.uniform(price_low, price_high), 2)
+
+    pe_trailing = round(random.uniform(6.0, 28.0), 1)
+    eps_trailing = round(price / pe_trailing, 2)
+    if random.random() < LOSS_MAKING_PROB:
+        eps_trailing = -abs(round(random.uniform(0.10, 3.0), 2))
+    pe_forward = round(pe_trailing * random.uniform(0.82, 1.05), 1)
+
+    div_yield = round(random.uniform(0.1, 3.2), 2) if random.random() < 0.6 else 0.0
+
+    year_low = round(price * random.uniform(0.72, 0.93), 2)
+    year_high = round(price * random.uniform(1.07, 1.38), 2)
+
+    # Tuned (jointly with pe_trailing above) so PE*PB dips below the Graham
+    # Number's implicit 22.5 threshold roughly a third of the time - an
+    # earlier, higher-floor range made almost every synthetic row land on
+    # "overvalued" regardless of the actual numbers, which would just teach
+    # the model to ignore this block rather than actually read it.
+    pb_ratio = round(random.uniform(0.4, 4.0), 1)
+    book_value_per_share = round(price / pb_ratio, 2)
+
+    rev_low, rev_high = company[3]
+    # Loosely ties market cap to the company's revenue band (bigger revenue
+    # -> more shares outstanding, roughly) without needing a second hand-
+    # authored per-ticker range - precision doesn't matter here, only that
+    # price * shares stays a plausible, internally consistent market cap.
+    shares_b = max(0.05, min(20.0, ((rev_low + rev_high) / 2) * random.uniform(0.04, 0.35)))
+    market_cap = price * shares_b * 1e9
+
+    anchor = datetime.date(2026, 8, 5)
+    last_q_date = anchor - datetime.timedelta(days=random.randint(45, 100))
+    next_earnings_date = anchor + datetime.timedelta(days=random.randint(35, 95))
+
+    last_q_revenue = fields["rev"]  # reuse the same draw headline templates use,
+                                     # so an example whose headline quotes revenue
+                                     # can't contradict its own earnings block
+    yoy_growth = round(random.uniform(-8.0, 22.0), 1)
+
+    last_q_eps = round(max(eps_trailing, 0.05) / 4 * random.uniform(0.85, 1.15), 2) \
+        if eps_trailing > 0 else round(-abs(eps_trailing) / 4 * random.uniform(0.85, 1.15), 2)
+
+    return {
+        "price": price,
+        "pe_trailing": pe_trailing,
+        "pe_forward": pe_forward,
+        "eps_trailing": eps_trailing,
+        "div_yield": div_yield,
+        "year_low": year_low,
+        "year_high": year_high,
+        "book_value_per_share": book_value_per_share,
+        "market_cap": market_cap,
+        "last_q_date": last_q_date,
+        "next_earnings_date": next_earnings_date,
+        "last_q_revenue": last_q_revenue,
+        "yoy_growth": yoy_growth,
+        "last_q_eps": last_q_eps,
+    }
+
+
+def render_market_data(fnd):
+    if random.random() < DATA_UNAVAILABLE_PROB:
+        return "Data unavailable."
+    return (
+        f"Price: ${fnd['price']:.2f} | Market Cap: {format_market_cap(fnd['market_cap'])}\n"
+        f"P/E (trailing): {fnd['pe_trailing']:.1f} | P/E (forward): {fnd['pe_forward']:.1f}\n"
+        f"EPS (trailing): ${fnd['eps_trailing']:.2f} | Dividend Yield: {fnd['div_yield']:.2f}%\n"
+        f"52-Week Range: ${fnd['year_low']:.2f} - ${fnd['year_high']:.2f}"
+    )
+
+
+def render_valuation(fnd):
+    if random.random() < DATA_UNAVAILABLE_PROB:
+        return "Data unavailable."
+    if fnd["eps_trailing"] <= 0 or fnd["book_value_per_share"] <= 0:
+        return "Not applicable (negative or missing EPS/book value)."
+    graham = (22.5 * fnd["eps_trailing"] * fnd["book_value_per_share"]) ** 0.5
+    pct = (fnd["price"] - graham) / graham * 100
+    verdict = "overvalued" if pct >= 0 else "undervalued"
+    return (
+        f"Intrinsic Value (Graham Number): ${graham:.2f}\n"
+        f"vs Current Price: {verdict} by ~{abs(pct):.0f}%"
+    )
+
+
+def render_earnings(fnd, direction):
+    if random.random() < DATA_UNAVAILABLE_PROB:
+        return "Data unavailable."
+    # Coherent with the resolved direction: a bullish example's earnings
+    # line shows a beat, a bearish one a miss, a neutral one in-line -
+    # matching the scenario's news headlines instead of being an
+    # independently-rolled, potentially contradictory number.
+    surprise_pct = round(random.uniform(2.0, 12.0), 1)
+    actual_eps = fnd["last_q_eps"]
+    if direction == "BULLISH":
+        est_eps = round(actual_eps / (1 + surprise_pct / 100), 2)
+        surprise_note = f"beat est. ${est_eps:.2f}"
+        yoy = abs(fnd["yoy_growth"])
+    elif direction == "BEARISH":
+        est_eps = round(actual_eps / (1 - surprise_pct / 100), 2)
+        surprise_note = f"missed est. ${est_eps:.2f}"
+        yoy = -abs(fnd["yoy_growth"])
+    else:
+        est_eps = actual_eps
+        surprise_note = f"in line with est. ${est_eps:.2f}"
+        yoy = fnd["yoy_growth"] / 3  # neutral quarters drift near flat YoY
+
+    date_str = fnd["last_q_date"].isoformat()
+    next_str = fnd["next_earnings_date"].isoformat()
+    sign = "+" if yoy >= 0 else ""
+    return (
+        f"Last Quarter ({date_str}): Revenue ${fnd['last_q_revenue']:.1f}B "
+        f"({sign}{yoy:.1f}% YoY), EPS ${actual_eps:.2f} ({surprise_note})\n"
+        f"Next Earnings Date: {next_str}"
+    )
 
 
 def make_example(company, category):
@@ -517,7 +764,14 @@ def make_example(company, category):
     reasoning = reasoning_template.format(**fields)
 
     news_block = build_news_block(filled_headlines)
-    user_query = build_user_query(ticker)
+    user_query, qtype = build_user_query(ticker)
+
+    fnd = make_fundamentals(company, fields)
+    market_data_block = render_market_data(fnd)
+    valuation_block = render_valuation(fnd)
+    earnings_block = render_earnings(fnd, direction)
+
+    answer = ANSWER_TEMPLATES[qtype][direction].format(ticker=ticker)
 
     confidence = round(random.uniform(conf_low, conf_high), 2)
 
@@ -528,6 +782,7 @@ def make_example(company, category):
                 "reasoning": reasoning,
                 "direction": direction,
                 "confidence": confidence,
+                "answer": answer,
             }
         ]
     }
@@ -540,6 +795,9 @@ def make_example(company, category):
                            # training script can build "Target Stock: {ticker}" without
                            # parsing the output JSON string
         "user_query": user_query,
+        "market_data": market_data_block,
+        "valuation": valuation_block,
+        "earnings": earnings_block,
         "news": news_block,
         "output": json.dumps(output_payload, indent=2),
         "_split": split,  # stripped before writing - see main()
