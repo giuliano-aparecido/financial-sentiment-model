@@ -79,6 +79,15 @@ got on synthetic val):
    +/-0.03 or +/-0.04 instead of the default +/-0.02) can write to
    different filenames instead of overwriting the default run. See the
    "Threshold experiment" note below the constants.
+4. v4: added `market_data`, `valuation`, `earnings` fields (fetched from
+   yfinance's quarterly statements/earnings_dates, AS OF the headline's own
+   publish date - not today's figures) and `answer` (Gemini-written, from
+   the same call as `reasoning`) - see fetch_ticker_fundamentals_history's
+   docstring for exactly which pieces are genuinely as-of-date vs a
+   documented current-snapshot approximation (shares outstanding, forward
+   P/E, dividend yield, 52-week range). direction/confidence remain purely
+   price-move-derived, unchanged. Mirrors generate_synthetic_dataset.py's
+   v4 addition field-for-field so both datasets stay concatenable.
 
 Earlier history: this script originally used yfinance's Ticker.news for
 headlines, which only returns the current "latest ~10" items with no
@@ -108,15 +117,17 @@ docs/training-results-analysis.md.)
 
 Output schema, ### Input: field structure, and user_query phrasing all
 match generate_synthetic_dataset.py exactly (down to reusing its
-NOISE_HEADLINES and USER_QUESTION_TEMPLATES verbatim), so both datasets'
-JSONL rows are interchangeable and can be concatenated/mixed for training:
+NOISE_HEADLINES, USER_QUESTION_TEMPLATES, QUESTION_TYPES, and
+ANSWER_TEMPLATES verbatim), so both datasets' JSONL rows are interchangeable
+and can be concatenated/mixed for training:
 
     data_files={"train": ["dataset_train.jsonl", "dataset_train_real.jsonl"], ...}
 
-Requirements: `pip install yfinance httpx feedparser google-genai`, network
-access, and a Gemini API key (GEMINI_API_KEY) - see generate_grounded_
-reasoning for where that's read from and why the model choice is
-gemini-3.5-flash-lite specifically.
+Requirements: `pip install yfinance httpx feedparser google-genai pandas`
+(pandas is also a transitive yfinance dependency, so usually already
+present), network access, and a Gemini API key (GEMINI_API_KEY) - see
+generate_grounded_reasoning for where that's read from and why the model
+choice is gemini-3.5-flash-lite specifically.
 Unlike the synthetic generator, this is NOT reproducible/deterministic -
 querying the same historical window twice can return different results as
 Google's index changes, and Gemini's reasoning text varies run to run even
@@ -158,12 +169,13 @@ import urllib.parse
 try:
     import feedparser
     import httpx
+    import pandas as pd
     import yfinance as yf
     from google import genai
 except ImportError as e:
     raise SystemExit(
         f"This script needs a package that isn't installed ({e.name}). "
-        "Run: pip install yfinance httpx feedparser google-genai"
+        "Run: pip install yfinance httpx feedparser google-genai pandas"
     )
 
 # get_secret() works on both Colab (Secrets, key icon in the left sidebar)
@@ -319,10 +331,79 @@ USER_QUESTION_TEMPLATES = [
     "",  # some users submit with no real question at all
 ]
 
+# Reused verbatim from generate_synthetic_dataset.py - index-aligned with
+# USER_QUESTION_TEMPLATES above, and used as the ANSWER_TEMPLATES fallback
+# below when Gemini is unavailable (quota exhausted, call failed).
+QUESTION_TYPES = [
+    "direction", "buy", "outlook", "worry", "impact",
+    "sell", "sentiment", "earnings", "read", "none",
+]
+
+ANSWER_TEMPLATES = {
+    "direction": {
+        "BULLISH": "The recent news points to upward momentum for {ticker}, so the near-term bias leans higher.",
+        "BEARISH": "The recent news points to downward pressure on {ticker}, so the near-term bias leans lower.",
+        "NEUTRAL": "The recent news doesn't point clearly in either direction for {ticker}, so a flat near-term move is the more likely outcome.",
+    },
+    "buy": {
+        "BULLISH": "Yes, the current signals lean favorably enough that {ticker} looks like a reasonable buy here.",
+        "BEARISH": "No, the current signals are negative enough that {ticker} doesn't look like a buy right now.",
+        "NEUTRAL": "It's a close call - nothing here strongly argues for or against buying {ticker} at current levels.",
+    },
+    "outlook": {
+        "BULLISH": "The outlook for {ticker} this quarter looks positive based on the latest developments.",
+        "BEARISH": "The outlook for {ticker} this quarter looks challenged based on the latest developments.",
+        "NEUTRAL": "The outlook for {ticker} this quarter looks steady, without a clear positive or negative catalyst.",
+    },
+    "worry": {
+        "BULLISH": "No significant cause for concern - the latest news on {ticker} is constructive.",
+        "BEARISH": "Some caution is warranted - the latest news on {ticker} raises real concerns.",
+        "NEUTRAL": "Not particularly - nothing in the latest news materially changes the risk picture for {ticker}.",
+    },
+    "impact": {
+        "BULLISH": "The latest news should be a net positive for {ticker}.",
+        "BEARISH": "The latest news should weigh on {ticker}.",
+        "NEUTRAL": "The latest news is unlikely to move {ticker} much either way.",
+    },
+    "sell": {
+        "BULLISH": "Not really - the current signals argue for holding rather than selling {ticker}.",
+        "BEARISH": "It's a reasonable moment to consider trimming {ticker}, given the negative signals.",
+        "NEUTRAL": "There's no strong signal here to justify selling {ticker} now versus holding.",
+    },
+    "sentiment": {
+        "BULLISH": "Sentiment on {ticker} is bullish today.",
+        "BEARISH": "Sentiment on {ticker} is bearish today.",
+        "NEUTRAL": "Sentiment on {ticker} is neutral today.",
+    },
+    "earnings": {
+        "BULLISH": "The signals point toward {ticker} beating expectations.",
+        "BEARISH": "The signals point toward {ticker} falling short of expectations.",
+        "NEUTRAL": "There's no strong signal either way on whether {ticker} beats expectations.",
+    },
+    "read": {
+        "BULLISH": "Overall, {ticker} looks bullish based on the current data and news.",
+        "BEARISH": "Overall, {ticker} looks bearish based on the current data and news.",
+        "NEUTRAL": "Overall, {ticker} looks balanced - no strong read either way right now.",
+    },
+    "none": {
+        "BULLISH": "{ticker} is showing a bullish setup based on current data and news.",
+        "BEARISH": "{ticker} is showing a bearish setup based on current data and news.",
+        "NEUTRAL": "{ticker} looks neutral right now, without a clear directional catalyst.",
+    },
+}
+
 
 def build_user_query(ticker):
-    template = random.choice(USER_QUESTION_TEMPLATES)
-    return template.format(ticker=ticker) if template else ""
+    idx = random.randrange(len(USER_QUESTION_TEMPLATES))
+    template = USER_QUESTION_TEMPLATES[idx]
+    query = template.format(ticker=ticker) if template else ""
+    return query, QUESTION_TYPES[idx]
+
+
+def format_market_cap(value):
+    if value >= 1e12:
+        return f"${value / 1e12:.2f}T"
+    return f"${value / 1e9:.1f}B"
 
 
 def _format_date(dt):
@@ -436,6 +517,233 @@ def confidence_from_move(direction, pct_change):
     return round(0.65 + 0.30 * magnitude, 2)
 
 
+def fetch_ticker_fundamentals_history(ticker_obj):
+    """Fetches quarterly income statement, quarterly balance sheet, and the
+    earnings-date history ONCE per ticker (not once per headline) - each is
+    reused across all of that ticker's headlines, filtered down to
+    'as-of the headline date' inside as_of_quarterly()/build_fundamentals_
+    blocks() below. This is the same look-ahead-bias mitigation LOOKBACK_
+    WEEKS/SAFETY_BUFFER_DAYS already apply to the price-move label: a
+    training row must only ever see data that would genuinely have been
+    knowable at the headline's own publish date, not a later-restated or
+    since-updated figure.
+
+    Known, documented approximation: yfinance's quarterly statements only
+    go back ~4-5 quarters from TODAY (not from the headline date), and
+    Ticker.info's sharesOutstanding/forward-PE/dividend-yield/52-week-range
+    fields are all CURRENT snapshots with no historical equivalent exposed
+    by yfinance. For headlines toward the older end of LOOKBACK_WEEKS this
+    means: (a) EPS/book-value-per-share - the two inputs that actually
+    drive the Graham Number valuation math - are still filtered to
+    strictly-before the headline date, so that part stays real and
+    look-ahead-free; (b) shares outstanding, forward P/E, dividend yield,
+    and the 52-week range use today's current values as a residual
+    approximation rather than the true as-of-date figures, since yfinance
+    doesn't expose historical versions of those; (c) YoY revenue growth
+    needs a quarter from ~a year before the as-of quarter, which the
+    4-5-quarter window frequently doesn't reach - when it doesn't, the YoY
+    figure is simply omitted from the earnings block rather than guessed.
+    All three are deliberate, bounded approximations, not silently-ignored
+    gaps - see the module docstring.
+
+    Fails soft per-field: any individual fetch that raises leaves that
+    field None rather than aborting the whole ticker.
+    """
+    result = {"income": None, "balance": None, "earnings_dates": None, "shares_outstanding": None}
+    try:
+        result["income"] = ticker_obj.quarterly_income_stmt
+    except Exception as e:
+        print(f"    Warning: quarterly_income_stmt fetch failed: {e}", flush=True)
+    try:
+        result["balance"] = ticker_obj.quarterly_balance_sheet
+    except Exception as e:
+        print(f"    Warning: quarterly_balance_sheet fetch failed: {e}", flush=True)
+    try:
+        result["earnings_dates"] = ticker_obj.earnings_dates
+    except Exception as e:
+        print(f"    Warning: earnings_dates fetch failed: {e}", flush=True)
+    try:
+        result["shares_outstanding"] = ticker_obj.info.get("sharesOutstanding")
+    except Exception as e:
+        print(f"    Warning: shares_outstanding/info fetch failed: {e}", flush=True)
+    return result
+
+
+def _row_series(df, row_names):
+    """Returns the first matching row (a Series indexed by period-end
+    Timestamp) from a yfinance quarterly statement DataFrame for whichever
+    of row_names actually exists - the exact row label varies slightly
+    across tickers/filings (e.g. some report 'Diluted EPS', others only
+    'Basic EPS')."""
+    if df is None or df.empty:
+        return None
+    for name in row_names:
+        if name in df.index:
+            return df.loc[name]
+    return None
+
+
+def as_of_quarterly(series, as_of_date):
+    """Most recent value in a quarterly-indexed Series whose period-end is
+    strictly before as_of_date, i.e. the last quarter that would already
+    have been reported by then - plus that period's own end-date, so
+    callers can label which quarter the figure is from. (None, None) if
+    series is None or nothing qualifies."""
+    if series is None:
+        return None, None
+    as_of_ts = pd.Timestamp(as_of_date)
+    prior = series.dropna()
+    prior = prior[prior.index < as_of_ts]
+    if prior.empty:
+        return None, None
+    period = prior.index.max()
+    return float(prior[period]), period
+
+
+def as_of_price(ticker_obj, as_of_date):
+    """Closing price on or just before as_of_date - the 'current market
+    data' a user asking about this headline on this date would actually
+    have seen. Fails soft to None."""
+    try:
+        start = as_of_date - datetime.timedelta(days=10)
+        hist = ticker_obj.history(start=start, end=as_of_date + datetime.timedelta(days=1))
+        if hist.empty:
+            return None
+        return float(hist["Close"].iloc[-1])
+    except Exception:
+        return None
+
+
+def build_fundamentals_blocks(ticker_obj, fundamentals_history, as_of_date):
+    """Returns (market_data_block, valuation_block, earnings_block)
+    strings, each independently 'Data unavailable.' if that piece couldn't
+    be resolved as-of as_of_date - mirrors generate_synthetic_dataset.py's
+    per-block rendering and financial-sentiment-api's real fetchers, so the
+    model trains on the same range of shapes (including real gaps) it'll
+    see served in production.
+    """
+    income = fundamentals_history["income"]
+    balance = fundamentals_history["balance"]
+    shares = fundamentals_history["shares_outstanding"]
+
+    price = as_of_price(ticker_obj, as_of_date)
+
+    eps_series = _row_series(income, ["Diluted EPS", "Basic EPS"])
+    as_of_ts = pd.Timestamp(as_of_date)
+    eps_trailing = None
+    if eps_series is not None:
+        prior_eps = eps_series.dropna()
+        prior_eps = prior_eps[prior_eps.index < as_of_ts].sort_index(ascending=False)
+        if len(prior_eps) >= 4:
+            eps_trailing = float(prior_eps.iloc[:4].sum())
+        elif len(prior_eps) >= 1:
+            # Only a single quarter available before this headline -
+            # annualize it as a rough TTM stand-in (documented above).
+            eps_trailing = float(prior_eps.iloc[0]) * 4
+
+    revenue, rev_period = as_of_quarterly(_row_series(income, ["Total Revenue"]), as_of_date)
+    equity, _ = as_of_quarterly(
+        _row_series(balance, ["Common Stock Equity", "Stockholders Equity",
+                               "Total Equity Gross Minority Interest"]),
+        as_of_date,
+    )
+
+    book_value_per_share = (equity / shares) if (equity is not None and shares) else None
+    market_cap = (price * shares) if (price is not None and shares) else None
+
+    # --- market_data block ---
+    if price is not None and market_cap is not None and eps_trailing:
+        pe_trailing = price / eps_trailing if eps_trailing > 0 else None
+        div_yield, year_low, year_high, forward_pe = None, None, None, None
+        try:
+            info = ticker_obj.info
+            div_yield = info.get("dividendYield")
+            year_low = info.get("fiftyTwoWeekLow")
+            year_high = info.get("fiftyTwoWeekHigh")
+            forward_pe = info.get("forwardPE")
+        except Exception:
+            pass
+        pe_trailing_str = f"{pe_trailing:.1f}" if pe_trailing else "N/A"
+        pe_forward_str = f"{forward_pe:.1f}" if forward_pe else "N/A"
+        div_yield_str = f"{div_yield:.2f}%" if div_yield else "0.00%"
+        range_str = (f"${year_low:.2f} - ${year_high:.2f}"
+                     if (year_low and year_high) else "N/A")
+        market_data_block = (
+            f"Price: ${price:.2f} | Market Cap: {format_market_cap(market_cap)}\n"
+            f"P/E (trailing): {pe_trailing_str} | P/E (forward): {pe_forward_str}\n"
+            f"EPS (trailing): ${eps_trailing:.2f} | Dividend Yield: {div_yield_str}\n"
+            f"52-Week Range: {range_str}"
+        )
+    else:
+        market_data_block = "Data unavailable."
+
+    # --- valuation block ---
+    if eps_trailing and book_value_per_share and price is not None:
+        if eps_trailing <= 0 or book_value_per_share <= 0:
+            valuation_block = "Not applicable (negative or missing EPS/book value)."
+        else:
+            graham = (22.5 * eps_trailing * book_value_per_share) ** 0.5
+            pct = (price - graham) / graham * 100
+            verdict = "overvalued" if pct >= 0 else "undervalued"
+            valuation_block = (
+                f"Intrinsic Value (Graham Number): ${graham:.2f}\n"
+                f"vs Current Price: {verdict} by ~{abs(pct):.0f}%"
+            )
+    else:
+        valuation_block = "Data unavailable."
+
+    # --- earnings block ---
+    earnings_dates = fundamentals_history["earnings_dates"]
+    earnings_block = "Data unavailable."
+    if revenue is not None:
+        # YoY needs a same-quarter-prior-year revenue figure, which the
+        # ~4-5-quarter yfinance window frequently doesn't reach - omit the
+        # parenthetical when it's not available rather than guess it.
+        rev_series = _row_series(income, ["Total Revenue"])
+        yoy_str = ""
+        if rev_series is not None:
+            prior_year_period = rev_period - pd.DateOffset(months=12)
+            candidates = rev_series.dropna()
+            nearest = candidates[(candidates.index - prior_year_period).map(abs) < pd.Timedelta(days=20)]
+            if not nearest.empty:
+                prior_rev = float(nearest.iloc[0])
+                if prior_rev:
+                    yoy = (revenue - prior_rev) / prior_rev * 100
+                    yoy_str = f" ({'+' if yoy >= 0 else ''}{yoy:.1f}% YoY)"
+
+        eps_note = ""
+        if earnings_dates is not None and not earnings_dates.empty:
+            reported = earnings_dates.dropna(subset=["Reported EPS"]) \
+                if "Reported EPS" in earnings_dates.columns else earnings_dates.iloc[0:0]
+            prior_reports = reported[reported.index < as_of_ts]
+            if not prior_reports.empty:
+                row = prior_reports.sort_index(ascending=False).iloc[0]
+                actual = row.get("Reported EPS")
+                est = row.get("EPS Estimate")
+                if actual is not None and est is not None and est:
+                    if actual > est:
+                        eps_note = f", EPS ${actual:.2f} (beat est. ${est:.2f})"
+                    elif actual < est:
+                        eps_note = f", EPS ${actual:.2f} (missed est. ${est:.2f})"
+                    else:
+                        eps_note = f", EPS ${actual:.2f} (in line with est. ${est:.2f})"
+
+        next_line = ""
+        if earnings_dates is not None and not earnings_dates.empty:
+            future = earnings_dates[earnings_dates.index > as_of_ts]
+            if not future.empty:
+                next_date = future.sort_index().index.min()
+                next_line = f"\nNext Earnings Date: {next_date.date().isoformat()}"
+
+        earnings_block = (
+            f"Last Quarter ({rev_period.date().isoformat()}): "
+            f"Revenue {format_market_cap(revenue)}{yoy_str}{eps_note}"
+            f"{next_line}"
+        )
+
+    return market_data_block, valuation_block, earnings_block
+
+
 def build_news_block(primary_headline_line):
     lines = [primary_headline_line]
     n_noise = random.randint(1, 3)
@@ -463,21 +771,34 @@ def _template_reasoning(ticker, direction, pct_change, actual_window_days):
     )
 
 
-GEMINI_REASONING_PROMPT = """You are labeling training data for a financial-news sentiment model.
+GEMINI_REASONING_PROMPT = """You are labeling training data for a financial-news analyst model.
 
-You are given a stock ticker, a real news headline about it, and a directional label (BULLISH, BEARISH, or NEUTRAL). That label was already determined from the stock's ACTUAL subsequent price move over the next few trading days - not from reading the headline. You do not have access to that price data, and you must not reference it, invent a percentage move, or write anything implying you know what the stock did afterward.
+You are given a stock ticker, its current market data, a valuation estimate, its most recent earnings, a real news headline about it, a user's question, and a directional label (BULLISH, BEARISH, or NEUTRAL). That label was already determined from the stock's ACTUAL subsequent price move over the next few trading days - not from reading anything below. You do not have access to that price-move data, and you must not reference it, invent a percentage move, or write anything implying you know what the stock did afterward.
 
-Write 2-3 sentences of reasoning that:
-- Reads the headline itself and explains why this kind of news is plausibly consistent with a {direction} outlook - the way a financial analyst would talk through the headline, not the outcome.
-- Does not invent facts, numbers, or details that are not in the headline.
-- If the headline's content does not obviously support {direction} (this happens often - many price moves in a short window are unrelated to the nearest headline), say so plainly - call it a weak or indirect signal rather than forcing a confident causal claim that isn't there.
-- If the headline's content clearly points the OPPOSITE way from {direction} (e.g. a headline reporting good news paired with a BEARISH label, or bad news paired with BULLISH - this happens often, since the label reflects the actual subsequent move and headlines don't always predict it), do NOT invent a contrarian story to force a fit - phrases like "already priced in," "overbought/oversold," or "the market sees through this" sound analytical but aren't something you can actually know from a single headline, and a model trained on that kind of reasoning learns to talk itself out of headlines it read correctly. Instead say plainly that the headline's own content points the other way, and that the labeled outcome likely reflects other developments not visible in this headline - and use a low confidence score (0.5-0.6) in that case, since the label isn't actually explained by what you were given.
+Write TWO things, each as its own labeled line (see OUTPUT FORMAT):
+
+1. REASONING (2-3 sentences): Reads the headline and explains why it's plausibly consistent with a {direction} outlook - the way a financial analyst would talk through the available evidence, not the outcome. Weave in the market data, valuation, or earnings below ONLY where they genuinely reinforce or complicate the headline's own signal - don't force a mention if a block is irrelevant to this specific headline or says "Data unavailable."/"Not applicable", and never invent facts or numbers that aren't in what you were given.
+   - If the headline's content does not obviously support {direction} (this happens often - many price moves in a short window are unrelated to the nearest headline), say so plainly - call it a weak or indirect signal rather than forcing a confident causal claim that isn't there.
+   - If the headline's content clearly points the OPPOSITE way from {direction} (e.g. a headline reporting good news paired with a BEARISH label, or bad news paired with BULLISH - this happens often, since the label reflects the actual subsequent move and headlines don't always predict it), do NOT invent a contrarian story to force a fit - phrases like "already priced in," "overbought/oversold," or "the market sees through this" sound analytical but aren't something you can actually know from a single headline, and a model trained on that kind of reasoning learns to talk itself out of headlines it read correctly. Instead say plainly that the headline's own content points the other way, and that the labeled outcome likely reflects other developments not visible here.
+2. ANSWER (1-2 sentences): A direct, plain answer to the user's question below, consistent with {direction} and, where relevant, the data above. If the question is empty, give a general one-line read on {ticker} instead.
 
 Ticker: {ticker}
+Current Market Data:
+{market_data}
+
+Valuation:
+{valuation}
+
+Recent Earnings:
+{earnings}
+
 Headline: {headline}
+User Question: {user_query}
 Direction: {direction}
 
-Output ONLY the reasoning text - no preamble, no headers, no quotes around it."""
+OUTPUT FORMAT - exactly two lines, nothing else, no preamble or quotes:
+REASONING: <text>
+ANSWER: <text>"""
 
 
 def _retry_delay_seconds(error_text, default=10.0):
@@ -491,12 +812,37 @@ def _retry_delay_seconds(error_text, default=10.0):
     return float(match.group(1)) if match else default
 
 
-def generate_grounded_reasoning(ticker, title, direction, pct_change, actual_window_days):
+def _parse_gemini_output(text):
+    """Splits Gemini's 'REASONING: ...\\nANSWER: ...' response into (reasoning,
+    answer). Raises ValueError if the REASONING section is missing/empty -
+    callers catch that as a normal Gemini-call failure and fall back to the
+    template, same as any other malformed/empty response. A missing ANSWER
+    section alone is NOT fatal - the caller fills it from ANSWER_TEMPLATES,
+    since losing just the answer half shouldn't discard a good REASONING."""
+    reasoning_match = re.search(r"REASONING:\s*(.*?)(?:\n\s*ANSWER:|$)", text, re.DOTALL | re.IGNORECASE)
+    answer_match = re.search(r"ANSWER:\s*(.*)", text, re.DOTALL | re.IGNORECASE)
+    reasoning = reasoning_match.group(1).strip() if reasoning_match else ""
+    answer = answer_match.group(1).strip() if answer_match else ""
+    if not reasoning:
+        raise ValueError("no REASONING section in Gemini output")
+    return reasoning, answer
+
+
+def generate_grounded_reasoning(ticker, title, direction, pct_change, actual_window_days,
+                                 market_data, valuation, earnings, user_query, qtype):
     """Replaces the old fixed template (ticker + price move + direction,
     never the headline itself) with headline-grounded reasoning from
-    Gemini. That template was confirmed live as the root cause of a
-    trained model reproducing an identical memorized answer for a given
-    ticker across unrelated headlines - see the module docstring's item 0.
+    Gemini, now also weaving in market_data/valuation/earnings and writing
+    the `answer` field for user_query. That template was confirmed live as
+    the root cause of a trained model reproducing an identical memorized
+    answer for a given ticker across unrelated headlines - see the module
+    docstring's item 0.
+
+    Returns (reasoning, answer) - both fall back independently: a Gemini
+    failure/empty response/quota exhaustion falls back to
+    (_template_reasoning(...), ANSWER_TEMPLATES[qtype][direction]); a
+    response with REASONING but no parseable ANSWER line keeps Gemini's
+    reasoning and only falls back the answer half.
 
     Confirmed live: the free tier's 15-requests/minute cap gets hit almost
     immediately with no pacing, and every call after that silently fell
@@ -525,17 +871,25 @@ def generate_grounded_reasoning(ticker, title, direction, pct_change, actual_win
     use)."""
     global _gemini_daily_quota_exhausted
     reasoning = _template_reasoning(ticker, direction, pct_change, actual_window_days)
+    answer = ANSWER_TEMPLATES[qtype][direction].format(ticker=ticker)
     if _gemini_daily_quota_exhausted:
-        return reasoning
+        return reasoning, answer
 
-    prompt = GEMINI_REASONING_PROMPT.format(ticker=ticker, headline=title, direction=direction)
+    prompt = GEMINI_REASONING_PROMPT.format(
+        ticker=ticker, headline=title, direction=direction,
+        market_data=market_data, valuation=valuation, earnings=earnings,
+        user_query=user_query or "(none)",
+    )
     for attempt in range(GEMINI_MAX_RETRIES + 1):
         try:
             response = _gemini_client.models.generate_content(model=GEMINI_MODEL, contents=prompt)
             text = (response.text or "").strip()
             if not text:
                 raise ValueError("empty response")
-            reasoning = text
+            parsed_reasoning, parsed_answer = _parse_gemini_output(text)
+            reasoning = parsed_reasoning
+            if parsed_answer:
+                answer = parsed_answer
             break
         except Exception as e:
             error_text = str(e)
@@ -556,10 +910,10 @@ def generate_grounded_reasoning(ticker, title, direction, pct_change, actual_win
             break
     if not _gemini_daily_quota_exhausted:
         time.sleep(GEMINI_REQUEST_DELAY_SECONDS)
-    return reasoning
+    return reasoning, answer
 
 
-def make_real_example(ticker, ticker_obj, title, publisher, published_at):
+def make_real_example(ticker, ticker_obj, fundamentals_history, title, publisher, published_at):
     """Returns (example_or_None, skip_reason). skip_reason is None on
     success, otherwise whatever label_from_forward_return reported."""
     direction, pct_change, actual_window_days, skip_reason = label_from_forward_return(ticker_obj, published_at)
@@ -570,7 +924,15 @@ def make_real_example(ticker, ticker_obj, title, publisher, published_at):
     headline_line = f"- [{date_str}] {title} - {publisher}"
 
     confidence = confidence_from_move(direction, pct_change)
-    reasoning = generate_grounded_reasoning(ticker, title, direction, pct_change, actual_window_days)
+    user_query, qtype = build_user_query(ticker)
+
+    as_of_date = published_at.date() if published_at else datetime.date.today()
+    market_data, valuation, earnings = build_fundamentals_blocks(ticker_obj, fundamentals_history, as_of_date)
+
+    reasoning, answer = generate_grounded_reasoning(
+        ticker, title, direction, pct_change, actual_window_days,
+        market_data, valuation, earnings, user_query, qtype,
+    )
 
     output_payload = {
         "impacted_stocks": [
@@ -579,13 +941,17 @@ def make_real_example(ticker, ticker_obj, title, publisher, published_at):
                 "reasoning": reasoning,
                 "direction": direction,
                 "confidence": confidence,
+                "answer": answer,
             }
         ]
     }
 
     example = {
         "ticker": ticker,
-        "user_query": build_user_query(ticker),
+        "user_query": user_query,
+        "market_data": market_data,
+        "valuation": valuation,
+        "earnings": earnings,
         "news": build_news_block(headline_line),
         "output": json.dumps(output_payload, indent=2),
     }
@@ -667,6 +1033,12 @@ def generate_and_write():
         try:
             ticker_examples = []
             ticker_obj = yf.Ticker(ticker)
+            # Fetched ONCE per ticker and reused across all of its
+            # headlines below - avoids N x the quarterly-statement/
+            # earnings-dates calls per ticker (see fetch_ticker_
+            # fundamentals_history's docstring for why this is safe: each
+            # headline still gets its own as-of-date filtering downstream).
+            fundamentals_history = fetch_ticker_fundamentals_history(ticker_obj)
             is_val = ticker in VAL_HOLDOUT_TICKERS
 
             seen_titles = set()
@@ -698,7 +1070,8 @@ def generate_and_write():
                         continue
                     seen_titles.add(title)
 
-                    example, skip_reason = make_real_example(ticker, ticker_obj, title, publisher, published_at)
+                    example, skip_reason = make_real_example(
+                        ticker, ticker_obj, fundamentals_history, title, publisher, published_at)
                     time.sleep(PRICE_REQUEST_DELAY_SECONDS)
 
                     if example:

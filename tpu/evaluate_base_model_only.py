@@ -40,7 +40,7 @@ except NameError:
     HF_USER = get_secret("HF_USER")
     # Matches the "-tpu" suffix train_model.py pushes to, so this reloads
     # the TPU-trained adapter rather than the GPU-trained one at "-v3".
-    HF_REPO = f"{HF_USER}/{MODEL_CHOICE}-financial-reasoner-v3-tpu"
+    HF_REPO = f"{HF_USER}/{MODEL_CHOICE}-financial-reasoner-v4-tpu"
 
     # The pushed repo is adapter-only (see train_model.py's push-to-hub
     # comment) - AutoPeftModelForCausalLM is peft's loader built
@@ -63,7 +63,7 @@ alpaca_prompt = """Below is an instruction that describes a task, paired with an
 
 ### Instruction:
 
-Analyze the following financial news and output JSON containing the impacted stock ticker, detailed reasoning, directional sentiment (BULLISH/BEARISH/NEUTRAL), and confidence score.
+Analyze the following financial data and news and output JSON containing the impacted stock ticker, detailed reasoning, directional sentiment (BULLISH/BEARISH/NEUTRAL), confidence score, and a direct answer to the user's question.
 
 CRITICAL SENTIMENT RULES:
 
@@ -73,6 +73,16 @@ CRITICAL SENTIMENT RULES:
 
 Target Stock: {}
 User Question: {}
+
+Current Market Data:
+{}
+
+Valuation:
+{}
+
+Recent Earnings:
+{}
+
 Recent News & Results:
 {}
 
@@ -81,6 +91,10 @@ Recent News & Results:
 {}"""
 
 DIRECTION_RE = re.compile(r'"direction"\s*:\s*"(BULLISH|BEARISH|NEUTRAL)"')
+# Not used for accuracy scoring (direction is), just to surface the model's
+# generated answer text in the misclassification dump below so answer
+# quality can be eyeballed alongside the direction miss.
+ANSWER_RE = re.compile(r'"answer"\s*:\s*"((?:[^"\\]|\\.)*)"')
 EVAL_SAMPLE_PER_SOURCE = 100
 VAL_FILES = {"synthetic": "dataset_val.jsonl", "real": "dataset_val_real.jsonl"}
 
@@ -110,12 +124,15 @@ def expected_direction(row):
 
 
 def generate_response(row):
-    prompt = alpaca_prompt.format(row["ticker"], row["user_query"], row["news"], "")
+    prompt = alpaca_prompt.format(
+        row["ticker"], row["user_query"], row["market_data"],
+        row["valuation"], row["earnings"], row["news"], "",
+    )
     inputs = tokenizer(prompt, return_tensors="pt").to(model.device)
     with torch.no_grad():
         out = model.generate(
             **inputs,
-            max_new_tokens=300,
+            max_new_tokens=512,
             do_sample=False,
             pad_token_id=tokenizer.eos_token_id,
         )
@@ -182,10 +199,13 @@ def run_eval(label):
     for source, source_samples in samples.items():
         for (exp, pred), rows in sorted(source_samples.items()):
             for row, text in rows:
+                m = ANSWER_RE.search(text)
+                answer = m.group(1) if m else "(no answer field found)"
                 print(f"\n[{source}] expected {exp} -> predicted {pred or 'UNPARSEABLE'} | ticker={row['ticker']}")
                 print(f"User Question: {row['user_query']}")
                 print(f"News:\n{row['news']}")
                 print(f"Model output:\n{text}")
+                print(f"Answer: {answer}")
     print()
     return per_source
 

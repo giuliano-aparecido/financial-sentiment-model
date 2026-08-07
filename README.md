@@ -14,8 +14,9 @@ practice of doing it properly, not because it needs to scale.
 A LoRA-fine-tuned instruction model (Llama 3.2 3B by default; a few other
 open models are supported via `MODEL_REGISTRY` in `gpu/train_model.py` /
 `tpu/train_model.py`) that reads a stock ticker, an optional user
-question, and a block of recent news headlines, and outputs structured
-JSON:
+question, current market data/valuation/earnings, and a block of recent
+news headlines, and outputs structured JSON that answers the user directly
+rather than just classifying sentiment:
 
 ```json
 {
@@ -24,7 +25,8 @@ JSON:
       "ticker": "AAPL",
       "reasoning": "...",
       "direction": "BULLISH",
-      "confidence": 0.91
+      "confidence": 0.91,
+      "answer": "Yes, the current signals lean favorably enough that AAPL looks like a reasonable buy here."
     }
   ]
 }
@@ -33,7 +35,7 @@ JSON:
 `financial-sentiment-api`'s `app/services/inference.py` calls the resulting
 model via a Hugging Face Inference endpoint and parses this exact shape —
 if you change the output schema or the prompt structure here, that repo
-needs a matching change.
+needs a matching change (see CONTRIBUTING.md's 4-way sync rule).
 
 ## Pipeline (run each of these as its own Colab cell, in order)
 
@@ -41,23 +43,31 @@ Steps 1-3 are hardware-agnostic and identical either way. Steps 4-5 branch
 depending on which free Colab accelerator you're using — pick **one** of
 `gpu/` or `tpu/`, not both, for a given training run.
 
-1. **`!pip install -q yfinance httpx feedparser google-genai`** —
-   dependencies for the real-data generator (step 3). The training script
-   for whichever accelerator you pick installs its own dependencies at the
-   top of that file, so nothing extra is needed for steps 4-5.
+1. **`!pip install -q yfinance httpx feedparser google-genai pandas`** —
+   dependencies for the real-data generator (step 3; `pandas` is also a
+   transitive `yfinance` dependency, usually already present). The training
+   script for whichever accelerator you pick installs its own dependencies
+   at the top of that file, so nothing extra is needed for steps 4-5.
 2. **`generate_synthetic_dataset.py`** — offline, deterministic, no
    dependencies beyond the standard library. Writes `dataset_train.jsonl` /
-   `dataset_val.jsonl`. Takes a few seconds.
+   `dataset_val.jsonl`. Each row includes fabricated-but-internally-
+   consistent `market_data`/`valuation`/`earnings` blocks (the valuation
+   figure is a real Graham Number computation on the row's own synthetic
+   price/EPS/book-value, never LLM-generated) alongside the news headlines.
+   Takes a few seconds.
 3. **`generate_real_dataset.py`** — pulls real historical headlines from
-   Google News RSS and real subsequent price moves from `yfinance`, and
-   derives BULLISH/BEARISH/NEUTRAL labels from what the stock actually did
-   afterward. Writes `dataset_train_real.jsonl` / `dataset_val_real.jsonl`.
-   Not deterministic (depends on what Google's index currently returns, and
-   Gemini's reasoning text varies run to run for the same headline), and
-   noticeably slower than step 2 — expect several minutes given the number
-   of tickers and historical windows it scans, plus one Gemini call per
-   kept headline; this is expected, not a hang. Requires a `GEMINI_API_KEY`
-   secret — see below.
+   Google News RSS, real subsequent price moves from `yfinance`, and real
+   fundamentals/earnings **as of each headline's own publish date** (not
+   today's figures — see `fetch_ticker_fundamentals_history`'s docstring for
+   the specific, documented approximations where yfinance can't go back far
+   enough), and derives BULLISH/BEARISH/NEUTRAL labels from what the stock
+   actually did afterward. Writes `dataset_train_real.jsonl` /
+   `dataset_val_real.jsonl`. Not deterministic (depends on what Google's
+   index currently returns, and Gemini's reasoning/answer text varies run to
+   run for the same headline), and noticeably slower than step 2 — expect
+   several minutes given the number of tickers and historical windows it
+   scans, plus one Gemini call per kept headline; this is expected, not a
+   hang. Requires a `GEMINI_API_KEY` secret — see below.
 4. **`gpu/train_model.py`** (T4) or **`tpu/train_model.py`** (v5e-1) —
    loads the base model, adds a LoRA adapter, mixes both datasets from
    steps 2-3, fine-tunes with early stopping, and pushes the result to
@@ -96,9 +106,12 @@ Practical consequences:
   `transformers peft trl accelerate datasets` (plus whatever `torch_xla`
   build Colab's TPU runtime already ships).
 - Both paths push an **adapter-only** model to the same naming scheme
-  (`{HF_USER}/{model}-financial-reasoner-v3`), except the TPU path adds a
+  (`{HF_USER}/{model}-financial-reasoner-v4`), except the TPU path adds a
   `-tpu` suffix so a TPU run never overwrites a GPU-trained adapter at the
-  same name, or vice versa.
+  same name, or vice versa. (`v4` is the "analyst pipeline" generation —
+  market data/valuation/earnings inputs plus the `answer` output field; the
+  older `-v3`/`-v3-tpu` repos remain on Hugging Face, untouched, for
+  comparison.)
 - The TPU path hasn't been run end-to-end on real TPU hardware yet — the
   GPU path is the proven one. If you hit an issue running `tpu/`'s
   scripts, that's expected first-run friction, not necessarily something
@@ -115,8 +128,8 @@ running the whole notebook unattended via "Run all."
 | Name | What it is |
 |---|---|
 | `HF_TOKEN` | A Hugging Face **write**-access token, used to push the fine-tuned model. |
-| `HF_USER` | Your Hugging Face username, used to build the target repo name (`{HF_USER}/{model}-financial-reasoner-v3`). |
-| `GEMINI_API_KEY` | A free key from [aistudio.google.com/apikey](https://aistudio.google.com/apikey), used by `generate_real_dataset.py` to write headline-grounded `reasoning` text (`gemini-3.5-flash-lite` — cost for the whole real dataset is well under $1). |
+| `HF_USER` | Your Hugging Face username, used to build the target repo name (`{HF_USER}/{model}-financial-reasoner-v4`). |
+| `GEMINI_API_KEY` | A free key from [aistudio.google.com/apikey](https://aistudio.google.com/apikey), used by `generate_real_dataset.py` to write headline-grounded `reasoning` and `answer` text (`gemini-3.5-flash-lite` — cost for the whole real dataset is well under $1). |
 
 None of these values are ever written into any file in this repo — that's
 the whole point of pulling them from Colab/Kaggle Secrets instead.
@@ -130,9 +143,9 @@ the whole point of pulling them from Colab/Kaggle Secrets instead.
   `generate_real_dataset.py` produces real headlines with *proxy* labels
   (derived from actual subsequent price movement, not a human judgment) —
   noisier, but real language the synthetic templates can't fully capture.
-  Both write the identical `{ticker, user_query, news, output}` schema so
-  either `train_model.py` (`gpu/` or `tpu/`) can concatenate them with no
-  reconciliation step.
+  Both write the identical `{ticker, user_query, market_data, valuation,
+  earnings, news, output}` schema so either `train_model.py` (`gpu/` or
+  `tpu/`) can concatenate them with no reconciliation step.
 - **Real data is undersampled to balance classes, never duplicated**, to
   avoid teaching the model to memorize repeated rows. The cost is fewer
   total real-data rows; see `generate_real_dataset.py`'s docstring for the
@@ -170,6 +183,19 @@ the whole point of pulling them from Colab/Kaggle Secrets instead.
   stay purely proxy-derived, only the reasoning text changes. Falls back to
   the old template on an API failure so one bad call doesn't abort a
   multi-hundred-row run.
+
+- **The model reasons over data, not just headlines, and answers the
+  user directly.** v4 added `market_data`/`valuation`/`earnings` to the
+  prompt and `answer` to the output. Valuation is always a deterministic
+  Graham Number (`sqrt(22.5 x EPS x book value/share)`) computed in code
+  from the row's own price/EPS/book-value — never LLM-generated or
+  hand-waved — so the model learns to read a real number, not to
+  hallucinate one. Any block that couldn't be fetched/computed renders as
+  exactly `Data unavailable.` in both training data and production, so the
+  model is trained on, not just hoped to handle, partial data gaps. See the
+  canonical prompt template comment above `alpaca_prompt` in
+  `gpu/train_model.py` and CONTRIBUTING.md's 4-way sync rule before
+  changing any of this.
 
 ## docs/
 

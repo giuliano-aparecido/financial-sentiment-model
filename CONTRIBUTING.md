@@ -26,7 +26,7 @@ so there's nothing meaningful to mock or run in CI. Instead:
 - If you change a generator script, run it locally (both are plain Python;
   `generate_synthetic_dataset.py` needs no dependencies beyond the standard
   library, `generate_real_dataset.py` needs `pip install yfinance httpx
-  feedparser google-genai` and a `GEMINI_API_KEY` env var) and sanity-check
+  feedparser google-genai pandas` and a `GEMINI_API_KEY` env var) and sanity-check
   the output — row counts, a few sample rows, and that
   `python -m py_compile <file>` passes. Without a Gemini key you can still
   `py_compile` and read through the diff, but can't confirm
@@ -34,12 +34,24 @@ so there's nothing meaningful to mock or run in CI. Instead:
   — say so explicitly in the PR description rather than claiming it was
   tested if it wasn't.
 - If you change the prompt template (`alpaca_prompt`) or the output JSON
-  schema, keep three files in sync: `gpu/train_model.py`,
-  `tpu/train_model.py`, and `financial-sentiment-api`'s
-  `app/services/inference.py` — a mismatch anywhere in that trio silently
-  trains or serves a different shape than the other two expect. The
-  gpu/tpu split introduced this three-way duplication, so this is exactly
-  the kind of drift to check for on any prompt/schema change.
+  schema, keep FOUR files in sync: `gpu/train_model.py`,
+  `tpu/train_model.py`, their own `evaluate_model.py`/
+  `evaluate_base_model_only.py` copies of the same string (4 more copies,
+  8 total, but only one canonical string), and `financial-sentiment-api`'s
+  `app/services/inference.py` — a mismatch anywhere in that set silently
+  trains or serves a different shape than the others expect. This also
+  covers the `market_data`/`valuation`/`earnings` block FORMATTING (not
+  just the outer template) — the block renderers in
+  `generate_synthetic_dataset.py`, `generate_real_dataset.py`, and
+  `financial-sentiment-api`'s `app/services/{fundamentals,valuation,
+  earnings}.py` need to produce byte-compatible shapes (e.g. "Data
+  unavailable." exactly, the same "$X.XXT"/"$X.XB" market-cap notation),
+  since the model is trained on one shape and served against whatever
+  these renderers actually produce. The gpu/tpu split introduced the
+  original three-way duplication; the v4 "analyst pipeline" expansion
+  (fundamentals + valuation + earnings + an `answer` field) is what pushed
+  it to four files plus the block-format requirement, so this is exactly
+  the kind of drift to check for on any prompt/schema/block-format change.
 - If you change anything that affects the instruction/response markers
   used for completion-only loss masking (`train_on_responses_only`'s
   `instruction_part`/`response_part` in `gpu/train_model.py`, or

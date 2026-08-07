@@ -55,6 +55,10 @@ model.eval()
 
 VAL_FILES = {"synthetic": "dataset_val.jsonl", "real": "dataset_val_real.jsonl"}
 DIRECTION_RE = re.compile(r'"direction"\s*:\s*"(BULLISH|BEARISH|NEUTRAL)"')
+# Not used for accuracy scoring (direction is), just to surface the model's
+# generated answer text in the misclassification dump below so answer
+# quality can be eyeballed alongside the direction miss.
+ANSWER_RE = re.compile(r'"answer"\s*:\s*"((?:[^"\\]|\\.)*)"')
 
 random.seed(42)
 eval_rows = []
@@ -79,14 +83,19 @@ def expected_direction(row):
 def generate_response(row):
     # Same template as training, with the response slot left empty - the
     # prompt ends at "### Response:\n\n" and the model continues from there.
-    prompt = alpaca_prompt.format(row["ticker"], row["user_query"], row["news"], "")
+    prompt = alpaca_prompt.format(
+        row["ticker"], row["user_query"], row["market_data"],
+        row["valuation"], row["earnings"], row["news"], "",
+    )
     # model.device is backend-agnostic - once the model has been placed on
     # the XLA device during training, this just works.
     inputs = tokenizer(prompt, return_tensors="pt").to(model.device)
     with torch.no_grad():
         out = model.generate(
             **inputs,
-            max_new_tokens=300,
+            max_new_tokens=512,  # v4's `answer` field adds length beyond the
+                                  # old 300-token cap, which was already
+                                  # keyed to a 4-field JSON output.
             do_sample=False,  # greedy = deterministic, comparable across passes
             pad_token_id=tokenizer.eos_token_id,
         )
@@ -154,10 +163,13 @@ def run_eval(label):
     for source, source_samples in samples.items():
         for (exp, pred), rows in sorted(source_samples.items()):
             for row, text in rows:
+                m = ANSWER_RE.search(text)
+                answer = m.group(1) if m else "(no answer field found)"
                 print(f"\n[{source}] expected {exp} -> predicted {pred or 'UNPARSEABLE'} | ticker={row['ticker']}")
                 print(f"User Question: {row['user_query']}")
                 print(f"News:\n{row['news']}")
                 print(f"Model output:\n{text}")
+                print(f"Answer: {answer}")
     print()
     return per_source
 
