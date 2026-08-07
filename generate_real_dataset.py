@@ -45,6 +45,26 @@ got on synthetic val):
    template's disclaimer was protecting, just solved by writing
    headline-grounded text instead of refusing to engage with the
    headline at all.
+
+   Follow-up, after the first full-scale (40-ticker) eval on this fix:
+   real accuracy jumped to 37% (from 25%) and the class-collapse bug was
+   confirmed gone, but a new, more specific pattern showed up - the
+   model correctly reading a headline's plain tone in its own reasoning,
+   then flipping to the opposite direction anyway via a fabricated
+   "contrarian" story ("already priced in," "market sees through this")
+   to force-fit a mismatched label. Root cause: the prompt's escape
+   hatch only covered headlines that don't obviously SUPPORT the given
+   direction (ambiguous case) - it had no guidance for headlines that
+   actively CONTRADICT it (which happens constantly, since the label is
+   real-price-derived and headlines don't reliably predict short-term
+   moves). Added an explicit instruction for that case: acknowledge the
+   mismatch honestly and use a low confidence score, instead of
+   inventing a plausible-sounding but unverifiable contrarian narrative.
+   Deliberately NOT fixed by feeding in what actually happened after the
+   headline (real follow-up news, etc.) - that would leak information
+   the model can never have at real inference time (predicting forward
+   from headlines available now), training a skill that's unusable in
+   production rather than a general calibration habit that is.
 1. TICKERS expanded 20 -> 40. Real data volume is capped by how much
    Google News actually returns per ticker/window, so growing the
    TRAINING supplement without duplicating rows (see rebalance_by_direction
@@ -451,6 +471,7 @@ Write 2-3 sentences of reasoning that:
 - Reads the headline itself and explains why this kind of news is plausibly consistent with a {direction} outlook - the way a financial analyst would talk through the headline, not the outcome.
 - Does not invent facts, numbers, or details that are not in the headline.
 - If the headline's content does not obviously support {direction} (this happens often - many price moves in a short window are unrelated to the nearest headline), say so plainly - call it a weak or indirect signal rather than forcing a confident causal claim that isn't there.
+- If the headline's content clearly points the OPPOSITE way from {direction} (e.g. a headline reporting good news paired with a BEARISH label, or bad news paired with BULLISH - this happens often, since the label reflects the actual subsequent move and headlines don't always predict it), do NOT invent a contrarian story to force a fit - phrases like "already priced in," "overbought/oversold," or "the market sees through this" sound analytical but aren't something you can actually know from a single headline, and a model trained on that kind of reasoning learns to talk itself out of headlines it read correctly. Instead say plainly that the headline's own content points the other way, and that the labeled outcome likely reflects other developments not visible in this headline - and use a low confidence score (0.5-0.6) in that case, since the label isn't actually explained by what you were given.
 
 Ticker: {ticker}
 Headline: {headline}
