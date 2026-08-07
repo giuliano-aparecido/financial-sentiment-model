@@ -192,6 +192,12 @@ GEMINI_MODEL = "gemini-3.5-flash-lite"
 GEMINI_REQUEST_DELAY_SECONDS = 4.5
 GEMINI_MAX_RETRIES = 2
 
+# Set by generate_grounded_reasoning once it sees a
+# RequestsPerDayPerProjectPerModel quota error - see that function's
+# docstring. Global, not per-ticker, since the daily cap is per API key,
+# not per anything this script loops over.
+_gemini_daily_quota_exhausted = False
+
 random.seed(42)
 
 # (ticker, company name) - name improves Google News query precision over
@@ -473,9 +479,27 @@ def generate_grounded_reasoning(ticker, title, direction, pct_change, actual_win
     immediately, same as before, so one non-recoverable bad call still
     can't abort an unattended multi-hundred-row run. Paces itself to
     GEMINI_REQUEST_DELAY_SECONDS between calls either way, to avoid
-    re-triggering the same limit on the next row."""
-    prompt = GEMINI_REASONING_PROMPT.format(ticker=ticker, headline=title, direction=direction)
+    re-triggering the same limit on the next row.
+
+    Also confirmed live, and more serious: the free tier separately caps
+    total requests at 500/DAY (RequestsPerDayPerProjectPerModel), distinct
+    from the 15/minute cap above - a 40-ticker run needs up to ~2000 Gemini
+    calls (kept headlines only), so hitting this is expected, not a fluke.
+    Unlike the per-minute cap, no amount of waiting fixes this within the
+    same day - the very first version of this retry loop didn't
+    distinguish the two, so once the daily cap hit it wasted a full
+    per-minute-style retry (tens of seconds) on every single remaining
+    headline for the rest of the run before falling back. Detected
+    separately here: once seen, every later call in this process skips
+    straight to the template with no retry and no per-call pacing delay -
+    there's nothing to wait out until the quota resets (~24h from first
+    use)."""
+    global _gemini_daily_quota_exhausted
     reasoning = _template_reasoning(ticker, direction, pct_change, actual_window_days)
+    if _gemini_daily_quota_exhausted:
+        return reasoning
+
+    prompt = GEMINI_REASONING_PROMPT.format(ticker=ticker, headline=title, direction=direction)
     for attempt in range(GEMINI_MAX_RETRIES + 1):
         try:
             response = _gemini_client.models.generate_content(model=GEMINI_MODEL, contents=prompt)
@@ -486,6 +510,13 @@ def generate_grounded_reasoning(ticker, title, direction, pct_change, actual_win
             break
         except Exception as e:
             error_text = str(e)
+            if "RequestsPerDayPerProjectPerModel" in error_text:
+                _gemini_daily_quota_exhausted = True
+                print(f"    Gemini free-tier DAILY quota exhausted - the rest of this run will use the "
+                      f"template fallback (nothing to wait out until the quota resets, ~24h from first "
+                      f"use). Options: re-run tomorrow, lower MAX_HEADLINES_PER_TICKER so total calls "
+                      f"stay under 500, or use a billed key.", flush=True)
+                break
             is_rate_limited = "RESOURCE_EXHAUSTED" in error_text or "429" in error_text
             if is_rate_limited and attempt < GEMINI_MAX_RETRIES:
                 wait = _retry_delay_seconds(error_text)
@@ -494,7 +525,8 @@ def generate_grounded_reasoning(ticker, title, direction, pct_change, actual_win
                 continue
             print(f"    Warning: Gemini reasoning call failed for {ticker!r} ({e!r}) - using template fallback.", flush=True)
             break
-    time.sleep(GEMINI_REQUEST_DELAY_SECONDS)
+    if not _gemini_daily_quota_exhausted:
+        time.sleep(GEMINI_REQUEST_DELAY_SECONDS)
     return reasoning
 
 
