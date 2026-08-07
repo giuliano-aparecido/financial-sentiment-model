@@ -583,6 +583,25 @@ def _row_series(df, row_names):
     return None
 
 
+def _as_of_timestamp(index, as_of_date):
+    """pd.Timestamp for as_of_date, localized to match `index`'s own
+    tz-awareness. Confirmed live: yfinance's quarterly-statement and
+    earnings_dates indices are INCONSISTENTLY tz-aware - some tickers/
+    fields come back tz-naive, others localized to the exchange timezone
+    (e.g. America/New_York) - and pandas raises TypeError comparing a
+    naive Timestamp against a tz-aware DatetimeIndex (or vice versa)
+    rather than silently coercing one to the other. Every direct
+    `series.index < as_of_ts`-style comparison in this file must build its
+    as_of_ts through this helper, keyed to the SPECIFIC index being
+    compared against - two different fetches (e.g. quarterly financials vs
+    earnings_dates) can have different tz-awareness even for the same
+    ticker, so one as_of_ts computed globally isn't safe to reuse across
+    both."""
+    ts = pd.Timestamp(as_of_date)
+    tz = getattr(index, "tz", None)
+    return ts.tz_localize(tz) if tz is not None else ts
+
+
 def as_of_quarterly(series, as_of_date):
     """Most recent value in a quarterly-indexed Series whose period-end is
     strictly before as_of_date, i.e. the last quarter that would already
@@ -591,8 +610,8 @@ def as_of_quarterly(series, as_of_date):
     series is None or nothing qualifies."""
     if series is None:
         return None, None
-    as_of_ts = pd.Timestamp(as_of_date)
     prior = series.dropna()
+    as_of_ts = _as_of_timestamp(prior.index, as_of_date)
     prior = prior[prior.index < as_of_ts]
     if prior.empty:
         return None, None
@@ -629,10 +648,10 @@ def build_fundamentals_blocks(ticker_obj, fundamentals_history, as_of_date):
     price = as_of_price(ticker_obj, as_of_date)
 
     eps_series = _row_series(income, ["Diluted EPS", "Basic EPS"])
-    as_of_ts = pd.Timestamp(as_of_date)
     eps_trailing = None
     if eps_series is not None:
         prior_eps = eps_series.dropna()
+        as_of_ts = _as_of_timestamp(prior_eps.index, as_of_date)
         prior_eps = prior_eps[prior_eps.index < as_of_ts].sort_index(ascending=False)
         if len(prior_eps) >= 4:
             eps_trailing = float(prior_eps.iloc[:4].sum())
@@ -715,7 +734,8 @@ def build_fundamentals_blocks(ticker_obj, fundamentals_history, as_of_date):
         if earnings_dates is not None and not earnings_dates.empty:
             reported = earnings_dates.dropna(subset=["Reported EPS"]) \
                 if "Reported EPS" in earnings_dates.columns else earnings_dates.iloc[0:0]
-            prior_reports = reported[reported.index < as_of_ts]
+            reported_as_of_ts = _as_of_timestamp(reported.index, as_of_date)
+            prior_reports = reported[reported.index < reported_as_of_ts]
             if not prior_reports.empty:
                 row = prior_reports.sort_index(ascending=False).iloc[0]
                 actual = row.get("Reported EPS")
@@ -730,7 +750,8 @@ def build_fundamentals_blocks(ticker_obj, fundamentals_history, as_of_date):
 
         next_line = ""
         if earnings_dates is not None and not earnings_dates.empty:
-            future = earnings_dates[earnings_dates.index > as_of_ts]
+            future_as_of_ts = _as_of_timestamp(earnings_dates.index, as_of_date)
+            future = earnings_dates[earnings_dates.index > future_as_of_ts]
             if not future.empty:
                 next_date = future.sort_index().index.min()
                 next_line = f"\nNext Earnings Date: {next_date.date().isoformat()}"
