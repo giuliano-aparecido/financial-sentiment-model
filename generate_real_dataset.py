@@ -569,6 +569,36 @@ def append_examples(filepath, examples):
             f.write(json.dumps(row) + "\n")
 
 
+def _count_jsonl_lines(path):
+    if not os.path.exists(path):
+        return 0
+    with open(path) as f:
+        return sum(1 for line in f if line.strip())
+
+
+def already_completed_tickers():
+    """Tickers with at least one row already written to either output
+    file. A ticker only ever gets written after its whole per-ticker loop
+    finishes (see generate_and_write) - so a ticker that was mid-progress
+    when a run was interrupted has ZERO rows here and will correctly be
+    reprocessed from scratch, while a ticker that fully finished won't be.
+    Used to resume after a manual restart (Kaggle/Colab session died, or
+    you interrupted deliberately - e.g. after a code fix mid-run) without
+    reprocessing tickers already done, which would otherwise re-spend
+    real Gemini quota and RSS/yfinance requests for no reason. Empty set
+    on a genuinely fresh run, since the files don't exist yet."""
+    done = set()
+    for path in (OUTPUT_TRAIN_FILE, OUTPUT_VAL_FILE):
+        if not os.path.exists(path):
+            continue
+        with open(path) as f:
+            for line in f:
+                line = line.strip()
+                if line:
+                    done.add(json.loads(line)["ticker"])
+    return done
+
+
 def generate_and_write():
     """Writes each ticker's results to disk as soon as that ticker finishes,
     instead of accumulating everything in memory and writing once at the
@@ -577,15 +607,33 @@ def generate_and_write():
     unexpected error on one ticker), whatever tickers already completed
     are safely on disk rather than lost entirely. Each ticker also runs
     inside its own try/except so one unexpected failure can't take down
-    the other 39."""
-    open(OUTPUT_TRAIN_FILE, "w").close()
-    open(OUTPUT_VAL_FILE, "w").close()
+    the other 39.
+
+    Resumable: if the output files already have rows in them (a prior run
+    was interrupted and this cell is being re-run), those tickers are
+    skipped instead of the files being wiped and everything redone from
+    scratch - confirmed live as a real problem (a 7+ hour run, ~15 tickers
+    in, needed a restart for a code fix; wiping the files would have
+    thrown all of that away, including real, already-spent Gemini quota).
+    To force a genuinely fresh run, delete dataset_train_real.jsonl and
+    dataset_val_real.jsonl yourself first."""
+    resume_skip = already_completed_tickers()
+    if resume_skip:
+        print(f"Resuming - {len(resume_skip)} ticker(s) already in the output files, skipping: {sorted(resume_skip)}", flush=True)
+    else:
+        open(OUTPUT_TRAIN_FILE, "w").close()
+        open(OUTPUT_VAL_FILE, "w").close()
 
     skip_reason_totals = {}
-    total_train = 0
-    total_val = 0
+    # Seeded from what's already on disk (0 on a fresh run) so the final
+    # "Collected N examples" summary reflects the true total, not just
+    # this process's own additions on top of a resumed run.
+    total_train = _count_jsonl_lines(OUTPUT_TRAIN_FILE)
+    total_val = _count_jsonl_lines(OUTPUT_VAL_FILE)
 
     for ticker, name in TICKERS:
+        if ticker in resume_skip:
+            continue
         print(f"Fetching {ticker} ({name})...", flush=True)
         try:
             ticker_examples = []
