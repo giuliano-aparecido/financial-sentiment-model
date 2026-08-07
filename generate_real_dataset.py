@@ -112,13 +112,16 @@ Runtime note: with TICKERS x LOOKBACK_WEEKS now 40 x 18 = 720 weekly
 windows, and NEWS_REQUEST_DELAY_SECONDS=1.0 between each, the news-fetch
 phase alone is >=12 minutes of politeness delay before counting actual
 request latency or the price-history calls on top - expect a notably
-longer run than earlier, smaller configurations. GEMINI_REQUEST_DELAY_SECONDS
-(4.5s, sized for the free tier's 15-requests/minute cap on
-gemini-3.5-flash-lite - see the comment above that constant) adds roughly
-another 4.5s per kept headline on top of that, since a Gemini call happens
-once per row now. This is expected, not a hang; the per-ticker incremental
-writes and try/except (see generate_and_write) mean a slow run is safe to
-leave unattended.
+longer run than earlier, smaller configurations. On a free-tier
+GEMINI_API_KEY, GEMINI_REQUEST_DELAY_SECONDS (4.5s, sized for the free
+tier's 15-requests/minute cap) would add roughly another 4.5s per kept
+headline on top of that, since a Gemini call happens once per row now -
+with billing enabled and a paid tier's much higher per-minute limit,
+GEMINI_REQUEST_DELAY_SECONDS drops to 0.1s and that cost mostly
+disappears (dominated instead by actual Gemini/yfinance/RSS network
+latency, not artificial pacing). Either way, this is expected, not a
+hang; the per-ticker incremental writes and try/except (see
+generate_and_write) mean a slow run is safe to leave unattended.
 
 Output: two JSONL files, named by OUTPUT_TRAIN_FILE/OUTPUT_VAL_FILE below
 (default: dataset_train_real.jsonl and dataset_val_real.jsonl).
@@ -181,15 +184,20 @@ _gemini_client = genai.Client(api_key=get_secret("GEMINI_API_KEY"))
 GEMINI_MODEL = "gemini-3.5-flash-lite"
 
 # Confirmed live: the FREE TIER caps gemini-3.5-flash-lite at 15 requests
-# per minute (generativelanguage.googleapis.com/generate_content_free_tier_requests).
-# With zero pacing between calls, a run blows through that almost
-# immediately and every call after the first ~15 falls back to the
-# template - silently defeating the whole point of this feature (100% of
-# rows end up ungrounded again, just without an obvious error). 60/15 = 4s
-# minimum between calls; this adds margin. If GEMINI_API_KEY has billing
-# enabled, this limit is much higher and the delay can be lowered - check
-# https://ai.google.dev/gemini-api/docs/rate-limits for the current tier.
-GEMINI_REQUEST_DELAY_SECONDS = 4.5
+# per minute (generativelanguage.googleapis.com/generate_content_free_tier_requests) -
+# that's what forced a 4.5s (60/15, plus margin) delay here originally.
+# With GEMINI_API_KEY billing enabled, Tier 1 raised this to ~4000
+# requests/minute (confirmed live at https://aistudio.google.com/rate-limit) -
+# our whole run needs at most ~2000 calls total, so at that rate the
+# per-minute cap is no longer the binding constraint. 0.1s is just a floor
+# against hammering the API in a tight loop, not a real rate-limiting
+# delay - the yfinance/RSS calls and actual Gemini network latency in the
+# rest of the per-headline loop already pace things well under 4000/min
+# on their own. If this ever moves to a free-tier key again, revert to
+# 4.5 (or whatever 60/{current RPM} + margin works out to - re-check
+# https://ai.google.dev/gemini-api/docs/rate-limits, don't assume 15 is
+# still current).
+GEMINI_REQUEST_DELAY_SECONDS = 0.1
 GEMINI_MAX_RETRIES = 2
 
 # Set by generate_grounded_reasoning once it sees a
