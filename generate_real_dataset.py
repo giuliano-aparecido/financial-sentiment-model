@@ -192,6 +192,12 @@ GEMINI_MODEL = "gemini-3.5-flash-lite"
 GEMINI_REQUEST_DELAY_SECONDS = 4.5
 GEMINI_MAX_RETRIES = 2
 
+# Set by generate_grounded_reasoning once it sees a
+# RequestsPerDayPerProjectPerModel quota error - see that function's
+# docstring. Global, not per-ticker, since the daily cap is per API key,
+# not per anything this script loops over.
+_gemini_daily_quota_exhausted = False
+
 random.seed(42)
 
 # (ticker, company name) - name improves Google News query precision over
@@ -473,9 +479,27 @@ def generate_grounded_reasoning(ticker, title, direction, pct_change, actual_win
     immediately, same as before, so one non-recoverable bad call still
     can't abort an unattended multi-hundred-row run. Paces itself to
     GEMINI_REQUEST_DELAY_SECONDS between calls either way, to avoid
-    re-triggering the same limit on the next row."""
-    prompt = GEMINI_REASONING_PROMPT.format(ticker=ticker, headline=title, direction=direction)
+    re-triggering the same limit on the next row.
+
+    Also confirmed live, and more serious: the free tier separately caps
+    total requests at 500/DAY (RequestsPerDayPerProjectPerModel), distinct
+    from the 15/minute cap above - a 40-ticker run needs up to ~2000 Gemini
+    calls (kept headlines only), so hitting this is expected, not a fluke.
+    Unlike the per-minute cap, no amount of waiting fixes this within the
+    same day - the very first version of this retry loop didn't
+    distinguish the two, so once the daily cap hit it wasted a full
+    per-minute-style retry (tens of seconds) on every single remaining
+    headline for the rest of the run before falling back. Detected
+    separately here: once seen, every later call in this process skips
+    straight to the template with no retry and no per-call pacing delay -
+    there's nothing to wait out until the quota resets (~24h from first
+    use)."""
+    global _gemini_daily_quota_exhausted
     reasoning = _template_reasoning(ticker, direction, pct_change, actual_window_days)
+    if _gemini_daily_quota_exhausted:
+        return reasoning
+
+    prompt = GEMINI_REASONING_PROMPT.format(ticker=ticker, headline=title, direction=direction)
     for attempt in range(GEMINI_MAX_RETRIES + 1):
         try:
             response = _gemini_client.models.generate_content(model=GEMINI_MODEL, contents=prompt)
@@ -486,6 +510,13 @@ def generate_grounded_reasoning(ticker, title, direction, pct_change, actual_win
             break
         except Exception as e:
             error_text = str(e)
+            if "RequestsPerDayPerProjectPerModel" in error_text:
+                _gemini_daily_quota_exhausted = True
+                print(f"    Gemini free-tier DAILY quota exhausted - the rest of this run will use the "
+                      f"template fallback (nothing to wait out until the quota resets, ~24h from first "
+                      f"use). Options: re-run tomorrow, lower MAX_HEADLINES_PER_TICKER so total calls "
+                      f"stay under 500, or use a billed key.", flush=True)
+                break
             is_rate_limited = "RESOURCE_EXHAUSTED" in error_text or "429" in error_text
             if is_rate_limited and attempt < GEMINI_MAX_RETRIES:
                 wait = _retry_delay_seconds(error_text)
@@ -494,7 +525,8 @@ def generate_grounded_reasoning(ticker, title, direction, pct_change, actual_win
                 continue
             print(f"    Warning: Gemini reasoning call failed for {ticker!r} ({e!r}) - using template fallback.", flush=True)
             break
-    time.sleep(GEMINI_REQUEST_DELAY_SECONDS)
+    if not _gemini_daily_quota_exhausted:
+        time.sleep(GEMINI_REQUEST_DELAY_SECONDS)
     return reasoning
 
 
@@ -537,6 +569,36 @@ def append_examples(filepath, examples):
             f.write(json.dumps(row) + "\n")
 
 
+def _count_jsonl_lines(path):
+    if not os.path.exists(path):
+        return 0
+    with open(path) as f:
+        return sum(1 for line in f if line.strip())
+
+
+def already_completed_tickers():
+    """Tickers with at least one row already written to either output
+    file. A ticker only ever gets written after its whole per-ticker loop
+    finishes (see generate_and_write) - so a ticker that was mid-progress
+    when a run was interrupted has ZERO rows here and will correctly be
+    reprocessed from scratch, while a ticker that fully finished won't be.
+    Used to resume after a manual restart (Kaggle/Colab session died, or
+    you interrupted deliberately - e.g. after a code fix mid-run) without
+    reprocessing tickers already done, which would otherwise re-spend
+    real Gemini quota and RSS/yfinance requests for no reason. Empty set
+    on a genuinely fresh run, since the files don't exist yet."""
+    done = set()
+    for path in (OUTPUT_TRAIN_FILE, OUTPUT_VAL_FILE):
+        if not os.path.exists(path):
+            continue
+        with open(path) as f:
+            for line in f:
+                line = line.strip()
+                if line:
+                    done.add(json.loads(line)["ticker"])
+    return done
+
+
 def generate_and_write():
     """Writes each ticker's results to disk as soon as that ticker finishes,
     instead of accumulating everything in memory and writing once at the
@@ -545,15 +607,33 @@ def generate_and_write():
     unexpected error on one ticker), whatever tickers already completed
     are safely on disk rather than lost entirely. Each ticker also runs
     inside its own try/except so one unexpected failure can't take down
-    the other 39."""
-    open(OUTPUT_TRAIN_FILE, "w").close()
-    open(OUTPUT_VAL_FILE, "w").close()
+    the other 39.
+
+    Resumable: if the output files already have rows in them (a prior run
+    was interrupted and this cell is being re-run), those tickers are
+    skipped instead of the files being wiped and everything redone from
+    scratch - confirmed live as a real problem (a 7+ hour run, ~15 tickers
+    in, needed a restart for a code fix; wiping the files would have
+    thrown all of that away, including real, already-spent Gemini quota).
+    To force a genuinely fresh run, delete dataset_train_real.jsonl and
+    dataset_val_real.jsonl yourself first."""
+    resume_skip = already_completed_tickers()
+    if resume_skip:
+        print(f"Resuming - {len(resume_skip)} ticker(s) already in the output files, skipping: {sorted(resume_skip)}", flush=True)
+    else:
+        open(OUTPUT_TRAIN_FILE, "w").close()
+        open(OUTPUT_VAL_FILE, "w").close()
 
     skip_reason_totals = {}
-    total_train = 0
-    total_val = 0
+    # Seeded from what's already on disk (0 on a fresh run) so the final
+    # "Collected N examples" summary reflects the true total, not just
+    # this process's own additions on top of a resumed run.
+    total_train = _count_jsonl_lines(OUTPUT_TRAIN_FILE)
+    total_val = _count_jsonl_lines(OUTPUT_VAL_FILE)
 
     for ticker, name in TICKERS:
+        if ticker in resume_skip:
+            continue
         print(f"Fetching {ticker} ({name})...", flush=True)
         try:
             ticker_examples = []
