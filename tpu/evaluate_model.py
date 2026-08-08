@@ -1,7 +1,16 @@
-# Direction-accuracy evaluation - paste as ONE Colab cell and run it in the
-# SAME session, right AFTER the training cell (it reuses the `model`,
-# `tokenizer`, and `alpaca_prompt` variables that cell leaves in memory, and
-# the dataset_val*.jsonl files already on this Colab's disk).
+# Direction-accuracy evaluation - paste as ONE Colab cell. Self-contained:
+# works whether the previous session is still alive (reuses `model`,
+# `tokenizer`, `alpaca_prompt` already in memory - the normal case, right
+# after the training cell) or crashed/expired (reloads the finished,
+# already-pushed model fresh from Hugging Face - e.g. re-running this cell
+# after a prior run of THIS SAME script crashed partway through, such as
+# the confusion-matrix sort TypeError this eval script used to hit on any
+# row with an unparseable model output; that crash happened after training
+# had already finished and pushed, so there was nothing left to retrain -
+# only this cell needed re-running). Either way, needs the
+# dataset_val*.jsonl files present on disk (regenerate
+# generate_synthetic_dataset.py/generate_real_dataset.py first if this is
+# a fresh session that doesn't have them).
 #
 # What it measures - the metric that actually matters, which token loss
 # doesn't (see ../docs/training-results-analysis.md):
@@ -20,6 +29,7 @@
 # session dies partway, the number you care most about is already printed.
 
 import json
+import os
 import random
 import re
 
@@ -37,15 +47,81 @@ EVAL_SAMPLE_PER_SOURCE = 100
 # that isn't a straightforward data-imbalance artifact).
 SAMPLE_MISCLASSIFICATIONS_PER_PAIR = 3
 
+
+# Checking whether `google.colab` IMPORTS is not a reliable way to detect
+# Colab vs Kaggle - some Kaggle base images ship a google-colab package
+# too, so the import succeeds there and userdata.get() just hangs and
+# times out instead of raising. KAGGLE_KERNEL_RUN_TYPE is set by Kaggle's
+# own runtime on every notebook - check that directly instead.
+def get_secret(name):
+    if os.environ.get("KAGGLE_KERNEL_RUN_TYPE"):
+        from kaggle_secrets import UserSecretsClient
+        return UserSecretsClient().get_secret(name)
+    from google.colab import userdata
+    return userdata.get(name)
+
+
 try:
     model, tokenizer, alpaca_prompt
+    print("Reusing model already in memory - skipping reload.")
 except NameError:
-    raise SystemExit(
-        "Run this cell in the same session as the training cell - it needs "
-        "the model/tokenizer/alpaca_prompt still in memory. If the runtime "
-        "restarted, re-run the training cell first (or load the pushed "
-        "model from HF)."
-    )
+    print("Model/tokenizer not in memory (new or crashed session) - "
+          "reloading the already-trained, already-pushed model from "
+          "Hugging Face...")
+    from peft import AutoPeftModelForCausalLM
+    from transformers import AutoTokenizer
+    import torch_xla.core.xla_model as xm
+
+    MODEL_CHOICE = "llama-3.2-3b"
+    HF_USER = get_secret("HF_USER")
+    # Matches the "-tpu" suffix train_model.py pushes to, so this reloads
+    # the TPU-trained adapter rather than the GPU-trained one at "-v4".
+    HF_REPO = f"{HF_USER}/{MODEL_CHOICE}-financial-reasoner-v4-tpu"
+
+    # The pushed repo is adapter-only - AutoPeftModelForCausalLM is peft's
+    # loader built specifically for that: it reads adapter_config.json,
+    # resolves the base model automatically, and wraps it with the
+    # adapter. bf16 since bitsandbytes has no TPU backend.
+    model = AutoPeftModelForCausalLM.from_pretrained(
+        HF_REPO,
+        torch_dtype=torch.bfloat16,
+    ).to(xm.xla_device())
+    tokenizer = AutoTokenizer.from_pretrained(HF_REPO)
+
+    # Must match tpu/train_model.py's alpaca_prompt exactly (see
+    # CONTRIBUTING.md's 4-way sync rule) - this is a separate copy because
+    # a reload means the training cell's own copy never ran in this
+    # session.
+    alpaca_prompt = """Below is an instruction that describes a task, paired with an input that provides further context. Write a response that appropriately completes the request.
+
+### Instruction:
+
+Analyze the following financial data and news and output JSON containing the impacted stock ticker, detailed reasoning, directional sentiment (BULLISH/BEARISH/NEUTRAL), confidence score, and a direct answer to the user's question.
+
+CRITICAL SENTIMENT RULES:
+
+1. Weigh guidance cuts and revenue misses higher than minor operational wins.
+
+### Input:
+
+Target Stock: {}
+User Question: {}
+
+Current Market Data:
+{}
+
+Valuation:
+{}
+
+Recent Earnings:
+{}
+
+Recent News & Results:
+{}
+
+### Response:
+
+{}"""
 
 # unsloth's FastLanguageModel.for_inference(model) has no TPU equivalent
 # (unsloth doesn't support TPU) - plain eval mode is all that's needed
