@@ -150,13 +150,18 @@ def run_eval(label):
         if not source_confusion:
             continue
         print(f"Confusion for {source} (expected -> predicted: count):")
-        for (exp, pred), count in sorted(source_confusion.items()):
+        # sorted() on the raw (exp, pred) tuple crashes with TypeError the
+        # first time any row is genuinely unparseable (pred=None) - Python
+        # can't order None against a str. key= treats None as "" so it
+        # sorts first (before any real direction) instead of crashing.
+        for (exp, pred), count in sorted(source_confusion.items(), key=lambda item: (item[0][0], item[0][1] or "")):
             print(f"  {exp:<8} -> {pred or 'UNPARSEABLE':<12} {count}")
     print()
 
     print(f"----- Sample misclassifications for {label} (up to {SAMPLE_MISCLASSIFICATIONS_PER_PAIR} per source/expected/predicted) -----")
     for source, source_samples in samples.items():
-        for (exp, pred), rows in sorted(source_samples.items()):
+        # Same None-vs-str sort gotcha as the confusion matrix above.
+        for (exp, pred), rows in sorted(source_samples.items(), key=lambda item: (item[0][0], item[0][1] or "")):
             for row, text in rows:
                 m = ANSWER_RE.search(text)
                 answer = m.group(1) if m else "(no answer field found)"
