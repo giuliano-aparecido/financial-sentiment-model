@@ -34,7 +34,7 @@ def get_secret(name):
 
 # 1. Load fine-tuned weights directly from Hugging Face
 HF_USER = get_secret("HF_USER")
-MODEL_NAME = f"{HF_USER}/llama-3.2-3b-financial-reasoner-v2"  # or f"{HF_USER}/apertus-0.5b-financial-reasoner"
+MODEL_NAME = f"{HF_USER}/llama-3.2-3b-financial-reasoner-v7"  # or f"{HF_USER}/apertus-0.5b-financial-reasoner"
 
 model, tokenizer = FastLanguageModel.from_pretrained(
     model_name=MODEL_NAME,

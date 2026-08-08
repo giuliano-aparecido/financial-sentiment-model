@@ -52,6 +52,14 @@ so there's nothing meaningful to mock or run in CI. Instead:
   (fundamentals + valuation + earnings + an `answer` field) is what pushed
   it to four files plus the block-format requirement, so this is exactly
   the kind of drift to check for on any prompt/schema/block-format change.
+- If you bump the Hugging Face model repo version (the `-financial-
+  reasoner-vN` suffix, a different concept from the prompt/schema version
+  above), run `python bump_model_version.py vN` instead of hand-editing
+  each `HF_REPO =`/`MODEL_NAME =` line - it scans the whole repo tree
+  rather than a fixed file list, specifically because hand-editing has
+  already missed `run/run_model.py` and `docs/llm-training-primer.md`
+  (both outside the "obvious" `gpu/`/`tpu/` set) across multiple real
+  version bumps.
 - If you change anything that affects the instruction/response markers
   used for completion-only loss masking (`train_on_responses_only`'s
   `instruction_part`/`response_part` in `gpu/train_model.py`, or

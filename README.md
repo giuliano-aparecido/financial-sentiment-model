@@ -121,9 +121,13 @@ Practical consequences:
   stayed the "analyst pipeline" generation (market data/valuation/earnings
   inputs plus the `answer` output field, introduced at v4) across all of
   them. Older numbered repos remain on Hugging Face, untouched, for
-  comparison - update this README's number (and every `HF_REPO =` line in
-  `gpu/`/`tpu`'s `train_model.py` and `evaluate_*.py`) whenever you bump it
-  again, so the docs and the scripts don't point at different models.
+  comparison - **run `python bump_model_version.py v8`** (substituting
+  whatever the new number actually is) to bump every reference across the
+  whole repo in one shot instead of hand-editing each one; confirmed live
+  that hand-editing misses files that aren't in the "obvious" gpu/tpu set -
+  `run/run_model.py` and `docs/llm-training-primer.md` both drifted for
+  multiple version bumps before this script existed specifically to catch
+  that.
 - The TPU path hasn't been run end-to-end on real TPU hardware yet — the
   GPU path is the proven one. If you hit an issue running `tpu/`'s
   scripts, that's expected first-run friction, not necessarily something

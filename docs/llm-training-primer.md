@@ -358,7 +358,7 @@ stopping fires.
 from google.colab import userdata
 HF_TOKEN = userdata.get("HF_TOKEN")
 HF_USER = userdata.get("HF_USER")
-HF_REPO = f"{HF_USER}/{MODEL_CHOICE}-financial-reasoner-v3"
+HF_REPO = f"{HF_USER}/{MODEL_CHOICE}-financial-reasoner-v7"
 
 model.push_to_hub_merged(HF_REPO, tokenizer, save_method = "lora", token = HF_TOKEN)
 ```
