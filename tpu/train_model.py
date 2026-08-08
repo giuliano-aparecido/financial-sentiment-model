@@ -323,8 +323,8 @@ HF_TOKEN = get_secret("HF_TOKEN")
 HF_USER = get_secret("HF_USER")
 
 # "-tpu" suffix keeps this from silently overwriting the already-pushed
-# GPU-trained adapter at the plain "-v4" name.
-HF_REPO = f"{HF_USER}/{MODEL_CHOICE}-financial-reasoner-v4-tpu"
+# GPU-trained adapter at the plain "-v7" name.
+HF_REPO = f"{HF_USER}/{MODEL_CHOICE}-financial-reasoner-v7-tpu"
 
 # model.push_to_hub_merged(..., save_method="lora") in the GPU script
 # pushes the adapter only, not a merged model, despite the method name -

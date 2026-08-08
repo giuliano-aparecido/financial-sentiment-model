@@ -75,8 +75,8 @@ except NameError:
     MODEL_CHOICE = "llama-3.2-3b"
     HF_USER = get_secret("HF_USER")
     # Matches the "-tpu" suffix train_model.py pushes to, so this reloads
-    # the TPU-trained adapter rather than the GPU-trained one at "-v4".
-    HF_REPO = f"{HF_USER}/{MODEL_CHOICE}-financial-reasoner-v4-tpu"
+    # the TPU-trained adapter rather than the GPU-trained one at "-v7".
+    HF_REPO = f"{HF_USER}/{MODEL_CHOICE}-financial-reasoner-v7-tpu"
 
     # The pushed repo is adapter-only - AutoPeftModelForCausalLM is peft's
     # loader built specifically for that: it reads adapter_config.json,

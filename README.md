@@ -113,12 +113,17 @@ Practical consequences:
   `transformers peft trl accelerate datasets` (plus whatever `torch_xla`
   build Colab's TPU runtime already ships).
 - Both paths push an **adapter-only** model to the same naming scheme
-  (`{HF_USER}/{model}-financial-reasoner-v4`), except the TPU path adds a
+  (`{HF_USER}/{model}-financial-reasoner-v7`), except the TPU path adds a
   `-tpu` suffix so a TPU run never overwrites a GPU-trained adapter at the
-  same name, or vice versa. (`v4` is the "analyst pipeline" generation —
-  market data/valuation/earnings inputs plus the `answer` output field; the
-  older `-v3`/`-v3-tpu` repos remain on Hugging Face, untouched, for
-  comparison.)
+  same name, or vice versa. The trailing number is bumped by hand each time
+  a new training attempt is pushed (v4 → v7 so far), so it tracks
+  individual pushes, not the prompt/output schema - the schema itself has
+  stayed the "analyst pipeline" generation (market data/valuation/earnings
+  inputs plus the `answer` output field, introduced at v4) across all of
+  them. Older numbered repos remain on Hugging Face, untouched, for
+  comparison - update this README's number (and every `HF_REPO =` line in
+  `gpu/`/`tpu`'s `train_model.py` and `evaluate_*.py`) whenever you bump it
+  again, so the docs and the scripts don't point at different models.
 - The TPU path hasn't been run end-to-end on real TPU hardware yet — the
   GPU path is the proven one. If you hit an issue running `tpu/`'s
   scripts, that's expected first-run friction, not necessarily something
@@ -135,7 +140,7 @@ running the whole notebook unattended via "Run all."
 | Name | What it is |
 |---|---|
 | `HF_TOKEN` | A Hugging Face **write**-access token, used to push the fine-tuned model. |
-| `HF_USER` | Your Hugging Face username, used to build the target repo name (`{HF_USER}/{model}-financial-reasoner-v4`). |
+| `HF_USER` | Your Hugging Face username, used to build the target repo name (`{HF_USER}/{model}-financial-reasoner-v7`). |
 | `GEMINI_API_KEY` | A free key from [aistudio.google.com/apikey](https://aistudio.google.com/apikey), used by `generate_real_dataset.py` to write headline-grounded `reasoning` and `answer` text (`gemini-3.5-flash-lite` — cost for the whole real dataset is well under $1). |
 
 None of these values are ever written into any file in this repo — that's
