@@ -38,7 +38,7 @@ except NameError:
     MODEL_CHOICE = "llama-3.2-3b"
     MAX_SEQ_LENGTH = 2048
     HF_USER = get_secret("HF_USER")
-    HF_REPO = f"{HF_USER}/{MODEL_CHOICE}-financial-reasoner-v4"
+    HF_REPO = f"{HF_USER}/{MODEL_CHOICE}-financial-reasoner-v7"
 
     model, tokenizer = FastLanguageModel.from_pretrained(
         model_name=HF_REPO,

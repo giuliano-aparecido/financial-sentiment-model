@@ -321,6 +321,6 @@ HF_TOKEN = get_secret("HF_TOKEN")
 
 HF_USER = get_secret("HF_USER")
 
-HF_REPO = f"{HF_USER}/{MODEL_CHOICE}-financial-reasoner-v4"
+HF_REPO = f"{HF_USER}/{MODEL_CHOICE}-financial-reasoner-v7"
 
 model.push_to_hub_merged(HF_REPO, tokenizer, save_method = "lora", token = HF_TOKEN)

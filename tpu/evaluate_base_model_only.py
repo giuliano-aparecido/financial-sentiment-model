@@ -40,7 +40,7 @@ except NameError:
     HF_USER = get_secret("HF_USER")
     # Matches the "-tpu" suffix train_model.py pushes to, so this reloads
     # the TPU-trained adapter rather than the GPU-trained one at "-v3".
-    HF_REPO = f"{HF_USER}/{MODEL_CHOICE}-financial-reasoner-v4-tpu"
+    HF_REPO = f"{HF_USER}/{MODEL_CHOICE}-financial-reasoner-v7-tpu"
 
     # The pushed repo is adapter-only (see train_model.py's push-to-hub
     # comment) - AutoPeftModelForCausalLM is peft's loader built
