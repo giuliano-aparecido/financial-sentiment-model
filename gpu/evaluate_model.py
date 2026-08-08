@@ -1,5 +1,16 @@
+!pip install "unsloth[colab-new] @ git+https://github.com/unslothai/unsloth.git"
+!pip install --no-deps trl peft accelerate bitsandbytes
+
 # Direction-accuracy evaluation - paste as ONE Colab cell. Self-contained:
-# works whether the previous session is still alive (reuses `model`,
+# the two pip installs above match gpu/train_model.py's exactly - PR #16
+# made this script reload the model from HF instead of requiring the
+# training cell's variables in memory, but stopped short of installing its
+# own dependencies too, so a genuinely fresh session (no training cell run
+# at all this session) still hit ModuleNotFoundError on `unsloth` even
+# after that fix. These installs are safe to re-run if the training cell
+# already ran in this session too - pip just no-ops on an already-
+# satisfied requirement. Works whether the previous session is still alive
+# (reuses `model`,
 # `tokenizer`, `alpaca_prompt` already in memory - the normal case,
 # right after the training cell) or crashed/expired (reloads the
 # finished, already-pushed model fresh from Hugging Face - e.g. re-running
