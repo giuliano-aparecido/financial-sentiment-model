@@ -73,18 +73,25 @@ depending on which free Colab accelerator you're using — pick **one** of
    steps 2-3, fine-tunes with early stopping, and pushes the result to
    your Hugging Face account.
 5. **`gpu/evaluate_model.py`** or **`tpu/evaluate_model.py`** (match
-   whichever you used for step 4) — must run in the **same Colab session**
-   immediately after step 4 (it reuses `model`/`tokenizer`/`alpaca_prompt`
-   still in memory). Reports direction accuracy — not loss, see
-   `docs/training-results-analysis.md` for why that distinction matters —
-   split by dataset source and by class, plus a base-model (untrained)
-   comparison so you know how much the fine-tune actually helped.
+   whichever you used for step 4) — self-contained: reuses
+   `model`/`tokenizer`/`alpaca_prompt` if run immediately after step 4 in
+   the same session, or reloads the already-pushed model straight from
+   Hugging Face if run in a fresh session (e.g. the previous one expired,
+   or this same script crashed partway through on a prior run — training
+   already finished and pushed by that point, so there's nothing to
+   retrain, just this cell to re-run). Either way needs the
+   `dataset_val*.jsonl` files present on disk. Reports direction accuracy
+   — not loss, see `docs/training-results-analysis.md` for why that
+   distinction matters — split by dataset source and by class, plus a
+   base-model (untrained) comparison so you know how much the fine-tune
+   actually helped.
 
 `evaluate_base_model_only.py` (in the matching `gpu/` or `tpu/` directory)
-is a standalone fallback: if you need just the base-model comparison on
-its own (e.g. the tuned pass already ran in an earlier session), it
-reloads the pushed model straight from Hugging Face rather than requiring
-the training cell's variables still in memory.
+is a standalone fallback for when you need *just* the base-model
+comparison on its own (e.g. you already have `evaluate_model.py`'s
+fine-tuned numbers from an earlier run and don't want to redo that pass) —
+same self-contained reload-or-reuse behavior as `evaluate_model.py` above,
+just skipping the tuned pass entirely.
 
 ### GPU (`gpu/`) vs TPU (`tpu/`)
 
