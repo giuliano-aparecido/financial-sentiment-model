@@ -108,6 +108,14 @@ got on synthetic val):
    confidence_from_move now takes a `contradicts` flag that overrides the
    magnitude formula entirely rather than blending with it. Not yet
    re-validated with a full retrain/eval - that's the next G-gate.
+6. weekly_windows() now yields most-recent-first instead of oldest-first.
+   Confirmed live: combined with MAX_HEADLINES_PER_TICKER breaking the
+   window loop as soon as the cap is reached, a high-volume ticker (e.g.
+   Ford) filled its entire 50-headline quota within the first 3-4 windows
+   under the old oldest-first order - meaning its real training data was
+   drawn ENTIRELY from the oldest few weeks of the 18-week range, never
+   reaching the most recent, most relevant headlines at all. See that
+   function's own docstring for the full reasoning.
 
 Earlier history: this script originally used yfinance's Ticker.news for
 headlines, which only returns the current "latest ~10" items with no
@@ -433,11 +441,24 @@ def _format_date(dt):
 
 
 def weekly_windows():
-    """Yields (after_date, before_date) date objects, oldest first, covering
-    LOOKBACK_WEEKS weeks ending SAFETY_BUFFER_DAYS before today."""
+    """Yields (after_date, before_date) date objects, MOST RECENT first,
+    covering LOOKBACK_WEEKS weeks ending SAFETY_BUFFER_DAYS before today.
+
+    Confirmed live: with the old oldest-first order, a high-volume ticker
+    (e.g. Ford) hit MAX_HEADLINES_PER_TICKER within the first 3-4 windows
+    every time - and since generate_and_write()'s window loop breaks as
+    soon as that cap is reached, such a ticker's real training data ended
+    up drawn ENTIRELY from the oldest few weeks of the 18-week range,
+    never reaching the most recent, most relevant headlines at all. Most
+    recent first means the cap gets filled with current news first instead
+    - a ticker that hits the cap early now does so with its most relevant
+    headlines, not its stalest ones; a lower-volume ticker that needs the
+    full 18 weeks to reach the cap (or never reaches it) sees the exact
+    same set of headlines either way, just in the opposite order, so this
+    is a strict improvement with no downside for that case."""
     today = datetime.date.today()
     window_end = today - datetime.timedelta(days=SAFETY_BUFFER_DAYS)
-    for i in range(LOOKBACK_WEEKS, 0, -1):
+    for i in range(1, LOOKBACK_WEEKS + 1):
         after = window_end - datetime.timedelta(weeks=i)
         before = after + datetime.timedelta(weeks=1)
         yield after, before
