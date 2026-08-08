@@ -85,9 +85,29 @@ got on synthetic val):
    the same call as `reasoning`) - see fetch_ticker_fundamentals_history's
    docstring for exactly which pieces are genuinely as-of-date vs a
    documented current-snapshot approximation (shares outstanding, forward
-   P/E, dividend yield, 52-week range). direction/confidence remain purely
-   price-move-derived, unchanged. Mirrors generate_synthetic_dataset.py's
-   v4 addition field-for-field so both datasets stay concatenable.
+   P/E, dividend yield, 52-week range). direction remains purely price-
+   move-derived, unchanged; confidence's independence from Gemini ended in
+   item 5 below. Mirrors generate_synthetic_dataset.py's v4 addition
+   field-for-field so both datasets stay concatenable.
+5. Fixed a real, confirmed-live gap in item 0's "use low confidence when
+   the headline contradicts the label" fix: that instruction only ever
+   reached the REASONING prose Gemini wrote, never the numeric `confidence`
+   field, which was computed by confidence_from_move purely from price-move
+   magnitude BEFORE the Gemini call happened at all. A G1 eval on the v4
+   model showed the exact resulting mismatch: the model correctly stating
+   in its own reasoning that a headline contradicted the direction it was
+   about to output, then outputting that direction anyway with confidence
+   0.69-0.70 in nearly every contradicted case - not a coincidence, that's
+   confidence_from_move's own output for a move barely past the +/-2%
+   threshold (the noisiest, most contradiction-prone band), which the
+   trained model faithfully reproduced instead of the intended 0.5-0.6
+   calibration. Added an explicit `CONTRADICTS: yes/no` line to
+   GEMINI_REASONING_PROMPT's output format (kept separate from the
+   REASONING prose specifically so the confidence override doesn't depend
+   on regex-sniffing hedge language out of free text), and
+   confidence_from_move now takes a `contradicts` flag that overrides the
+   magnitude formula entirely rather than blending with it. Not yet
+   re-validated with a full retrain/eval - that's the next G-gate.
 
 Earlier history: this script originally used yfinance's Ticker.news for
 headlines, which only returns the current "latest ~10" items with no
@@ -506,11 +526,27 @@ def label_from_forward_return(ticker_obj, published_at):
     return direction, pct_change, actual_window_days, None
 
 
-def confidence_from_move(direction, pct_change):
+def confidence_from_move(direction, pct_change, contradicts=False):
     # Bigger moves get higher confidence, on the reasoning that a move well
     # past the threshold is less likely to be pure noise than one that
     # barely cleared it. Loosely mirrors the synthetic generator's
     # per-category confidence ranges, not derived from anything rigorous.
+    #
+    # `contradicts` - whether Gemini judged the headline's own content to
+    # point the OPPOSITE way from the price-derived `direction` (see
+    # GEMINI_REASONING_PROMPT's CONTRADICTS line) - overrides the magnitude
+    # formula entirely rather than blending with it. This was a real,
+    # confirmed-live gap: PR #10 told Gemini to WRITE low confidence
+    # (0.5-0.6) in the reasoning prose for exactly this case, but the
+    # actual numeric confidence field was computed here, from price
+    # magnitude alone, before Gemini's judgment existed anywhere - Gemini's
+    # text said "hedge," the label said 0.69-0.7 (this formula's own output
+    # for a move barely past the +/-2% threshold, which is also exactly the
+    # noisiest, most contradiction-prone case), and the trained model
+    # dutifully reproduced that exact mismatched pairing at inference time
+    # instead of the calibration PR #10 intended.
+    if contradicts:
+        return round(random.uniform(0.50, 0.60), 2)
     magnitude = min(abs(pct_change), 0.15) / 0.15  # normalize, cap at a 15% move
     if direction == "NEUTRAL":
         return round(0.55 + 0.15 * (1 - magnitude), 2)
@@ -796,12 +832,13 @@ GEMINI_REASONING_PROMPT = """You are labeling training data for a financial-news
 
 You are given a stock ticker, its current market data, a valuation estimate, its most recent earnings, a real news headline about it, a user's question, and a directional label (BULLISH, BEARISH, or NEUTRAL). That label was already determined from the stock's ACTUAL subsequent price move over the next few trading days - not from reading anything below. You do not have access to that price-move data, and you must not reference it, invent a percentage move, or write anything implying you know what the stock did afterward.
 
-Write TWO things, each as its own labeled line (see OUTPUT FORMAT):
+Write THREE things, each as its own labeled line (see OUTPUT FORMAT):
 
 1. REASONING (2-3 sentences): Reads the headline and explains why it's plausibly consistent with a {direction} outlook - the way a financial analyst would talk through the available evidence, not the outcome. Weave in the market data, valuation, or earnings below ONLY where they genuinely reinforce or complicate the headline's own signal - don't force a mention if a block is irrelevant to this specific headline or says "Data unavailable."/"Not applicable", and never invent facts or numbers that aren't in what you were given.
    - If the headline's content does not obviously support {direction} (this happens often - many price moves in a short window are unrelated to the nearest headline), say so plainly - call it a weak or indirect signal rather than forcing a confident causal claim that isn't there.
    - If the headline's content clearly points the OPPOSITE way from {direction} (e.g. a headline reporting good news paired with a BEARISH label, or bad news paired with BULLISH - this happens often, since the label reflects the actual subsequent move and headlines don't always predict it), do NOT invent a contrarian story to force a fit - phrases like "already priced in," "overbought/oversold," or "the market sees through this" sound analytical but aren't something you can actually know from a single headline, and a model trained on that kind of reasoning learns to talk itself out of headlines it read correctly. Instead say plainly that the headline's own content points the other way, and that the labeled outcome likely reflects other developments not visible here.
 2. ANSWER (1-2 sentences): A direct, plain answer to the user's question below, consistent with {direction} and, where relevant, the data above. If the question is empty, give a general one-line read on {ticker} instead.
+3. CONTRADICTS: yes if the headline's own content clearly points the OPPOSITE way from {direction} (the case described in REASONING's second bullet above) - no otherwise, including the "weak/indirect signal" case (first bullet), which is NOT a contradiction, just a lack of strong support. This drives the confidence score a downstream step assigns to this example (low if yes) - answer based on what the headline itself says, not on any hedging language you used in REASONING.
 
 Ticker: {ticker}
 Current Market Data:
@@ -817,9 +854,10 @@ Headline: {headline}
 User Question: {user_query}
 Direction: {direction}
 
-OUTPUT FORMAT - exactly two lines, nothing else, no preamble or quotes:
+OUTPUT FORMAT - exactly three lines, nothing else, no preamble or quotes:
 REASONING: <text>
-ANSWER: <text>"""
+ANSWER: <text>
+CONTRADICTS: <yes or no>"""
 
 
 def _retry_delay_seconds(error_text, default=10.0):
@@ -834,19 +872,25 @@ def _retry_delay_seconds(error_text, default=10.0):
 
 
 def _parse_gemini_output(text):
-    """Splits Gemini's 'REASONING: ...\\nANSWER: ...' response into (reasoning,
-    answer). Raises ValueError if the REASONING section is missing/empty -
-    callers catch that as a normal Gemini-call failure and fall back to the
-    template, same as any other malformed/empty response. A missing ANSWER
-    section alone is NOT fatal - the caller fills it from ANSWER_TEMPLATES,
-    since losing just the answer half shouldn't discard a good REASONING."""
+    """Splits Gemini's 'REASONING: ...\\nANSWER: ...\\nCONTRADICTS: ...'
+    response into (reasoning, answer, contradicts). Raises ValueError if
+    the REASONING section is missing/empty - callers catch that as a
+    normal Gemini-call failure and fall back to the template, same as any
+    other malformed/empty response. A missing ANSWER or CONTRADICTS
+    section alone is NOT fatal - the caller fills the answer from
+    ANSWER_TEMPLATES and defaults contradicts to False (the conservative
+    choice: an unparseable flag should NOT suppress confidence, only an
+    explicit "yes" should), since losing just one field shouldn't discard
+    an otherwise-good REASONING."""
     reasoning_match = re.search(r"REASONING:\s*(.*?)(?:\n\s*ANSWER:|$)", text, re.DOTALL | re.IGNORECASE)
-    answer_match = re.search(r"ANSWER:\s*(.*)", text, re.DOTALL | re.IGNORECASE)
+    answer_match = re.search(r"ANSWER:\s*(.*?)(?:\n\s*CONTRADICTS:|$)", text, re.DOTALL | re.IGNORECASE)
+    contradicts_match = re.search(r"CONTRADICTS:\s*(yes|no)", text, re.IGNORECASE)
     reasoning = reasoning_match.group(1).strip() if reasoning_match else ""
     answer = answer_match.group(1).strip() if answer_match else ""
+    contradicts = bool(contradicts_match) and contradicts_match.group(1).lower() == "yes"
     if not reasoning:
         raise ValueError("no REASONING section in Gemini output")
-    return reasoning, answer
+    return reasoning, answer, contradicts
 
 
 def generate_grounded_reasoning(ticker, title, direction, pct_change, actual_window_days,
@@ -859,11 +903,15 @@ def generate_grounded_reasoning(ticker, title, direction, pct_change, actual_win
     answer for a given ticker across unrelated headlines - see the module
     docstring's item 0.
 
-    Returns (reasoning, answer) - both fall back independently: a Gemini
-    failure/empty response/quota exhaustion falls back to
-    (_template_reasoning(...), ANSWER_TEMPLATES[qtype][direction]); a
-    response with REASONING but no parseable ANSWER line keeps Gemini's
-    reasoning and only falls back the answer half.
+    Returns (reasoning, answer, contradicts) - each falls back
+    independently: a Gemini failure/empty response/quota exhaustion falls
+    back to (_template_reasoning(...), ANSWER_TEMPLATES[qtype][direction],
+    False); a response with REASONING but no parseable ANSWER/CONTRADICTS
+    line keeps Gemini's reasoning and only falls back the missing half(es).
+    `contradicts` feeds confidence_from_move's override (see that
+    function's docstring for why this exists - the confidence field used
+    to be entirely blind to whether the headline actually agreed with the
+    label).
 
     Confirmed live: the free tier's 15-requests/minute cap gets hit almost
     immediately with no pacing, and every call after that silently fell
@@ -893,8 +941,9 @@ def generate_grounded_reasoning(ticker, title, direction, pct_change, actual_win
     global _gemini_daily_quota_exhausted
     reasoning = _template_reasoning(ticker, direction, pct_change, actual_window_days)
     answer = ANSWER_TEMPLATES[qtype][direction].format(ticker=ticker)
+    contradicts = False
     if _gemini_daily_quota_exhausted:
-        return reasoning, answer
+        return reasoning, answer, contradicts
 
     prompt = GEMINI_REASONING_PROMPT.format(
         ticker=ticker, headline=title, direction=direction,
@@ -907,8 +956,9 @@ def generate_grounded_reasoning(ticker, title, direction, pct_change, actual_win
             text = (response.text or "").strip()
             if not text:
                 raise ValueError("empty response")
-            parsed_reasoning, parsed_answer = _parse_gemini_output(text)
+            parsed_reasoning, parsed_answer, parsed_contradicts = _parse_gemini_output(text)
             reasoning = parsed_reasoning
+            contradicts = parsed_contradicts
             if parsed_answer:
                 answer = parsed_answer
             break
@@ -931,7 +981,7 @@ def generate_grounded_reasoning(ticker, title, direction, pct_change, actual_win
             break
     if not _gemini_daily_quota_exhausted:
         time.sleep(GEMINI_REQUEST_DELAY_SECONDS)
-    return reasoning, answer
+    return reasoning, answer, contradicts
 
 
 def make_real_example(ticker, ticker_obj, fundamentals_history, title, publisher, published_at):
@@ -944,16 +994,23 @@ def make_real_example(ticker, ticker_obj, fundamentals_history, title, publisher
     date_str = _format_date(published_at) if published_at else "recent"
     headline_line = f"- [{date_str}] {title} - {publisher}"
 
-    confidence = confidence_from_move(direction, pct_change)
     user_query, qtype = build_user_query(ticker)
 
     as_of_date = published_at.date() if published_at else datetime.date.today()
     market_data, valuation, earnings = build_fundamentals_blocks(ticker_obj, fundamentals_history, as_of_date)
 
-    reasoning, answer = generate_grounded_reasoning(
+    # Gemini's contradicts judgment has to exist BEFORE confidence is
+    # computed - confidence_from_move needs it to override the magnitude-
+    # only formula for headline-contradicted rows (see that function's
+    # docstring). Confidence used to be computed first, independent of
+    # Gemini entirely, which was the actual root cause of PR #10's
+    # "use low confidence when contradicted" instruction never taking
+    # effect on the trained model's calibration - only on the prose.
+    reasoning, answer, contradicts = generate_grounded_reasoning(
         ticker, title, direction, pct_change, actual_window_days,
         market_data, valuation, earnings, user_query, qtype,
     )
+    confidence = confidence_from_move(direction, pct_change, contradicts)
 
     output_payload = {
         "impacted_stocks": [
