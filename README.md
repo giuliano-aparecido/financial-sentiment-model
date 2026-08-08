@@ -152,6 +152,7 @@ running the whole notebook unattended via "Run all."
 | `HF_USER` | Your Hugging Face username, used to build the target repo name (`{HF_USER}/{model}-financial-reasoner-v7`). |
 | `GEMINI_API_KEY` | A free key from [aistudio.google.com/apikey](https://aistudio.google.com/apikey), used by `generate_real_dataset.py` to write headline-grounded `reasoning` and `answer` text (`gemini-3.5-flash-lite` — cost for the whole real dataset is well under $1). |
 | `MODEL_VERSION` *(optional)* | Overrides the `-vN` suffix in the target repo name for this session only, without editing any file - e.g. set to `v6` to reload/evaluate an older push for comparison. Every script falls back to the git-committed `MODEL_VERSION_DEFAULT` (bumped via `python bump_model_version.py vN`) if this isn't set, so it's safe to leave unset entirely. |
+| `MODEL_CHOICE` *(optional)* | Overrides which `MODEL_REGISTRY` entry (base model family, e.g. `apertus-8b`) to train/reload for this session only, without editing any file. Falls back to the git-committed `MODEL_CHOICE_DEFAULT` (`"llama-3.2-3b"`) if unset. When reloading a pushed model in an eval script, this must match whatever `MODEL_CHOICE` that specific push was actually trained under, not whatever you'd like to try next. |
 
 None of these values are ever written into any file in this repo — that's
 the whole point of pulling them from Colab/Kaggle Secrets instead.

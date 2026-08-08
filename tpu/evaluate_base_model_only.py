@@ -42,7 +42,16 @@ except NameError:
     from transformers import AutoTokenizer
     import torch_xla.core.xla_model as xm
 
-    MODEL_CHOICE = "llama-3.2-3b"
+    # MODEL_CHOICE_DEFAULT is the git-committed baseline. Add an OPTIONAL
+    # "MODEL_CHOICE" Colab/Kaggle Secret to reload a different base-model
+    # family ad-hoc, without editing this file - must match whatever
+    # MODEL_CHOICE the target HF_REPO was actually trained/pushed under.
+    MODEL_CHOICE_DEFAULT = "llama-3.2-3b"
+    try:
+        MODEL_CHOICE = get_secret("MODEL_CHOICE") or MODEL_CHOICE_DEFAULT
+    except Exception:
+        MODEL_CHOICE = MODEL_CHOICE_DEFAULT
+
     HF_USER = get_secret("HF_USER")
 
     # MODEL_VERSION_DEFAULT is the git-committed baseline (bumped by
