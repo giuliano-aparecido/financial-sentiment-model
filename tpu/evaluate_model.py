@@ -44,8 +44,12 @@ import re
 
 import torch
 
-# Rows to sample per val source (real val only has 60 rows, so it always
-# runs in full). None = evaluate every row (slower: 657 synthetic rows).
+# Rows to sample per val source. Real val's actual row count depends on
+# how many headlines generate_real_dataset.py's non-deterministic fetch
+# turned up for VAL_HOLDOUT_TICKERS this run (widened to 6 tickers - was
+# 2 - specifically so this sample draws from more than one or two
+# companies' idiosyncratic news cycle; see that constant's own comment).
+# None = evaluate every row (slower: 657 synthetic rows).
 EVAL_SAMPLE_PER_SOURCE = 100
 
 # How many full generations to keep and print per (source, expected,

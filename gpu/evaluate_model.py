@@ -47,8 +47,12 @@ import re
 import torch
 from unsloth import FastLanguageModel
 
-# Rows to sample per val source (real val only has 60 rows, so it always
-# runs in full). None = evaluate every row (slower: 657 synthetic rows).
+# Rows to sample per val source. Real val's actual row count depends on
+# how many headlines generate_real_dataset.py's non-deterministic fetch
+# turned up for VAL_HOLDOUT_TICKERS this run (widened to 6 tickers - was
+# 2 - specifically so this sample draws from more than one or two
+# companies' idiosyncratic news cycle; see that constant's own comment).
+# None = evaluate every row (slower: 657 synthetic rows).
 EVAL_SAMPLE_PER_SOURCE = 100
 
 # How many full generations to keep and print per (source, expected,
@@ -282,14 +286,64 @@ tuned = run_eval("FINE-TUNED model")
 # Free whatever's reclaimable before starting the second pass.
 torch.cuda.empty_cache()
 
-# Pass 2: the base model, by temporarily disabling the LoRA adapter on the
-# same loaded model - no second download, no extra memory. This is the
-# baseline that tells us whether training added value at all. Guarded so a
-# surprise here can't erase the tuned results already printed above.
+# Base repos for the fallback path below - mirrors gpu/train_model.py's
+# MODEL_REGISTRY "repo" field per MODEL_CHOICE (see CONTRIBUTING.md's sync
+# rule; keep in sync with that file, not just the alpaca_prompt).
+BASE_MODEL_REPO_BY_CHOICE = {
+    "llama-3.2-3b": "unsloth/Llama-3.2-3B-Instruct-bnb-4bit",
+    "apertus-8b": "swiss-ai/Apertus-8B-Instruct-2509",
+    "apertus-0.5b": "swiss-ai/Apertus-v1.1-0.5B-Instruct",
+    "qwen-2.5-7b": "unsloth/Qwen2.5-7B-Instruct-bnb-4bit",
+    "mistral-7b": "unsloth/mistral-7b-instruct-v0.3-bnb-4bit",
+}
+
+# Pass 2: the base model. Prefers temporarily disabling the LoRA adapter on
+# the already-loaded model (no second download, no extra memory) - works
+# when `model` is a plain peft-wrapped object with disable_adapter()
+# available. Confirmed live: this can fail with
+# "'LlamaForCausalLM' object has no attribute 'disable_adapter'" - some
+# unsloth code path (FastLanguageModel.for_inference(), or how it loads an
+# adapter-only repo) can return/transform the model into something that no
+# longer exposes peft's disable_adapter() context manager, and this
+# apparently happened on every run this session (no base-model pass had
+# completed before this fix - earlier attempts were masked by other
+# crashes, like the confusion-matrix sort TypeError, that happened first
+# and prevented execution from ever reaching this point). Falls back to
+# loading a genuinely separate, adapter-free base model instance when
+# disable_adapter() isn't available - costs a second download/load, but
+# doesn't depend on guessing which unsloth-internal transformation caused
+# the first approach to fail.
 try:
     with model.disable_adapter():
         base = run_eval("BASE model (adapter disabled)")
 except Exception as e:
-    print(f"Base-model pass failed ({e!r}) - tuned results above still stand. "
-          "Fallback: reload the base model fresh in a new cell and rerun "
-          "run_eval, or share this error.")
+    print(f"model.disable_adapter() unavailable/failed ({e!r}) - loading a "
+          f"separate, genuinely adapter-free base model instance instead...")
+    try:
+        _model_choice = globals().get("MODEL_CHOICE", "llama-3.2-3b")
+        _max_seq_length = globals().get("MAX_SEQ_LENGTH", 2048)
+        _base_repo = BASE_MODEL_REPO_BY_CHOICE[_model_choice]
+
+        base_model, base_tokenizer = FastLanguageModel.from_pretrained(
+            model_name=_base_repo,
+            max_seq_length=_max_seq_length,
+            dtype=None,
+            load_in_4bit=True,
+        )
+        FastLanguageModel.for_inference(base_model)
+
+        # run_eval()/generate_response() close over the module-level
+        # `model`/`tokenizer` names, looked up at call time - swap them to
+        # the base model for this pass, then restore, so nothing below (or
+        # a later cell reusing `model`) silently ends up with the base
+        # model instead of the fine-tuned one.
+        _tuned_model, _tuned_tokenizer = model, tokenizer
+        model, tokenizer = base_model, base_tokenizer
+        try:
+            base = run_eval("BASE model (separately loaded, no adapter)")
+        finally:
+            model, tokenizer = _tuned_model, _tuned_tokenizer
+    except Exception as e2:
+        print(f"Base-model fallback load also failed ({e2!r}) - tuned results "
+              "above still stand. Fallback: reload the base model fresh in a "
+              "new cell and rerun run_eval manually, or share this error.")
