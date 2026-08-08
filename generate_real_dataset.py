@@ -290,7 +290,18 @@ TICKERS = [
 # Smaller holdout than the synthetic generator's - real data volume per
 # ticker is naturally lower than a generated quota, so holding out too
 # many tickers leaves too little to actually train on.
-VAL_HOLDOUT_TICKERS = {"META", "BA"}
+#
+# Widened from {"META", "BA"} after a real, confirmed problem: real-val
+# accuracy swung 38% -> 49% -> 53% -> 33% across four consecutive eval
+# runs, and a 2-ticker, 100-row val sample is dominated by whatever those
+# two specific companies' recent news cycle happened to look like in
+# whatever window generate_real_dataset.py's non-deterministic fetch
+# sampled that run - not a reliable signal to judge or optimize the model
+# against. Spans distinct sectors (tech/social, aerospace/industrial,
+# banking, energy, consumer staples, streaming media) specifically so no
+# single company's idiosyncratic news cycle can dominate the sample the
+# way META/BA alone could.
+VAL_HOLDOUT_TICKERS = {"META", "BA", "JPM", "XOM", "KO", "NFLX"}
 
 FORWARD_WINDOW_TRADING_DAYS = 3   # how many trading days after the headline
                                    # to measure the price move over

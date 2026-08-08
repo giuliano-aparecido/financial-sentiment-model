@@ -231,5 +231,49 @@ def run_eval(label):
 
 
 torch.cuda.empty_cache()
-with model.disable_adapter():
-    base = run_eval("BASE model (adapter disabled)")
+
+# Base repos for the fallback path below - mirrors gpu/train_model.py's
+# MODEL_REGISTRY "repo" field per MODEL_CHOICE (see CONTRIBUTING.md's sync
+# rule; keep in sync with that file, not just the alpaca_prompt).
+BASE_MODEL_REPO_BY_CHOICE = {
+    "llama-3.2-3b": "unsloth/Llama-3.2-3B-Instruct-bnb-4bit",
+    "apertus-8b": "swiss-ai/Apertus-8B-Instruct-2509",
+    "apertus-0.5b": "swiss-ai/Apertus-v1.1-0.5B-Instruct",
+    "qwen-2.5-7b": "unsloth/Qwen2.5-7B-Instruct-bnb-4bit",
+    "mistral-7b": "unsloth/mistral-7b-instruct-v0.3-bnb-4bit",
+}
+
+# Prefers temporarily disabling the LoRA adapter on the already-loaded
+# model (no second download, no extra memory). Confirmed live: this can
+# fail with "'LlamaForCausalLM' object has no attribute 'disable_adapter'"
+# - some unsloth code path can return/transform the model into something
+# that no longer exposes peft's disable_adapter() context manager. Since
+# this script's ENTIRE purpose is exactly the "reload fresh, then run
+# base-only" scenario most likely to trigger that, an unhandled crash here
+# would defeat the script - falls back to loading a genuinely separate,
+# adapter-free base model instance instead, which doesn't depend on
+# guessing which unsloth-internal transformation caused the first
+# approach to fail.
+try:
+    with model.disable_adapter():
+        base = run_eval("BASE model (adapter disabled)")
+except Exception as e:
+    print(f"model.disable_adapter() unavailable/failed ({e!r}) - loading a "
+          f"separate, genuinely adapter-free base model instance instead...")
+    _model_choice = globals().get("MODEL_CHOICE", "llama-3.2-3b")
+    _max_seq_length = globals().get("MAX_SEQ_LENGTH", 2048)
+    _base_repo = BASE_MODEL_REPO_BY_CHOICE[_model_choice]
+
+    base_model, base_tokenizer = FastLanguageModel.from_pretrained(
+        model_name=_base_repo,
+        max_seq_length=_max_seq_length,
+        dtype=None,
+        load_in_4bit=True,
+    )
+    FastLanguageModel.for_inference(base_model)
+
+    # run_eval()/generate_response() close over the module-level
+    # `model`/`tokenizer` names, looked up at call time - swap them to the
+    # base model for this pass.
+    model, tokenizer = base_model, base_tokenizer
+    base = run_eval("BASE model (separately loaded, no adapter)")

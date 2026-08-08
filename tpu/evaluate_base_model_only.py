@@ -243,5 +243,19 @@ def run_eval(label):
 
 # No CUDA cache to clear on TPU (see evaluate_model.py's equivalent
 # comment) - XLA's allocator has no manual-release call.
-with model.disable_adapter():
-    base = run_eval("BASE model (adapter disabled)")
+#
+# Unlike the GPU scripts' unsloth-loaded model (confirmed live to
+# sometimes lose its disable_adapter() method after certain unsloth code
+# paths - see gpu/evaluate_base_model_only.py's comment on the same
+# call), this script's model comes from vanilla peft's
+# AutoPeftModelForCausalLM, which reliably supports disable_adapter() as
+# documented, standard behavior - no separate-model-load fallback needed
+# here. Still guarded, matching evaluate_model.py's TPU pass 2, so an
+# unexpected failure has a clear message instead of a bare traceback.
+try:
+    with model.disable_adapter():
+        base = run_eval("BASE model (adapter disabled)")
+except Exception as e:
+    print(f"Base-model pass failed ({e!r}). Fallback: reload the base "
+          "model fresh in a new cell and rerun run_eval, or share this "
+          "error.")
