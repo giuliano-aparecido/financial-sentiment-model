@@ -14,7 +14,45 @@ from transformers import AutoModelForCausalLM, AutoTokenizer
 from trl import SFTTrainer, SFTConfig, DataCollatorForCompletionOnlyLM
 from datasets import load_dataset
 
-MODEL_CHOICE = "llama-3.2-3b"
+# Pull config from Colab/Kaggle's own Secrets manager rather than
+# hardcoding it - anything written into a saved/shared .py file is one
+# accidental commit or shared-notebook-link away from being a real leaked
+# credential (for HF_TOKEN/HF_USER below) or just annoying to edit and
+# re-paste (for MODEL_CHOICE/MODEL_VERSION). Add secrets named HF_TOKEN (a
+# write-access token) and HF_USER (your Hugging Face username), and grant
+# this notebook access when prompted - do this BEFORE an unattended run;
+# the permission grant is interactive and will block otherwise. See the
+# README's "Required Colab Secrets" section.
+#
+# Checking whether `google.colab` IMPORTS is not a reliable way to detect
+# Colab vs Kaggle - some Kaggle base images ship a google-colab package
+# too, so the import succeeds there and userdata.get() just hangs and
+# times out instead of raising. KAGGLE_KERNEL_RUN_TYPE is set by Kaggle's
+# own runtime on every notebook - check that directly instead.
+def get_secret(name):
+    if os.environ.get("KAGGLE_KERNEL_RUN_TYPE"):
+        from kaggle_secrets import UserSecretsClient
+        return UserSecretsClient().get_secret(name)
+    from google.colab import userdata
+    return userdata.get(name)
+
+# MODEL_CHOICE_DEFAULT is the git-committed baseline - which entry of
+# MODEL_REGISTRY below to train. Add an OPTIONAL "MODEL_CHOICE" Colab/
+# Kaggle Secret (same mechanism as HF_USER/HF_TOKEN, see README's
+# "Required Colab Secrets") to switch base models ad-hoc in this session
+# only, without editing this file. Falls back to the default below if the
+# secret was never created (not just ungranted) - a broad except is
+# deliberate here since Colab/Kaggle raise different exception types for
+# "no such secret", and this one specific secret is optional by design,
+# so any failure to read it should silently fall back, never block or
+# crash. An override naming a key that doesn't exist in MODEL_REGISTRY
+# still fails loudly at the dict lookup below - not worth adding extra
+# validation for a typo in an advanced, opt-in override.
+MODEL_CHOICE_DEFAULT = "llama-3.2-3b"
+try:
+    MODEL_CHOICE = get_secret("MODEL_CHOICE") or MODEL_CHOICE_DEFAULT
+except Exception:
+    MODEL_CHOICE = MODEL_CHOICE_DEFAULT
 
 MODEL_REGISTRY = {
 
@@ -297,34 +335,32 @@ trainer = SFTTrainer(
 
 trainer.train()
 
-# Pull credentials from Colab/Kaggle's own Secrets manager rather than
-# hardcoding them - anything written into a saved/shared .py file is one
-# accidental commit or shared-notebook-link away from being a real leaked
-# credential. Add secrets named HF_TOKEN (a write-access token) and
-# HF_USER (your Hugging Face username), and grant this notebook access
-# when prompted - do this BEFORE an unattended run; the permission grant
-# is interactive and will block otherwise. See the README's "Required
-# Colab Secrets" section.
-#
-# Checking whether `google.colab` IMPORTS is not a reliable way to detect
-# Colab vs Kaggle - some Kaggle base images ship a google-colab package
-# too, so the import succeeds there and userdata.get() just hangs and
-# times out instead of raising. KAGGLE_KERNEL_RUN_TYPE is set by Kaggle's
-# own runtime on every notebook - check that directly instead.
-def get_secret(name):
-    if os.environ.get("KAGGLE_KERNEL_RUN_TYPE"):
-        from kaggle_secrets import UserSecretsClient
-        return UserSecretsClient().get_secret(name)
-    from google.colab import userdata
-    return userdata.get(name)
-
+# get_secret() is defined at the top of this file (it's needed there too,
+# for the MODEL_CHOICE override) - reused here for HF_TOKEN/HF_USER/
+# MODEL_VERSION rather than redefined.
 HF_TOKEN = get_secret("HF_TOKEN")
 
 HF_USER = get_secret("HF_USER")
 
+# MODEL_VERSION_DEFAULT is the git-committed baseline (bumped by
+# bump_model_version.py, same as before) - what every session uses unless
+# overridden. Add an OPTIONAL "MODEL_VERSION" Colab/Kaggle Secret (same
+# mechanism as HF_USER/HF_TOKEN above, see README's "Required Colab
+# Secrets") to try a different push ad-hoc in this session only, without
+# editing this file at all. Falls back to the default below if the secret
+# was never created (not just ungranted) - a broad except is deliberate
+# here since Colab/Kaggle raise different exception types for "no such
+# secret", and this one specific secret is optional by design, so any
+# failure to read it should silently fall back, never block or crash.
+MODEL_VERSION_DEFAULT = "v7"
+try:
+    MODEL_VERSION = get_secret("MODEL_VERSION") or MODEL_VERSION_DEFAULT
+except Exception:
+    MODEL_VERSION = MODEL_VERSION_DEFAULT
+
 # "-tpu" suffix keeps this from silently overwriting the already-pushed
-# GPU-trained adapter at the plain "-v7" name.
-HF_REPO = f"{HF_USER}/{MODEL_CHOICE}-financial-reasoner-v7-tpu"
+# GPU-trained adapter at the plain (no "-tpu") name.
+HF_REPO = f"{HF_USER}/{MODEL_CHOICE}-financial-reasoner-{MODEL_VERSION}-tpu"
 
 # model.push_to_hub_merged(..., save_method="lora") in the GPU script
 # pushes the adapter only, not a merged model, despite the method name -

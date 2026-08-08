@@ -358,10 +358,16 @@ stopping fires.
 from google.colab import userdata
 HF_TOKEN = userdata.get("HF_TOKEN")
 HF_USER = userdata.get("HF_USER")
-HF_REPO = f"{HF_USER}/{MODEL_CHOICE}-financial-reasoner-v3"
+MODEL_VERSION_DEFAULT = "v7"  # bumped by bump_model_version.py
+MODEL_VERSION = userdata.get("MODEL_VERSION") or MODEL_VERSION_DEFAULT  # optional Secret override, see README
+HF_REPO = f"{HF_USER}/{MODEL_CHOICE}-financial-reasoner-{MODEL_VERSION}"
 
 model.push_to_hub_merged(HF_REPO, tokenizer, save_method = "lora", token = HF_TOKEN)
 ```
+
+(The real script's version in `gpu/train_model.py` wraps that `MODEL_VERSION` line
+in a try/except, since `userdata.get(...)` raises if the "MODEL_VERSION" Secret was
+never created at all - simplified here for readability.)
 
 `userdata.get(...)` pulls Hugging Face upload credentials from Colab's
 secure Secrets vault — never hardcoded in the script. `push_to_hub_merged`

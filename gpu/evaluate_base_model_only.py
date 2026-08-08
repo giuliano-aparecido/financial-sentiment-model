@@ -41,10 +41,29 @@ except NameError:
     print("Model not in memory (new or crashed session) - reloading the "
           "already-trained, already-pushed model from Hugging Face...")
 
-    MODEL_CHOICE = "llama-3.2-3b"
+    # MODEL_CHOICE_DEFAULT is the git-committed baseline. Add an OPTIONAL
+    # "MODEL_CHOICE" Colab/Kaggle Secret to reload a different base-model
+    # family ad-hoc, without editing this file - must match whatever
+    # MODEL_CHOICE the target HF_REPO was actually trained/pushed under.
+    MODEL_CHOICE_DEFAULT = "llama-3.2-3b"
+    try:
+        MODEL_CHOICE = get_secret("MODEL_CHOICE") or MODEL_CHOICE_DEFAULT
+    except Exception:
+        MODEL_CHOICE = MODEL_CHOICE_DEFAULT
+
     MAX_SEQ_LENGTH = 2048
     HF_USER = get_secret("HF_USER")
-    HF_REPO = f"{HF_USER}/{MODEL_CHOICE}-financial-reasoner-v7"
+
+    # MODEL_VERSION_DEFAULT is the git-committed baseline (bumped by
+    # bump_model_version.py). Add an OPTIONAL "MODEL_VERSION" Colab/Kaggle
+    # Secret to reload a different push ad-hoc, without editing this file.
+    MODEL_VERSION_DEFAULT = "v7"
+    try:
+        MODEL_VERSION = get_secret("MODEL_VERSION") or MODEL_VERSION_DEFAULT
+    except Exception:
+        MODEL_VERSION = MODEL_VERSION_DEFAULT
+
+    HF_REPO = f"{HF_USER}/{MODEL_CHOICE}-financial-reasoner-{MODEL_VERSION}"
 
     model, tokenizer = FastLanguageModel.from_pretrained(
         model_name=HF_REPO,

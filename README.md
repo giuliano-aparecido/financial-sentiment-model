@@ -121,9 +121,18 @@ Practical consequences:
   stayed the "analyst pipeline" generation (market data/valuation/earnings
   inputs plus the `answer` output field, introduced at v4) across all of
   them. Older numbered repos remain on Hugging Face, untouched, for
-  comparison - update this README's number (and every `HF_REPO =` line in
-  `gpu/`/`tpu`'s `train_model.py` and `evaluate_*.py`) whenever you bump it
-  again, so the docs and the scripts don't point at different models.
+  comparison - **run `python bump_model_version.py v8`** (substituting
+  whatever the new number actually is) to bump every reference across the
+  whole repo in one shot instead of hand-editing each one; confirmed live
+  that hand-editing misses files that aren't in the "obvious" gpu/tpu set -
+  `run/run_model.py` and `docs/llm-training-primer.md` both drifted for
+  multiple version bumps before this script existed specifically to catch
+  that. For a quick, no-code-edit comparison in a single session (e.g.
+  "does v6 actually do worse than v7?") instead of a permanent bump, set
+  the optional `MODEL_VERSION` Secret instead - see "Required Colab
+  Secrets" below. The two are for different situations: the Secret is a
+  session-local override with no git trace, the script changes the
+  committed default everyone gets when they haven't set that Secret.
 - The TPU path hasn't been run end-to-end on real TPU hardware yet — the
   GPU path is the proven one. If you hit an issue running `tpu/`'s
   scripts, that's expected first-run friction, not necessarily something
@@ -142,6 +151,8 @@ running the whole notebook unattended via "Run all."
 | `HF_TOKEN` | A Hugging Face **write**-access token, used to push the fine-tuned model. |
 | `HF_USER` | Your Hugging Face username, used to build the target repo name (`{HF_USER}/{model}-financial-reasoner-v7`). |
 | `GEMINI_API_KEY` | A free key from [aistudio.google.com/apikey](https://aistudio.google.com/apikey), used by `generate_real_dataset.py` to write headline-grounded `reasoning` and `answer` text (`gemini-3.5-flash-lite` — cost for the whole real dataset is well under $1). |
+| `MODEL_VERSION` *(optional)* | Overrides the `-vN` suffix in the target repo name for this session only, without editing any file - e.g. set to `v6` to reload/evaluate an older push for comparison. Every script falls back to the git-committed `MODEL_VERSION_DEFAULT` (bumped via `python bump_model_version.py vN`) if this isn't set, so it's safe to leave unset entirely. |
+| `MODEL_CHOICE` *(optional)* | Overrides which `MODEL_REGISTRY` entry (base model family, e.g. `apertus-8b`) to train/reload for this session only, without editing any file. Falls back to the git-committed `MODEL_CHOICE_DEFAULT` (`"llama-3.2-3b"`) if unset. When reloading a pushed model in an eval script, this must match whatever `MODEL_CHOICE` that specific push was actually trained under, not whatever you'd like to try next. |
 
 None of these values are ever written into any file in this repo — that's
 the whole point of pulling them from Colab/Kaggle Secrets instead.
