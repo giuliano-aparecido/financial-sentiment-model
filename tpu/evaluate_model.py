@@ -1,5 +1,14 @@
+!pip install -q -U transformers peft accelerate
+
 # Direction-accuracy evaluation - paste as ONE Colab cell. Self-contained:
-# works whether the previous session is still alive (reuses `model`,
+# the install above matches tpu/train_model.py's (minus trl/datasets,
+# which this script doesn't need) and is safe to re-run if the training
+# cell already ran this session - pip no-ops on an already-satisfied
+# requirement. torch_xla is intentionally NOT installed here, same
+# reasoning as tpu/train_model.py: it's expected to already be present and
+# version-matched in the Colab/Kaggle TPU runtime, and pip-installing it
+# separately risks a mismatched pairing. Works whether the previous
+# session is still alive (reuses `model`,
 # `tokenizer`, `alpaca_prompt` already in memory - the normal case, right
 # after the training cell) or crashed/expired (reloads the finished,
 # already-pushed model fresh from Hugging Face - e.g. re-running this cell

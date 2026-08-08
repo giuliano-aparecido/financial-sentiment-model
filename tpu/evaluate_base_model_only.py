@@ -1,4 +1,10 @@
-# Paste as ONE Colab cell. Self-contained: works whether the previous
+!pip install -q -U transformers peft accelerate
+
+# Paste as ONE Colab cell. Self-contained, including the install above
+# (matches tpu/train_model.py's, minus trl/datasets which this script
+# doesn't need; torch_xla intentionally excluded - see tpu/evaluate_
+# model.py's comment on the same install for why). Safe to re-run if the
+# training cell already ran this session. Works whether the previous
 # session is still alive (reuses model/tokenizer already in memory) or
 # crashed (reloads the finished model fresh from Hugging Face). Runs ONLY
 # the base-model (adapter-disabled) pass - use this when you already have

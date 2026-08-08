@@ -1,9 +1,15 @@
-# Paste as ONE Colab cell. Self-contained: works whether the previous
-# session is still alive (reuses model/tokenizer already in memory) or
-# crashed (reloads the finished model fresh from Hugging Face). Runs ONLY
-# the base-model (adapter-disabled) pass - use this when you already have
-# the fine-tuned numbers from evaluate_model.py and just need the
-# untrained baseline for comparison, without redoing the tuned pass.
+!pip install "unsloth[colab-new] @ git+https://github.com/unslothai/unsloth.git"
+!pip install --no-deps trl peft accelerate bitsandbytes
+
+# Paste as ONE Colab cell. Self-contained, including these installs (match
+# gpu/train_model.py's exactly, and are safe to re-run if the training
+# cell already ran this session - pip no-ops on an already-satisfied
+# requirement): works whether the previous session is still alive (reuses
+# model/tokenizer already in memory) or crashed (reloads the finished
+# model fresh from Hugging Face). Runs ONLY the base-model (adapter-
+# disabled) pass - use this when you already have the fine-tuned numbers
+# from evaluate_model.py and just need the untrained baseline for
+# comparison, without redoing the tuned pass.
 
 import json
 import os
