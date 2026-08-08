@@ -13,24 +13,35 @@ anyone thought to check by hand - they're not in gpu/ or tpu/, so a search
 scoped to "the training/eval scripts" walks right past them. This script
 scans the WHOLE repo tree instead of a fixed file list, specifically so a
 future file that starts referencing the model name doesn't need this
-script's own logic updated too - it just needs the same
-"financial-reasoner-vN" string shape to be found.
+script's own logic updated too - it just needs one of the two string
+shapes below to be present.
 
 Usage:
     python bump_model_version.py v8
     python bump_model_version.py 8          # "v" prefix optional
 
-Auto-detects the CURRENT version from gpu/train_model.py's own HF_REPO
-line (the canonical source of truth - the actual GPU training script that
-pushes the model), so you never type the old version and risk a stale or
-mistyped one silently no-op-ing.
+Auto-detects the CURRENT version from gpu/train_model.py's own
+MODEL_VERSION_DEFAULT line (the canonical source of truth - the actual
+GPU training script that pushes the model), so you never type the old
+version and risk a stale or mistyped one silently no-op-ing.
 
-Deliberately does NOT touch bare "vN" mentions that aren't part of a
-"financial-reasoner-vN" string - e.g. "the v4 'analyst pipeline' schema
-generation" prose in module docstrings/README, which describes the
-PROMPT/OUTPUT SCHEMA version (unchanged since v4 across every retrain) -
-a different concept from this per-push repo suffix. See README.md's "Key
-design decisions" section for that distinction.
+Replaces TWO distinct string shapes, both needed to keep every reference
+in sync:
+1. `MODEL_VERSION_DEFAULT = "v7"` - the actual runtime default each
+   script falls back to when no "MODEL_VERSION" Colab/Kaggle Secret
+   override is set (see README's "Required Colab Secrets" - this default
+   is what every session actually uses unless someone deliberately
+   overrides it for an ad-hoc comparison).
+2. `financial-reasoner-vv8` - illustrative literal mentions in prose
+   (README.md's naming-scheme description and Secrets table), which
+   don't run as code but should still describe the current version.
+
+Deliberately does NOT touch bare "vN" mentions that are neither of the
+above - e.g. "the v4 'analyst pipeline' schema generation" prose in
+module docstrings/README, which describes the PROMPT/OUTPUT SCHEMA
+version (unchanged since v4 across every retrain) - a different concept
+from this per-push repo suffix. See README.md's "Key design decisions"
+section for that distinction.
 """
 
 import re
@@ -40,9 +51,8 @@ from pathlib import Path
 REPO_ROOT = Path(__file__).resolve().parent
 CANONICAL_SOURCE = REPO_ROOT / "gpu" / "train_model.py"
 
-# Matches "financial-reasoner-v7" or "financial-reasoner-v7-tpu" - the
-# "-tpu" suffix, if present, is captured and preserved untouched.
-VERSION_RE = re.compile(r"financial-reasoner-v(\d+)(-tpu)?")
+DEFAULT_VAR_RE = re.compile(r'(MODEL_VERSION_DEFAULT\s*=\s*")v(\d+)(")')
+LITERAL_RE = re.compile(r"(financial-reasoner-v)(\d+)((?:-tpu)?)")
 
 SCANNED_SUFFIXES = {".py", ".md"}
 SKIPPED_DIR_PARTS = {".git", "__pycache__"}
@@ -50,21 +60,18 @@ SKIPPED_DIR_PARTS = {".git", "__pycache__"}
 
 def detect_current_version() -> str:
     text = CANONICAL_SOURCE.read_text(encoding="utf-8")
-    match = VERSION_RE.search(text)
+    match = DEFAULT_VAR_RE.search(text)
     if not match:
         raise SystemExit(
-            f"Couldn't find a financial-reasoner-vN reference in {CANONICAL_SOURCE} "
-            "to detect the current version from - has its HF_REPO line moved or changed shape?"
+            f"Couldn't find a MODEL_VERSION_DEFAULT = \"vN\" line in {CANONICAL_SOURCE} "
+            "to detect the current version from - has it moved or changed shape?"
         )
-    return match.group(1)
+    return match.group(2)
 
 
 def bump(old_version: str, new_version: str) -> list[tuple[Path, int]]:
-    old_pattern = re.compile(rf"financial-reasoner-v{re.escape(old_version)}(-tpu)?")
-
-    def replacement(m: re.Match) -> str:
-        suffix = m.group(1) or ""
-        return f"financial-reasoner-v{new_version}{suffix}"
+    old_default_re = re.compile(rf'(MODEL_VERSION_DEFAULT\s*=\s*")v{re.escape(old_version)}(")')
+    old_literal_re = re.compile(rf"(financial-reasoner-v){re.escape(old_version)}((?:-tpu)?)")
 
     changed = []
     for path in REPO_ROOT.rglob("*"):
@@ -72,11 +79,19 @@ def bump(old_version: str, new_version: str) -> list[tuple[Path, int]]:
             continue
         if any(part in SKIPPED_DIR_PARTS for part in path.parts):
             continue
+
         text = path.read_text(encoding="utf-8")
-        new_text, count = old_pattern.subn(replacement, text)
-        if count:
-            path.write_text(new_text, encoding="utf-8")
-            changed.append((path.relative_to(REPO_ROOT), count))
+        text, count_default = old_default_re.subn(rf"\g<1>v{new_version}\g<2>", text)
+        # old_literal_re's group 1 ("financial-reasoner-v") already
+        # includes the "v" - confirmed live: reusing the same
+        # \g<1>v{new_version} template as the line above (whose group 1
+        # does NOT include the "v") produced "financial-reasoner-vv8"
+        # instead of "financial-reasoner-v7" the first time this ran.
+        text, count_literal = old_literal_re.subn(rf"\g<1>{new_version}\g<2>", text)
+        total = count_default + count_literal
+        if total:
+            path.write_text(text, encoding="utf-8")
+            changed.append((path.relative_to(REPO_ROOT), total))
     return changed
 
 
@@ -95,14 +110,20 @@ def main() -> None:
 
     changed = bump(old_version, new_version)
     if not changed:
-        print(f"No occurrences of financial-reasoner-v{old_version} found anywhere - nothing to do.")
+        print(f"No occurrences of v{old_version} found anywhere - nothing to do.")
         return
 
-    print(f"Bumped financial-reasoner-v{old_version} -> v{new_version} in {len(changed)} file(s):")
+    print(f"Bumped v{old_version} -> v{new_version} in {len(changed)} file(s):")
     for rel_path, count in changed:
         plural = "s" if count != 1 else ""
         print(f"  {rel_path} ({count} occurrence{plural})")
-    print("\nReview with `git diff`, then commit and open a PR as usual.")
+    print(
+        "\nThis only changes the DEFAULT every session falls back to - it doesn't "
+        "touch any \"MODEL_VERSION\" Colab/Kaggle Secret you may have set for ad-hoc "
+        "overrides, so remove or update that Secret too if it's now pointing at a "
+        "stale version.\n"
+        "Review with `git diff`, then commit and open a PR as usual."
+    )
 
 
 if __name__ == "__main__":

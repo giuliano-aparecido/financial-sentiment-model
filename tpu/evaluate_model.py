@@ -83,9 +83,20 @@ except NameError:
 
     MODEL_CHOICE = "llama-3.2-3b"
     HF_USER = get_secret("HF_USER")
+
+    # MODEL_VERSION_DEFAULT is the git-committed baseline (bumped by
+    # bump_model_version.py). Add an OPTIONAL "MODEL_VERSION" Colab/Kaggle
+    # Secret to reload a different push ad-hoc, without editing this file.
+    MODEL_VERSION_DEFAULT = "v7"
+    try:
+        MODEL_VERSION = get_secret("MODEL_VERSION") or MODEL_VERSION_DEFAULT
+    except Exception:
+        MODEL_VERSION = MODEL_VERSION_DEFAULT
+
     # Matches the "-tpu" suffix train_model.py pushes to, so this reloads
-    # the TPU-trained adapter rather than the GPU-trained one at "-v7".
-    HF_REPO = f"{HF_USER}/{MODEL_CHOICE}-financial-reasoner-v7-tpu"
+    # the TPU-trained adapter rather than the GPU-trained one at the plain
+    # (no "-tpu") name.
+    HF_REPO = f"{HF_USER}/{MODEL_CHOICE}-financial-reasoner-{MODEL_VERSION}-tpu"
 
     # The pushed repo is adapter-only - AutoPeftModelForCausalLM is peft's
     # loader built specifically for that: it reads adapter_config.json,

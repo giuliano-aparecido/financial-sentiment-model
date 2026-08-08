@@ -321,6 +321,23 @@ HF_TOKEN = get_secret("HF_TOKEN")
 
 HF_USER = get_secret("HF_USER")
 
-HF_REPO = f"{HF_USER}/{MODEL_CHOICE}-financial-reasoner-v7"
+# MODEL_VERSION_DEFAULT is the git-committed baseline (bumped by
+# bump_model_version.py, same as before) - what every session uses unless
+# overridden. Add an OPTIONAL "MODEL_VERSION" Colab/Kaggle Secret (same
+# mechanism as HF_USER/HF_TOKEN above, see README's "Required Colab
+# Secrets") to try a different push ad-hoc in this session only, without
+# editing this file at all - e.g. set it to "v6" to compare against an
+# older push. Falls back to the default below if the secret was never
+# created (not just ungranted) - a broad except is deliberate here since
+# Colab/Kaggle raise different exception types for "no such secret", and
+# this one specific secret is optional by design, so any failure to read
+# it should silently fall back, never block or crash.
+MODEL_VERSION_DEFAULT = "v7"
+try:
+    MODEL_VERSION = get_secret("MODEL_VERSION") or MODEL_VERSION_DEFAULT
+except Exception:
+    MODEL_VERSION = MODEL_VERSION_DEFAULT
+
+HF_REPO = f"{HF_USER}/{MODEL_CHOICE}-financial-reasoner-{MODEL_VERSION}"
 
 model.push_to_hub_merged(HF_REPO, tokenizer, save_method = "lora", token = HF_TOKEN)

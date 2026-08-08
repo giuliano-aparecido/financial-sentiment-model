@@ -34,7 +34,19 @@ def get_secret(name):
 
 # 1. Load fine-tuned weights directly from Hugging Face
 HF_USER = get_secret("HF_USER")
-MODEL_NAME = f"{HF_USER}/llama-3.2-3b-financial-reasoner-v7"  # or f"{HF_USER}/apertus-0.5b-financial-reasoner"
+
+# MODEL_VERSION_DEFAULT is the git-committed baseline (bumped by
+# bump_model_version.py, at the repo root). Add an OPTIONAL "MODEL_VERSION"
+# Colab/Kaggle Secret to serve a different push ad-hoc, without editing
+# this file - useful for a quick rollback if a newly-trained version turns
+# out worse than the one it replaced.
+MODEL_VERSION_DEFAULT = "v7"
+try:
+    MODEL_VERSION = get_secret("MODEL_VERSION") or MODEL_VERSION_DEFAULT
+except Exception:
+    MODEL_VERSION = MODEL_VERSION_DEFAULT
+
+MODEL_NAME = f"{HF_USER}/llama-3.2-3b-financial-reasoner-{MODEL_VERSION}"  # or f"{HF_USER}/apertus-0.5b-financial-reasoner"
 
 model, tokenizer = FastLanguageModel.from_pretrained(
     model_name=MODEL_NAME,

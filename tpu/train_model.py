@@ -322,9 +322,25 @@ HF_TOKEN = get_secret("HF_TOKEN")
 
 HF_USER = get_secret("HF_USER")
 
+# MODEL_VERSION_DEFAULT is the git-committed baseline (bumped by
+# bump_model_version.py, same as before) - what every session uses unless
+# overridden. Add an OPTIONAL "MODEL_VERSION" Colab/Kaggle Secret (same
+# mechanism as HF_USER/HF_TOKEN above, see README's "Required Colab
+# Secrets") to try a different push ad-hoc in this session only, without
+# editing this file at all. Falls back to the default below if the secret
+# was never created (not just ungranted) - a broad except is deliberate
+# here since Colab/Kaggle raise different exception types for "no such
+# secret", and this one specific secret is optional by design, so any
+# failure to read it should silently fall back, never block or crash.
+MODEL_VERSION_DEFAULT = "v7"
+try:
+    MODEL_VERSION = get_secret("MODEL_VERSION") or MODEL_VERSION_DEFAULT
+except Exception:
+    MODEL_VERSION = MODEL_VERSION_DEFAULT
+
 # "-tpu" suffix keeps this from silently overwriting the already-pushed
-# GPU-trained adapter at the plain "-v7" name.
-HF_REPO = f"{HF_USER}/{MODEL_CHOICE}-financial-reasoner-v7-tpu"
+# GPU-trained adapter at the plain (no "-tpu") name.
+HF_REPO = f"{HF_USER}/{MODEL_CHOICE}-financial-reasoner-{MODEL_VERSION}-tpu"
 
 # model.push_to_hub_merged(..., save_method="lora") in the GPU script
 # pushes the adapter only, not a merged model, despite the method name -
