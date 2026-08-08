@@ -482,6 +482,19 @@ NEUTRAL_SCENARIOS = [
 # and revenue misses higher than minor operational wins") is trying to
 # hard-code in the absence of any. `resolved_direction` and `confidence_note`
 # make the tie-break explicit and are what the reasoning should teach.
+#
+# Reasoning phrasing is deliberately varied across entries (different
+# sentence order, different vocabulary for "this signal wins"/"this signal
+# is minor") rather than reusing one rigid template like "X is the more
+# decision-relevant signal; Y is a minor operational item" everywhere -
+# confirmed live: a trained model pattern-matched that near-verbatim phrase
+# strongly enough to invoke it on CLEAN, single-direction BULLISH/BEARISH
+# headlines that merely had two clauses (not two conflicting ones), then
+# picked the wrong direction from a tie-break that didn't apply. Varying
+# the surface form is meant to make the underlying skill (weigh forward-
+# looking/concrete signals over backward-looking/routine ones) harder to
+# imitate as a rigid sentence shape divorced from whether a real conflict
+# exists.
 MIXED_SIGNAL_SCENARIOS = [
     (["{name} ({ticker}) beat Q{q} earnings estimates by {beat}%",
       "{name} ({ticker}) cut its full-year guidance, citing softening {product} demand heading into next quarter"],
@@ -489,7 +502,7 @@ MIXED_SIGNAL_SCENARIOS = [
      "BEARISH"),
     (["{name} ({ticker}) missed quarterly revenue estimates by {beat}%",
       "{name} ({ticker}) simultaneously announced a ${buyback}B share buyback program"],
-     "The revenue miss is the more decision-relevant signal; a buyback doesn't offset weakening underlying demand.",
+     "A buyback doesn't paper over the revenue miss - underlying demand looks weaker regardless of the capital-return announcement.",
      "BEARISH"),
     (["{name} ({ticker}) reported a strong Q{q}, with revenue of ${rev}B beating estimates by {beat}%",
       "Analysts flagged {product} inventory buildup as a risk to next quarter's results"],
@@ -500,7 +513,7 @@ MIXED_SIGNAL_SCENARIOS = [
      "A recall's safety and legal risk outweighs the prior quarter's already-priced-in sales record."),
     (["{name} ({ticker}) disclosed a regulatory fine related to {product} practices",
       "{name} ({ticker}) also raised its full-year guidance, citing broad-based demand strength"],
-     "The guidance raise is a stronger forward signal than a one-time fine, which is a minor operational item rather than a guidance or revenue signal - bullish, with reduced confidence given the fine.",
+     "A one-time fine is a sunk cost that doesn't change the forward outlook; the guidance raise, grounded in broad-based demand strength, is what should actually move the stock - bullish, tempered by the fine's reputational overhang.",
      "BULLISH"),
     (["{name} ({ticker}) reported solid Q{q} results in line with expectations",
       "Broader market headlines describe a sector-wide selloff unrelated to {ticker}'s own fundamentals"],
@@ -508,15 +521,15 @@ MIXED_SIGNAL_SCENARIOS = [
      "BULLISH"),
     (["{name} ({ticker}) beat Q{q} revenue estimates by {beat}%",
       "{name} ({ticker}) separately announced its CEO will step down at year-end as part of a planned transition"],
-     "A beat is the more decision-relevant signal; a planned, orderly CEO transition is a minor operational item, not a guidance or revenue signal - bullish, with confidence tempered by leadership transition uncertainty.",
+     "An orderly, pre-planned leadership transition tells you little you didn't already expect; the revenue beat is the harder data point here - bullish, tempered only by the normal uncertainty a CEO change introduces.",
      "BULLISH"),
     (["Analysts upgraded {ticker} ({name}) to 'Buy' citing long-term {product} potential",
       "{name} ({ticker}) issued weak near-term guidance, citing short-term {product} softness"],
-     "The near-term guidance is the more decision-relevant, dated signal; a long-term-oriented upgrade doesn't offset a concrete near-term guidance cut - bearish.",
+     "A long-term-oriented upgrade doesn't change what management itself just said about the next few quarters - a concrete near-term guidance cut from the company carries more weight than an analyst's multi-year thesis - bearish.",
      "BEARISH"),
     (["{name} ({ticker}) missed Q{q} earnings estimates by {beat}%",
       "{name} ({ticker}) simultaneously raised its quarterly dividend by {divhike}%"],
-     "The earnings miss is the more decision-relevant signal; a dividend increase is a minor operational item relative to a revenue/earnings miss - bearish.",
+     "Raising the dividend doesn't undo an actual earnings miss - a payout bump is the smaller signal next to results falling short - bearish.",
      "BEARISH"),
     (["{name} ({ticker})'s new {product} line sold out within days of launch",
       "{name} ({ticker}) separately recalled a small batch of an older, legacy product line unrelated to {product}"],
@@ -528,7 +541,7 @@ MIXED_SIGNAL_SCENARIOS = [
      "BEARISH"),
     (["{name} ({ticker}) reported Q{q} results in line with expectations",
       "{name} ({ticker}) raised full-year guidance, citing accelerating {product} momentum"],
-     "The guidance raise is the more decision-relevant, forward-looking signal; in-line current results don't offset positive forward guidance - bullish.",
+     "In-line current results don't cancel out a genuine guidance raise - forward-looking guidance is what should actually be priced in here - bullish.",
      "BULLISH"),
 ]
 # Backfill a uniform 4-tuple shape (some entries above omit the explicit
