@@ -143,6 +143,17 @@ got on synthetic val):
    asks for varied phrasing per row instead of a near-fixed sentence
    shape. Not yet re-validated with a full retrain/eval - that's the next
    G-gate.
+8. Spotted (not yet from an eval - a live-run observation) while item 6
+   was fresh: most-recent-first windows FIXED the "entirely stale
+   headlines" bug, but a high-volume ticker's single newest window can
+   itself return 50+ headlines and swallow the ENTIRE MAX_HEADLINES_PER_
+   TICKER quota on its own - meaning that ticker's real training data
+   would come from just one single week again, just the newest one
+   instead of the oldest. Added MAX_HEADLINES_PER_WINDOW (8) so no one
+   window can contribute more than a fraction of a ticker's quota - see
+   that constant's own comment for why 8. Also parallelized ticker
+   fetching across threads (process_ticker/MAX_CONCURRENT_TICKERS) for
+   wall-clock speed, unrelated to data quality.
 
 Earlier history: this script originally used yfinance's Ticker.news for
 headlines, which only returns the current "latest ~10" items with no
@@ -366,6 +377,18 @@ OUTPUT_VAL_FILE = "dataset_val_real.jsonl"
 LOOKBACK_WEEKS = 18
 SAFETY_BUFFER_DAYS = 14
 MAX_HEADLINES_PER_TICKER = 50
+
+# Caps how many KEPT examples any single week's window can contribute to a
+# ticker's MAX_HEADLINES_PER_TICKER quota (see process_ticker below and
+# history item 8 above) - without this, a high-volume ticker's single
+# newest window (weekly_windows() is most-recent-first - item 6 above) can
+# return 50+ headlines on its own and fill the ENTIRE quota from one week,
+# meaning the model never sees that ticker's headlines from any of the
+# other ~17 weeks at all. 8 means a ticker needs headlines spread across at
+# least ceil(50/8)=7 distinct weeks to hit its full quota - low-volume
+# tickers (which were never the problem) are unaffected, since they were
+# already spreading across many windows to reach 50.
+MAX_HEADLINES_PER_WINDOW = 8
 
 NEWS_REQUEST_DELAY_SECONDS = 1.0   # be polite to Google's unofficial endpoint
 PRICE_REQUEST_DELAY_SECONDS = 0.3  # be polite to yfinance between calls
@@ -1221,8 +1244,17 @@ def process_ticker(ticker, name):
         # just silently working through headlines one at a time.
         print(f"    [{ticker}] window {window_i}/{LOOKBACK_WEEKS} ({after_date}..{before_date}): {len(headlines)} headlines", flush=True)
 
+        # kept_this_window (reset every window) is what enforces MAX_
+        # HEADLINES_PER_WINDOW - a SEPARATE counter from the ticker-wide
+        # `kept`, which still enforces MAX_HEADLINES_PER_TICKER unchanged.
+        # Breaking (not skipping past) once either cap is hit avoids
+        # wasting a price-lookup + Gemini call on a headline that would be
+        # discarded anyway.
+        kept_this_window = 0
         for title, publisher, published_at in headlines:
             if kept >= MAX_HEADLINES_PER_TICKER:
+                break
+            if kept_this_window >= MAX_HEADLINES_PER_WINDOW:
                 break
             if title in seen_titles:
                 continue
@@ -1235,7 +1267,8 @@ def process_ticker(ticker, name):
             if example:
                 ticker_examples.append(example)
                 kept += 1
-                print(f"      [{ticker}] [{kept}/{MAX_HEADLINES_PER_TICKER}] kept: {title[:70]!r}", flush=True)
+                kept_this_window += 1
+                print(f"      [{ticker}] [{kept}/{MAX_HEADLINES_PER_TICKER}, {kept_this_window}/{MAX_HEADLINES_PER_WINDOW} this window] kept: {title[:70]!r}", flush=True)
             else:
                 ticker_skips[skip_reason] = ticker_skips.get(skip_reason, 0) + 1
                 print(f"      [{ticker}] skipped ({skip_reason}): {title[:70]!r}", flush=True)
