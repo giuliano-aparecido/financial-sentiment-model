@@ -116,6 +116,33 @@ got on synthetic val):
    drawn ENTIRELY from the oldest few weeks of the 18-week range, never
    reaching the most recent, most relevant headlines at all. See that
    function's own docstring for the full reasoning.
+7. Item 5's CONTRADICTS fix got its "next G-gate" validation, and it made
+   things WORSE: overall accuracy fell 69% -> 60% (synthetic 87%(ish) ->
+   77%, real 53% -> 43%), and nearly every misclassification in the dump -
+   on REAL rows AND, tellingly, on clean, unambiguous SYNTHETIC rows that
+   were never trained with any contradicts framing at all - showed the
+   same pattern: reasoning correctly identifies the headline's implied
+   direction, then the model flips to the opposite direction anyway,
+   citing near-identical boilerplate ("the headline's content clearly
+   contradicts/points the opposite way... likely reflects other market
+   dynamics not visible here") with confidence pinned in the 0.50-0.60
+   band. Root cause: with the +/-2% move threshold, CONTRADICTS=yes fires
+   often (headlines rarely predict small short-window moves) - and
+   GEMINI_REASONING_PROMPT's instruction for that case (previously) all
+   but dictated one canned sentence structure, so Gemini produced
+   near-identical text across hundreds of rows. That was enough repeated,
+   distinctively-phrased signal for the model to memorize "read correctly,
+   then flip + hedge + ~0.55 confidence" as a general strategy - one it
+   then applied indiscriminately, including to synthetic examples that
+   have nothing to do with this mechanism, since it's the same model
+   weights either way. Two-part fix: (a) downsample_contradicts_in_place
+   caps CONTRADICTS=yes rows at CONTRADICTS_MAX_FRACTION of the train file
+   (train-only, like rebalance_by_direction - val stays natural), so the
+   pattern is a minority case again instead of a memorizable default;
+   (b) GEMINI_REASONING_PROMPT's contradicts instruction now explicitly
+   asks for varied phrasing per row instead of a near-fixed sentence
+   shape. Not yet re-validated with a full retrain/eval - that's the next
+   G-gate.
 
 Earlier history: this script originally used yfinance's Ticker.news for
 headlines, which only returns the current "latest ~10" items with no
@@ -302,6 +329,12 @@ TICKERS = [
 # single company's idiosyncratic news cycle can dominate the sample the
 # way META/BA alone could.
 VAL_HOLDOUT_TICKERS = {"META", "BA", "JPM", "XOM", "KO", "NFLX"}
+
+# Cap on what fraction of the TRAIN file can be CONTRADICTS=yes rows (see
+# downsample_contradicts_in_place and history item 7 above) - 0.20 keeps
+# the "headline pointed the other way" pattern a clear minority case
+# instead of common enough to memorize as a default strategy.
+CONTRADICTS_MAX_FRACTION = 0.20
 
 FORWARD_WINDOW_TRADING_DAYS = 3   # how many trading days after the headline
                                    # to measure the price move over
@@ -868,7 +901,7 @@ Write THREE things, each as its own labeled line (see OUTPUT FORMAT):
 
 1. REASONING (2-3 sentences): Reads the headline and explains why it's plausibly consistent with a {direction} outlook - the way a financial analyst would talk through the available evidence, not the outcome. Weave in the market data, valuation, or earnings below ONLY where they genuinely reinforce or complicate the headline's own signal - don't force a mention if a block is irrelevant to this specific headline or says "Data unavailable."/"Not applicable", and never invent facts or numbers that aren't in what you were given.
    - If the headline's content does not obviously support {direction} (this happens often - many price moves in a short window are unrelated to the nearest headline), say so plainly - call it a weak or indirect signal rather than forcing a confident causal claim that isn't there.
-   - If the headline's content clearly points the OPPOSITE way from {direction} (e.g. a headline reporting good news paired with a BEARISH label, or bad news paired with BULLISH - this happens often, since the label reflects the actual subsequent move and headlines don't always predict it), do NOT invent a contrarian story to force a fit - phrases like "already priced in," "overbought/oversold," or "the market sees through this" sound analytical but aren't something you can actually know from a single headline, and a model trained on that kind of reasoning learns to talk itself out of headlines it read correctly. Instead say plainly that the headline's own content points the other way, and that the labeled outcome likely reflects other developments not visible here.
+   - If the headline's content clearly points the OPPOSITE way from {direction} (e.g. a headline reporting good news paired with a BEARISH label, or bad news paired with BULLISH - this happens often, since the label reflects the actual subsequent move and headlines don't always predict it), do NOT invent a contrarian story to force a fit - phrases like "already priced in," "overbought/oversold," or "the market sees through this" sound analytical but aren't something you can actually know from a single headline. Acknowledge honestly, in your own words, that this specific headline runs the other way and the labeled move likely came from something not shown here - but vary your phrasing and sentence structure from one headline to the next. This case recurs across many rows in this dataset; if you settle into one stock formulation for it, the model trained on your output will learn to recite that sentence instead of genuinely reasoning about each headline.
 2. ANSWER (1-2 sentences): A direct, plain answer to the user's question below, consistent with {direction} and, where relevant, the data above. If the question is empty, give a general one-line read on {ticker} instead.
 3. CONTRADICTS: yes if the headline's own content clearly points the OPPOSITE way from {direction} (the case described in REASONING's second bullet above) - no otherwise, including the "weak/indirect signal" case (first bullet), which is NOT a contradiction, just a lack of strong support. This drives the confidence score a downstream step assigns to this example (low if yes) - answer based on what the headline itself says, not on any hedging language you used in REASONING.
 
@@ -1064,6 +1097,13 @@ def make_real_example(ticker, ticker_obj, fundamentals_history, title, publisher
         "earnings": earnings,
         "news": build_news_block(headline_line),
         "output": json.dumps(output_payload, indent=2),
+        # Transient - not part of the canonical schema. Lets main()'s
+        # downsample_contradicts_in_place (train) / the val strip pass
+        # find and remove these rows/keys after the fact, without
+        # threading a third return value through generate_and_write's
+        # only caller. Always stripped before training - see history
+        # item 7 above.
+        "_contradicts": contradicts,
     }
     return example, None
 
@@ -1220,6 +1260,64 @@ def direction_of(example):
     return json.loads(example["output"])["impacted_stocks"][0]["direction"]
 
 
+def downsample_contradicts_in_place(filepath, max_fraction=CONTRADICTS_MAX_FRACTION):
+    """Undersamples rows tagged "_contradicts": true (Gemini judged the
+    headline's own content pointed the OPPOSITE way from the price-derived
+    label - see GEMINI_REASONING_PROMPT's CONTRADICTS line) down to at most
+    max_fraction of the file, then strips the transient "_contradicts" key
+    from every row so what's left matches the canonical 7-field schema.
+    See history item 7 above for why: this pattern was over-represented
+    enough in real training data (tight +/-2% move threshold -> frequent
+    headline/price mismatches -> frequent CONTRADICTS=yes) that the model
+    memorized "read the headline correctly, then flip anyway" as a general
+    strategy instead of a rare, narrowly-applicable judgment - and applied
+    it even to synthetic examples that never used this framing at all.
+    Undersampling (not duplicating the majority "not contradicted" rows up
+    to match) mirrors rebalance_by_direction's own reasoning: this project
+    has already hit a real overfitting problem from repeated content once,
+    and train-only, like that function - val stays untouched (natural/
+    unbalanced), so its accuracy stays an honest read of real-world
+    performance, contradicts cases included."""
+    with open(filepath) as f:
+        rows = [json.loads(line) for line in f]
+
+    contradicts_rows = [r for r in rows if r.get("_contradicts")]
+    other_rows = [r for r in rows if not r.get("_contradicts")]
+
+    ratio = max_fraction / (1 - max_fraction)  # solves contradicts/(contradicts+other) <= max_fraction
+    max_contradicts = int(len(other_rows) * ratio)
+    kept_contradicts = (random.sample(contradicts_rows, max_contradicts)
+                         if len(contradicts_rows) > max_contradicts else contradicts_rows)
+
+    result = other_rows + kept_contradicts
+    random.shuffle(result)
+    for r in result:
+        r.pop("_contradicts", None)
+
+    print(f"Downsampled CONTRADICTS=yes rows in {filepath}: "
+          f"{len(contradicts_rows)} -> {len(kept_contradicts)} "
+          f"(of {len(rows)} total, capped at {max_fraction:.0%})", flush=True)
+
+    with open(filepath, "w") as f:
+        for row in result:
+            f.write(json.dumps(row) + "\n")
+    return len(result)
+
+
+def strip_contradicts_field_in_place(filepath):
+    """Removes the transient "_contradicts" key (see make_real_example)
+    from every row without changing which rows are kept - used on the val
+    file, which stays at its natural/unbalanced distribution (see
+    downsample_contradicts_in_place's docstring for why train differs)."""
+    with open(filepath) as f:
+        rows = [json.loads(line) for line in f]
+    for r in rows:
+        r.pop("_contradicts", None)
+    with open(filepath, "w") as f:
+        for row in rows:
+            f.write(json.dumps(row) + "\n")
+
+
 def rebalance_by_direction(examples):
     """Undersamples down to the minority class's count, so BULLISH/BEARISH/
     NEUTRAL are equally represented. Undersampling (not duplicating the
@@ -1259,6 +1357,14 @@ def rebalance_file_in_place(filepath):
 
 def main():
     generate_and_write()
+
+    # Downsample CONTRADICTS=yes rows BEFORE rebalancing by direction (see
+    # history item 7 above) - runs first so rebalance_by_direction's
+    # minority-class count is computed on the post-downsample set, not
+    # skewed by whichever direction the discarded contradicts rows happened
+    # to lean toward. Train only, same reasoning as the rebalance below.
+    downsample_contradicts_in_place(OUTPUT_TRAIN_FILE)
+    strip_contradicts_field_in_place(OUTPUT_VAL_FILE)
 
     # Rebalance train only - an artificially-balanced val set would give a
     # less honest read of real-world performance than val's actual (skewed)
