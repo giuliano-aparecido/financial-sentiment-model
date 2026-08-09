@@ -143,6 +143,17 @@ got on synthetic val):
    asks for varied phrasing per row instead of a near-fixed sentence
    shape. Not yet re-validated with a full retrain/eval - that's the next
    G-gate.
+8. Spotted (not yet from an eval - a live-run observation) while item 6
+   was fresh: most-recent-first windows FIXED the "entirely stale
+   headlines" bug, but a high-volume ticker's single newest window can
+   itself return 50+ headlines and swallow the ENTIRE MAX_HEADLINES_PER_
+   TICKER quota on its own - meaning that ticker's real training data
+   would come from just one single week again, just the newest one
+   instead of the oldest. Added MAX_HEADLINES_PER_WINDOW (8) so no one
+   window can contribute more than a fraction of a ticker's quota - see
+   that constant's own comment for why 8. Also parallelized ticker
+   fetching across threads (process_ticker/MAX_CONCURRENT_TICKERS) for
+   wall-clock speed, unrelated to data quality.
 
 Earlier history: this script originally used yfinance's Ticker.news for
 headlines, which only returns the current "latest ~10" items with no
@@ -218,8 +229,10 @@ import json
 import os
 import random
 import re
+import threading
 import time
 import urllib.parse
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 try:
     import feedparser
@@ -364,6 +377,18 @@ OUTPUT_VAL_FILE = "dataset_val_real.jsonl"
 LOOKBACK_WEEKS = 18
 SAFETY_BUFFER_DAYS = 14
 MAX_HEADLINES_PER_TICKER = 50
+
+# Caps how many KEPT examples any single week's window can contribute to a
+# ticker's MAX_HEADLINES_PER_TICKER quota (see process_ticker below and
+# history item 8 above) - without this, a high-volume ticker's single
+# newest window (weekly_windows() is most-recent-first - item 6 above) can
+# return 50+ headlines on its own and fill the ENTIRE quota from one week,
+# meaning the model never sees that ticker's headlines from any of the
+# other ~17 weeks at all. 8 means a ticker needs headlines spread across at
+# least ceil(50/8)=7 distinct weeks to hit its full quota - low-volume
+# tickers (which were never the problem) are unaffected, since they were
+# already spreading across many windows to reach 50.
+MAX_HEADLINES_PER_WINDOW = 8
 
 NEWS_REQUEST_DELAY_SECONDS = 1.0   # be polite to Google's unofficial endpoint
 PRICE_REQUEST_DELAY_SECONDS = 0.3  # be polite to yfinance between calls
@@ -1144,15 +1169,132 @@ def already_completed_tickers():
     return done
 
 
+# Bounds how many tickers run concurrently (see process_ticker/
+# generate_and_write below). Each ticker's own internal loop is unchanged -
+# still one window/headline at a time, still paced by NEWS_REQUEST_DELAY_
+# SECONDS/PRICE_REQUEST_DELAY_SECONDS - concurrency comes ONLY from running
+# several tickers' loops at once. Measured live: ~3s/headline end to end
+# with GEMINI_REQUEST_DELAY_SECONDS=0.1 (paid tier), of which the explicit
+# sleep()s account for well under 1s - the rest is genuine RSS/yfinance/
+# Gemini network latency, i.e. this workload is I/O-bound, not CPU-bound,
+# so threads (not more pip installs) are the right tool. Kept modest (not
+# e.g. 20+) specifically because yfinance and Google News RSS are
+# unofficial, undocumented endpoints already flagged elsewhere in this file
+# as rate-limit-fragile - N tickers concurrently means N tickers' worth of
+# "polite" traffic lands in the same wall-clock window instead of strictly
+# one at a time, even though each ticker's own pacing is untouched. If a
+# run starts throwing RSS/yfinance errors it didn't before, lower this
+# toward 1 (which reproduces the old fully-sequential behavior exactly)
+# before assuming something else broke.
+MAX_CONCURRENT_TICKERS = 5
+
+_write_lock = threading.Lock()
+_stats_lock = threading.Lock()
+
+
+def process_ticker(ticker, name):
+    """One ticker's full fetch/label/write loop - identical logic to what
+    used to be inlined directly in generate_and_write's for-loop, extracted
+    only so it can run in its own worker thread (see MAX_CONCURRENT_TICKERS
+    above). All the state below (ticker_examples, seen_titles, kept,
+    ticker_skips, the yf.Ticker instance) is local to this call - nothing
+    here is shared across threads. The two things that ARE shared - the
+    output files and the aggregate counters/skip totals - are written under
+    _write_lock/_stats_lock by this function and its caller respectively.
+    _gemini_daily_quota_exhausted (see generate_grounded_reasoning) is also
+    shared but deliberately left unlocked - it's a monotonic, write-once
+    bool; the worst case of an unsynchronized race on it is a handful of
+    extra wasted Gemini calls right at the quota boundary, not a
+    correctness bug, so a lock there would cost more than it protects.
+    Returns (example_count, is_val, ticker_skips) for the caller to fold
+    into shared totals; exceptions propagate to the caller via the Future
+    (same one-ticker-can't-take-down-the-others isolation the old inline
+    try/except gave, since ThreadPoolExecutor already runs each submitted
+    call independently)."""
+    print(f"Fetching {ticker} ({name})...", flush=True)
+    ticker_examples = []
+    ticker_obj = yf.Ticker(ticker)
+    # Fetched ONCE per ticker and reused across all of its headlines below -
+    # avoids N x the quarterly-statement/earnings-dates calls per ticker
+    # (see fetch_ticker_fundamentals_history's docstring for why this is
+    # safe: each headline still gets its own as-of-date filtering
+    # downstream).
+    fundamentals_history = fetch_ticker_fundamentals_history(ticker_obj)
+    is_val = ticker in VAL_HOLDOUT_TICKERS
+
+    seen_titles = set()
+    kept = 0
+    ticker_skips = {}
+
+    for window_i, (after_date, before_date) in enumerate(weekly_windows(), 1):
+        if kept >= MAX_HEADLINES_PER_TICKER:
+            break
+
+        headlines = fetch_headlines_for_window(ticker, name, after_date, before_date)
+        time.sleep(NEWS_REQUEST_DELAY_SECONDS)
+
+        # Per-window/per-headline output, ticker-prefixed since several
+        # tickers now print interleaved from different threads - without
+        # this, a ticker can go silent for minutes at a time (each headline
+        # now costs a real Gemini call: GEMINI_REQUEST_DELAY_SECONDS at
+        # minimum, up to tens of seconds more on a rate-limit retry) with
+        # nothing printed to distinguish "still working" from "hung".
+        # Confirmed live: an interrupted run that looked stuck for over a
+        # minute turned out to be mid-loop, already well past the fetch,
+        # just silently working through headlines one at a time.
+        print(f"    [{ticker}] window {window_i}/{LOOKBACK_WEEKS} ({after_date}..{before_date}): {len(headlines)} headlines", flush=True)
+
+        # kept_this_window (reset every window) is what enforces MAX_
+        # HEADLINES_PER_WINDOW - a SEPARATE counter from the ticker-wide
+        # `kept`, which still enforces MAX_HEADLINES_PER_TICKER unchanged.
+        # Breaking (not skipping past) once either cap is hit avoids
+        # wasting a price-lookup + Gemini call on a headline that would be
+        # discarded anyway.
+        kept_this_window = 0
+        for title, publisher, published_at in headlines:
+            if kept >= MAX_HEADLINES_PER_TICKER:
+                break
+            if kept_this_window >= MAX_HEADLINES_PER_WINDOW:
+                break
+            if title in seen_titles:
+                continue
+            seen_titles.add(title)
+
+            example, skip_reason = make_real_example(
+                ticker, ticker_obj, fundamentals_history, title, publisher, published_at)
+            time.sleep(PRICE_REQUEST_DELAY_SECONDS)
+
+            if example:
+                ticker_examples.append(example)
+                kept += 1
+                kept_this_window += 1
+                print(f"      [{ticker}] [{kept}/{MAX_HEADLINES_PER_TICKER}, {kept_this_window}/{MAX_HEADLINES_PER_WINDOW} this window] kept: {title[:70]!r}", flush=True)
+            else:
+                ticker_skips[skip_reason] = ticker_skips.get(skip_reason, 0) + 1
+                print(f"      [{ticker}] skipped ({skip_reason}): {title[:70]!r}", flush=True)
+
+    skip_summary = ", ".join(f"{reason}={count}" for reason, count in ticker_skips.items())
+    print(f"  [{ticker}] {kept} labeled examples, {len(seen_titles)} unique headlines seen" + (f" (skipped: {skip_summary})" if skip_summary else ""), flush=True)
+
+    target_file = OUTPUT_VAL_FILE if is_val else OUTPUT_TRAIN_FILE
+    with _write_lock:
+        append_examples(target_file, ticker_examples)
+
+    return len(ticker_examples), is_val, ticker_skips
+
+
 def generate_and_write():
     """Writes each ticker's results to disk as soon as that ticker finishes,
     instead of accumulating everything in memory and writing once at the
     end. This is meant to survive an unattended Colab run: if something
     interrupts the process partway through (a Colab disconnect, an
     unexpected error on one ticker), whatever tickers already completed
-    are safely on disk rather than lost entirely. Each ticker also runs
-    inside its own try/except so one unexpected failure can't take down
-    the other 39.
+    are safely on disk rather than lost entirely. Runs up to
+    MAX_CONCURRENT_TICKERS tickers at once via ThreadPoolExecutor (see that
+    constant and process_ticker above for why threads and why that many) -
+    each ticker still runs inside its own isolation (a Future's exception
+    only affects that one ticker when .result() is called below) so one
+    unexpected failure can't take down the others.
 
     Resumable: if the output files already have rows in them (a prior run
     was interrupted and this cell is being re-run), those tickers are
@@ -1176,78 +1318,27 @@ def generate_and_write():
     total_train = _count_jsonl_lines(OUTPUT_TRAIN_FILE)
     total_val = _count_jsonl_lines(OUTPUT_VAL_FILE)
 
-    for ticker, name in TICKERS:
-        if ticker in resume_skip:
-            continue
-        print(f"Fetching {ticker} ({name})...", flush=True)
-        try:
-            ticker_examples = []
-            ticker_obj = yf.Ticker(ticker)
-            # Fetched ONCE per ticker and reused across all of its
-            # headlines below - avoids N x the quarterly-statement/
-            # earnings-dates calls per ticker (see fetch_ticker_
-            # fundamentals_history's docstring for why this is safe: each
-            # headline still gets its own as-of-date filtering downstream).
-            fundamentals_history = fetch_ticker_fundamentals_history(ticker_obj)
-            is_val = ticker in VAL_HOLDOUT_TICKERS
+    pending = [(ticker, name) for ticker, name in TICKERS if ticker not in resume_skip]
 
-            seen_titles = set()
-            kept = 0
-            ticker_skips = {}
+    with ThreadPoolExecutor(max_workers=MAX_CONCURRENT_TICKERS) as executor:
+        futures = {executor.submit(process_ticker, ticker, name): ticker for ticker, name in pending}
+        for future in as_completed(futures):
+            ticker = futures[future]
+            try:
+                count, is_val, ticker_skips = future.result()
+            except Exception as e:
+                # Whatever prior tickers already wrote stays on disk; this
+                # ticker is skipped entirely and the run moves on.
+                print(f"  Warning: {ticker} failed unexpectedly, skipping it: {e!r}", flush=True)
+                continue
 
-            for window_i, (after_date, before_date) in enumerate(weekly_windows(), 1):
-                if kept >= MAX_HEADLINES_PER_TICKER:
-                    break
-
-                headlines = fetch_headlines_for_window(ticker, name, after_date, before_date)
-                time.sleep(NEWS_REQUEST_DELAY_SECONDS)
-
-                # Per-window/per-headline output - without this, a ticker
-                # can go silent for minutes at a time (each headline now
-                # costs a real Gemini call: GEMINI_REQUEST_DELAY_SECONDS at
-                # minimum, up to tens of seconds more on a rate-limit
-                # retry) with nothing printed to distinguish "still
-                # working" from "hung". Confirmed live: an interrupted run
-                # that looked stuck for over a minute turned out to be mid-
-                # loop, already well past the fetch, just silently working
-                # through headlines one at a time.
-                print(f"    window {window_i}/{LOOKBACK_WEEKS} ({after_date}..{before_date}): {len(headlines)} headlines", flush=True)
-
-                for title, publisher, published_at in headlines:
-                    if kept >= MAX_HEADLINES_PER_TICKER:
-                        break
-                    if title in seen_titles:
-                        continue
-                    seen_titles.add(title)
-
-                    example, skip_reason = make_real_example(
-                        ticker, ticker_obj, fundamentals_history, title, publisher, published_at)
-                    time.sleep(PRICE_REQUEST_DELAY_SECONDS)
-
-                    if example:
-                        ticker_examples.append(example)
-                        kept += 1
-                        print(f"      [{kept}/{MAX_HEADLINES_PER_TICKER}] kept: {title[:70]!r}", flush=True)
-                    else:
-                        ticker_skips[skip_reason] = ticker_skips.get(skip_reason, 0) + 1
-                        skip_reason_totals[skip_reason] = skip_reason_totals.get(skip_reason, 0) + 1
-                        print(f"      skipped ({skip_reason}): {title[:70]!r}", flush=True)
-
-            skip_summary = ", ".join(f"{reason}={count}" for reason, count in ticker_skips.items())
-            print(f"  {kept} labeled examples, {len(seen_titles)} unique headlines seen" + (f" (skipped: {skip_summary})" if skip_summary else ""), flush=True)
-
-            target_file = OUTPUT_VAL_FILE if is_val else OUTPUT_TRAIN_FILE
-            append_examples(target_file, ticker_examples)
-            if is_val:
-                total_val += len(ticker_examples)
-            else:
-                total_train += len(ticker_examples)
-
-        except Exception as e:
-            # Whatever prior tickers already wrote stays on disk; this
-            # ticker is skipped entirely and the run moves on.
-            print(f"  Warning: {ticker} failed unexpectedly, skipping it: {e!r}", flush=True)
-            continue
+            with _stats_lock:
+                if is_val:
+                    total_val += count
+                else:
+                    total_train += count
+                for reason, reason_count in ticker_skips.items():
+                    skip_reason_totals[reason] = skip_reason_totals.get(reason, 0) + reason_count
 
     if skip_reason_totals:
         print()
