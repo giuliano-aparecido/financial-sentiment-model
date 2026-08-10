@@ -26,13 +26,45 @@ if not IS_COLAB:
 else:
     from IPython.display import display, Javascript
 
-    # JavaScript function to auto-click the connect button every 60 seconds
+    # JavaScript function to auto-click the connect button every 60 seconds.
+    #
+    # Confirmed (multiple independent reports, not verified against a live
+    # session here - see the calling context for how this was diagnosed):
+    # <colab-connect-button> is a custom element with a SHADOW DOM. The old
+    # version below just did document.querySelector("colab-connect-button")
+    # and called .click() on THAT element - it exists (btn != null passes,
+    # no error, the console message even prints), but the real interactive
+    # button lives inside btn.shadowRoot, so the click never reached
+    # anything real. That's a plausible root cause for "keep_running.py
+    # runs with no errors, but the session still dies around the 90-minute
+    # idle mark" - the click was always a no-op.
+    #
+    # Reaches into the shadow root first; falls back to the old top-level
+    # click if that structure isn't there (a future Colab UI change, or
+    # this diagnosis being wrong for some other reason) - so this degrades
+    # to the previous (silently ineffective) behavior rather than throwing.
+    # Watch the browser console: "(shadow DOM)" confirms the fix path is
+    # actually firing; "(fallback)" or the "not found" warning means
+    # Colab's DOM has changed again and the selector needs updating by
+    # hand (right-click the connect button -> Inspect -> find the current
+    # structure) - there's no way to verify this without a live session.
     js_code = '''
     function ClickConnect(){
-      let btn = document.querySelector("colab-connect-button");
-      if (btn != null){
-        console.log("✅ Clicked connect button to keep session alive");
-        btn.click();
+      try {
+        let outer = document.querySelector("#top-toolbar > colab-connect-button")
+                 || document.querySelector("colab-connect-button");
+        let shadowBtn = outer && outer.shadowRoot && outer.shadowRoot.querySelector("#connect");
+        if (shadowBtn) {
+          shadowBtn.click();
+          console.log("✅ Clicked connect button (shadow DOM) to keep session alive");
+        } else if (outer) {
+          outer.click();
+          console.log("✅ Clicked connect button (fallback, no shadow DOM found) to keep session alive");
+        } else {
+          console.log("⚠️ Connect button not found - Colab's UI may have changed again, inspect the page to find the current selector");
+        }
+      } catch (e) {
+        console.log("⚠️ ClickConnect error: " + e);
       }
     }
     // Click every 60 seconds (60000 milliseconds)
