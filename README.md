@@ -33,9 +33,10 @@ rather than just classifying sentiment:
 ```
 
 `financial-sentiment-api`'s `app/services/inference.py` calls the resulting
-model via a Hugging Face Inference endpoint and parses this exact shape —
-if you change the output schema or the prompt structure here, that repo
-needs a matching change (see CONTRIBUTING.md's 4-way sync rule).
+model over HTTP (a Colab/ngrok tunnel by default - see "Serving the model"
+below for a Modal alternative) and parses this exact shape — if you change
+the output schema or the prompt structure here, that repo needs a matching
+change (see CONTRIBUTING.md's 4-way sync rule).
 
 ## Pipeline (run each of these as its own Colab cell, in order)
 
@@ -137,6 +138,28 @@ Practical consequences:
   GPU path is the proven one. If you hit an issue running `tpu/`'s
   scripts, that's expected first-run friction, not necessarily something
   you did wrong.
+
+## Serving the model
+
+Two ways to expose the trained model to `financial-sentiment-api` over
+HTTP - pick one, both speak the exact same `{"inputs": ..., "parameters":
+{...}}` request / `[{"generated_text": ...}]` response shape, so switching
+between them is just repointing `HF_INFERENCE_URL` (its runtime-mutable
+`/api/update-inference-url` endpoint exists for exactly this):
+
+- **`run/run_model.py`** (default) - paste into a Colab cell, loads the
+  model on Colab's free GPU, exposes it through an ngrok tunnel. Free, but
+  the tunnel dies with the Colab session (90-minute idle timeout, 12-hour
+  hard cap - see `run/keep_running.py`), and needs a browser tab open.
+- **`modal/serve_model.py`** - deploys to [Modal](https://modal.com) as a
+  scale-to-zero serverless GPU function: no browser tab, no session limit,
+  but you pay per-second of actual GPU use. For occasional personal-project
+  traffic (a handful of requests a day) this lands well under Modal's
+  $30/month free credit - see the file's own docstring for the exact
+  autoscaling config (`min_containers` deliberately unset, `max_containers
+  =1`, `scaledown_window=120`) and the one-time `modal setup` / `modal
+  secret create` steps needed before `modal deploy modal/serve_model.py`
+  will work.
 
 ## Required Colab Secrets (environment variables)
 
