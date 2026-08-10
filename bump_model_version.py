@@ -27,7 +27,7 @@ version and risk a stale or mistyped one silently no-op-ing.
 
 Replaces TWO distinct string shapes, both needed to keep every reference
 in sync:
-1. `MODEL_VERSION_DEFAULT = "v7"` - the actual runtime default each
+1. `MODEL_VERSION_DEFAULT = "v8"` - the actual runtime default each
    script falls back to when no "MODEL_VERSION" Colab/Kaggle Secret
    override is set (see README's "Required Colab Secrets" - this default
    is what every session actually uses unless someone deliberately
@@ -86,7 +86,7 @@ def bump(old_version: str, new_version: str) -> list[tuple[Path, int]]:
         # includes the "v" - confirmed live: reusing the same
         # \g<1>v{new_version} template as the line above (whose group 1
         # does NOT include the "v") produced "financial-reasoner-vv8"
-        # instead of "financial-reasoner-v7" the first time this ran.
+        # instead of "financial-reasoner-v8" the first time this ran.
         text, count_literal = old_literal_re.subn(rf"\g<1>{new_version}\g<2>", text)
         total = count_default + count_literal
         if total:
