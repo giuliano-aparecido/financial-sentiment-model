@@ -36,10 +36,17 @@ Cost shape - the whole point of this file over an always-on host:
   - max_containers=1: hard cap so no burst of concurrent requests (or
     abuse against a leaked URL) can multiply cost - this is a single-user
     research tool, there's no legitimate case for concurrency here.
-  - scaledown_window=120: a container survives 2 minutes after its last
+  - scaledown_window=60: a container survives 1 minute after its last
     request before scaling back to zero, so a quick follow-up query
     reuses the warm container instead of paying another cold start - but
-    still bounded, since idle time in that window is billed.
+    still bounded, since idle time in that window is billed at the same
+    GPU rate as active compute (confirmed against Modal's own autoscaling
+    docs - the pricing page's "never pay for idle" language means fully
+    scaled-to-zero, not "warm but unused"). At this project's real usage
+    (a handful of one-off queries a day, rarely two within the same
+    couple minutes), the window mostly goes unused anyway - 60s instead
+    of the original 120s just halves what gets spent on follow-ups that
+    don't happen, without giving up the benefit for the ones that do.
   - timeout=300 on the GPU class: caps worst-case cost from a single
     request that somehow hangs, while still leaving room for a real cold
     start. Confirmed live this needs to be generous, not tight - a cold
@@ -94,7 +101,7 @@ secrets = [modal.Secret.from_name("financial-sentiment-model-secrets")]
     gpu="T4",
     volumes={MODEL_CACHE_DIR: model_cache},
     secrets=secrets,
-    scaledown_window=120,
+    scaledown_window=60,
     max_containers=1,
     timeout=300,
 )
