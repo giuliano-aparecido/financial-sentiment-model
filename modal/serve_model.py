@@ -40,8 +40,18 @@ Cost shape - the whole point of this file over an always-on host:
     request before scaling back to zero, so a quick follow-up query
     reuses the warm container instead of paying another cold start - but
     still bounded, since idle time in that window is billed.
-  - timeout=120 on the GPU class: caps worst-case cost from a single
-    request that somehow hangs.
+  - timeout=300 on the GPU class: caps worst-case cost from a single
+    request that somehow hangs, while still leaving room for a real cold
+    start. Confirmed live this needs to be generous, not tight - a cold
+    request (container boot + unsloth/torch import + weight load) alone
+    measured ~120s for a trivial 20-token generation, so the original
+    timeout=120 here was cutting off a real 512-token request (financial-
+    sentiment-api's actual max_new_tokens) before it could ever finish,
+    silently, since Modal kills the call rather than raising an app-level
+    error. See inference.py's httpx timeout and financial-sentiment-web's
+    proxy maxDuration/AbortSignal - both had to be raised to match, since
+    a shorter timeout anywhere upstream just moves where the same request
+    dies.
 """
 
 import os
@@ -86,7 +96,7 @@ secrets = [modal.Secret.from_name("financial-sentiment-model-secrets")]
     secrets=secrets,
     scaledown_window=120,
     max_containers=1,
-    timeout=120,
+    timeout=300,
 )
 class Model:
     @modal.enter()
