@@ -12,8 +12,8 @@ practice of doing it properly, not because it needs to scale.
 ## What this produces
 
 A LoRA-fine-tuned instruction model (Llama 3.2 3B by default; a few other
-open models are supported via `MODEL_REGISTRY` in `gpu/train_model.py` /
-`tpu/train_model.py`) that reads a stock ticker, an optional user
+open models are supported via `MODEL_REGISTRY` in `colab/train/gpu/train_model.py` /
+`colab/train/tpu/train_model.py`) that reads a stock ticker, an optional user
 question, current market data/valuation/earnings, and a block of recent
 news headlines, and outputs structured JSON that answers the user directly
 rather than just classifying sentiment:
@@ -42,7 +42,7 @@ change (see CONTRIBUTING.md's 4-way sync rule).
 
 Steps 1-3 are hardware-agnostic and identical either way. Steps 4-5 branch
 depending on which free Colab accelerator you're using — pick **one** of
-`gpu/` or `tpu/`, not both, for a given training run.
+`colab/train/gpu/` or `colab/train/tpu/`, not both, for a given training run.
 
 1. **`!pip install -q yfinance httpx feedparser google-genai pandas`** —
    dependencies for the real-data generator (step 3; `pandas` is also a
@@ -69,11 +69,11 @@ depending on which free Colab accelerator you're using — pick **one** of
    several minutes given the number of tickers and historical windows it
    scans, plus one Gemini call per kept headline; this is expected, not a
    hang. Requires a `GEMINI_API_KEY` secret — see below.
-4. **`gpu/train_model.py`** (T4) or **`tpu/train_model.py`** (v5e-1) —
+4. **`colab/train/gpu/train_model.py`** (T4) or **`colab/train/tpu/train_model.py`** (v5e-1) —
    loads the base model, adds a LoRA adapter, mixes both datasets from
    steps 2-3, fine-tunes with early stopping, and pushes the result to
    your Hugging Face account.
-5. **`gpu/evaluate_model.py`** or **`tpu/evaluate_model.py`** (match
+5. **`colab/train/gpu/evaluate_model.py`** or **`colab/train/tpu/evaluate_model.py`** (match
    whichever you used for step 4) — self-contained: reuses
    `model`/`tokenizer`/`alpaca_prompt` if run immediately after step 4 in
    the same session, or reloads the already-pushed model straight from
@@ -87,30 +87,30 @@ depending on which free Colab accelerator you're using — pick **one** of
    base-model (untrained) comparison so you know how much the fine-tune
    actually helped.
 
-`evaluate_base_model_only.py` (in the matching `gpu/` or `tpu/` directory)
+`evaluate_base_model_only.py` (in the matching `colab/train/gpu/` or `colab/train/tpu/` directory)
 is a standalone fallback for when you need *just* the base-model
 comparison on its own (e.g. you already have `evaluate_model.py`'s
 fine-tuned numbers from an earlier run and don't want to redo that pass) —
 same self-contained reload-or-reuse behavior as `evaluate_model.py` above,
 just skipping the tuned pass entirely.
 
-### GPU (`gpu/`) vs TPU (`tpu/`)
+### GPU (`colab/train/gpu/`) vs TPU (`colab/train/tpu/`)
 
 The two paths are **not** just a device-name swap. `unsloth` (fast LoRA
 loading/training) and `bitsandbytes` (4-bit quantization) are both
 CUDA-only — Colab's free TPU v5e-1 tier has no support for either, so
-`tpu/`'s scripts are a separate implementation on plain `transformers` +
+`colab/train/tpu/`'s scripts are a separate implementation on plain `transformers` +
 `peft` + `trl`, training in bf16 with no quantization instead.
 
 Practical consequences:
 
-- `tpu/`'s `MODEL_REGISTRY` only has working entries for `llama-3.2-3b`
+- `colab/train/tpu/`'s `MODEL_REGISTRY` only has working entries for `llama-3.2-3b`
   and `apertus-0.5b` — the default `llama-3.2-3b` repo is swapped to a
   non-quantized bf16 mirror. `apertus-8b`, `qwen-2.5-7b`, and `mistral-7b`
   are listed but blocked with a clear error if selected: bf16 with no
   quantization makes 7B/8B a tight-to-unsafe fit on a single v5e-1's 16GB
   HBM, and qwen/mistral have no confirmed non-quantized mirror.
-- `tpu/train_model.py` installs no `unsloth`/`bitsandbytes` — just
+- `colab/train/tpu/train_model.py` installs no `unsloth`/`bitsandbytes` — just
   `transformers peft trl accelerate datasets` (plus whatever `torch_xla`
   build Colab's TPU runtime already ships).
 - Both paths push an **adapter-only** model to the same naming scheme
@@ -135,7 +135,7 @@ Practical consequences:
   session-local override with no git trace, the script changes the
   committed default everyone gets when they haven't set that Secret.
 - The TPU path hasn't been run end-to-end on real TPU hardware yet — the
-  GPU path is the proven one. If you hit an issue running `tpu/`'s
+  GPU path is the proven one. If you hit an issue running `colab/train/tpu/`'s
   scripts, that's expected first-run friction, not necessarily something
   you did wrong.
 
@@ -147,10 +147,10 @@ HTTP - pick one, both speak the exact same `{"inputs": ..., "parameters":
 between them is just repointing `HF_INFERENCE_URL` (its runtime-mutable
 `/api/update-inference-url` endpoint exists for exactly this):
 
-- **`run/run_model.py`** (default) - paste into a Colab cell, loads the
+- **`colab/run/run_model.py`** (default) - paste into a Colab cell, loads the
   model on Colab's free GPU, exposes it through an ngrok tunnel. Free, but
   the tunnel dies with the Colab session (90-minute idle timeout, 12-hour
-  hard cap - see `run/keep_running.py`), and needs a browser tab open.
+  hard cap - see `colab/run/keep_running.py`), and needs a browser tab open.
 - **`modal/serve_model.py`** - deploys to [Modal](https://modal.com) as a
   scale-to-zero serverless GPU function: no browser tab, no session limit,
   but you pay per-second of actual GPU use. For occasional personal-project
@@ -190,8 +190,8 @@ the whole point of pulling them from Colab/Kaggle Secrets instead.
   (derived from actual subsequent price movement, not a human judgment) —
   noisier, but real language the synthetic templates can't fully capture.
   Both write the identical `{ticker, user_query, market_data, valuation,
-  earnings, news, output}` schema so either `train_model.py` (`gpu/` or
-  `tpu/`) can concatenate them with no reconciliation step.
+  earnings, news, output}` schema so either `train_model.py` (`colab/train/gpu/` or
+  `colab/train/tpu/`) can concatenate them with no reconciliation step.
 - **Real data is undersampled to balance classes, never duplicated**, to
   avoid teaching the model to memorize repeated rows. The cost is fewer
   total real-data rows; see `generate_real_dataset.py`'s docstring for the
@@ -207,8 +207,8 @@ the whole point of pulling them from Colab/Kaggle Secrets instead.
   Evaluate on direction accuracy (`evaluate_model.py`), not loss.
 - **Completion-only loss masking has a real tokenizer gotcha.** The
   instruction/response markers (passed to unsloth's
-  `train_on_responses_only` in `gpu/train_model.py`, or to trl's
-  `DataCollatorForCompletionOnlyLM` in `tpu/train_model.py`) must match
+  `train_on_responses_only` in `colab/train/gpu/train_model.py`, or to trl's
+  `DataCollatorForCompletionOnlyLM` in `colab/train/tpu/train_model.py`) must match
   the *exact* tokenization of the prompt template, including incidental
   whitespace — a mismatched marker silently masks 100% of the training
   signal rather than erroring loudly. See the comment above that call in
@@ -240,14 +240,14 @@ the whole point of pulling them from Colab/Kaggle Secrets instead.
   exactly `Data unavailable.` in both training data and production, so the
   model is trained on, not just hoped to handle, partial data gaps. See the
   canonical prompt template comment above `alpaca_prompt` in
-  `gpu/train_model.py` and CONTRIBUTING.md's 4-way sync rule before
+  `colab/train/gpu/train_model.py` and CONTRIBUTING.md's 4-way sync rule before
   changing any of this.
 
 ## docs/
 
 - `llm-training-primer.md` — a from-zero explanation of what every part of
-  `gpu/train_model.py` does, for anyone reading this without an ML
-  background. Written against the GPU/unsloth path; `tpu/train_model.py`
+  `colab/train/gpu/train_model.py` does, for anyone reading this without an ML
+  background. Written against the GPU/unsloth path; `colab/train/tpu/train_model.py`
   swaps the same conceptual steps onto a different toolchain (see the
   "GPU vs TPU" section above).
 - `training-results-analysis.md` — why the first training run's loss

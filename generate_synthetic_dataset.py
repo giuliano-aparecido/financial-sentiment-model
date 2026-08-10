@@ -95,8 +95,9 @@ Output schema (v4) - {"ticker", "user_query", "market_data", "valuation",
 "earnings", "news", "output"} where output is
 {"impacted_stocks": [{"ticker", "reasoning", "direction", "confidence",
 "answer"}]}. Matches the canonical prompt template shared with
-generate_real_dataset.py, gpu/train_model.py, tpu/train_model.py, and
-financial-sentiment-api's app/services/inference.py - keep all in sync
+generate_real_dataset.py, colab/train/gpu/train_model.py,
+colab/train/tpu/train_model.py, and financial-sentiment-api's
+app/services/inference.py - keep all in sync
 (see CONTRIBUTING.md's 4-way sync rule).
 
 Output: two JSONL files (one JSON object per line), train and val.

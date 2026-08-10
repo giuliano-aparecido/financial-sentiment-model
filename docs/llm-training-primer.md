@@ -365,7 +365,7 @@ HF_REPO = f"{HF_USER}/{MODEL_CHOICE}-financial-reasoner-{MODEL_VERSION}"
 model.push_to_hub_merged(HF_REPO, tokenizer, save_method = "lora", token = HF_TOKEN)
 ```
 
-(The real script's version in `gpu/train_model.py` wraps that `MODEL_VERSION` line
+(The real script's version in `colab/train/gpu/train_model.py` wraps that `MODEL_VERSION` line
 in a try/except, since `userdata.get(...)` raises if the "MODEL_VERSION" Secret was
 never created at all - simplified here for readability.)
 
