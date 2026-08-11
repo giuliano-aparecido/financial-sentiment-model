@@ -154,6 +154,27 @@ got on synthetic val):
    that constant's own comment for why 8. Also parallelized ticker
    fetching across threads (process_ticker/MAX_CONCURRENT_TICKERS) for
    wall-clock speed, unrelated to data quality.
+9. Replaced the Graham Number valuation formula with the same scenario-DCF
+   model financial-sentiment-api's valuation.py serves and
+   generate_synthetic_dataset.py now also uses (ported, not imported - see
+   that block's own comment) - production's Valuation block had drifted to
+   a different label/methodology than this generator's output entirely
+   (see generate_synthetic_dataset.py's history item 11 for the full
+   diagnosis, which applies here identically). Dropped the now-unused
+   quarterly_balance_sheet fetch and book-value-per-share calculation
+   (only the old Graham Number needed equity/book value; the DCF model
+   doesn't). Also added `valuation_alignment()` - a Python-computed (not
+   Gemini-judged) yes/no/no_data fact for whether the Valuation block's own
+   reading agrees with the price-derived label - fed into
+   GEMINI_REASONING_PROMPT so Gemini is explicitly told when to lean on
+   valuation as corroborating evidence instead of the previous "weave it in
+   where relevant" instruction, soft enough that it was plausibly being
+   skipped by default. `direction`/`confidence` remain purely price-move-
+   derived, unchanged - this only affects whether the REASONING prose
+   actually discusses valuation. NOT yet run/validated live (no Gemini key
+   or network access in the environment this was written in) - see
+   CONTRIBUTING.md's guidance on saying so explicitly rather than claiming
+   it was tested.
 
 Earlier history: this script originally used yfinance's Ticker.news for
 headlines, which only returns the current "latest ~10" items with no
@@ -644,8 +665,8 @@ def confidence_from_move(direction, pct_change, contradicts=False):
 
 
 def fetch_ticker_fundamentals_history(ticker_obj):
-    """Fetches quarterly income statement, quarterly balance sheet, and the
-    earnings-date history ONCE per ticker (not once per headline) - each is
+    """Fetches quarterly income statement and earnings-date history ONCE
+    per ticker (not once per headline) - each is
     reused across all of that ticker's headlines, filtered down to
     'as-of the headline date' inside as_of_quarterly()/build_fundamentals_
     blocks() below. This is the same look-ahead-bias mitigation LOOKBACK_
@@ -656,43 +677,272 @@ def fetch_ticker_fundamentals_history(ticker_obj):
 
     Known, documented approximation: yfinance's quarterly statements only
     go back ~4-5 quarters from TODAY (not from the headline date), and
-    Ticker.info's sharesOutstanding/forward-PE/dividend-yield/52-week-range
-    fields are all CURRENT snapshots with no historical equivalent exposed
-    by yfinance. For headlines toward the older end of LOOKBACK_WEEKS this
-    means: (a) EPS/book-value-per-share - the two inputs that actually
-    drive the Graham Number valuation math - are still filtered to
-    strictly-before the headline date, so that part stays real and
-    look-ahead-free; (b) shares outstanding, forward P/E, dividend yield,
-    and the 52-week range use today's current values as a residual
-    approximation rather than the true as-of-date figures, since yfinance
-    doesn't expose historical versions of those; (c) YoY revenue growth
-    needs a quarter from ~a year before the as-of quarter, which the
-    4-5-quarter window frequently doesn't reach - when it doesn't, the YoY
-    figure is simply omitted from the earnings block rather than guessed.
-    All three are deliberate, bounded approximations, not silently-ignored
-    gaps - see the module docstring.
+    Ticker.info's sharesOutstanding/forward-PE/dividend-yield/52-week-range/
+    sector/payoutRatio/freeCashflow/earnings_estimate fields are all CURRENT
+    snapshots with no historical equivalent exposed by yfinance. For
+    headlines toward the older end of LOOKBACK_WEEKS this means: (a) EPS/
+    revenue - the inputs that actually drive the scenario-DCF valuation math
+    (see classify_valuation_basis/build_scenarios above) - are still
+    filtered to strictly-before the headline date, so that part stays real
+    and look-ahead-free; (b) shares outstanding, forward P/E, dividend
+    yield, 52-week range, sector, payout ratio, free cash flow, and growth
+    consensus all use today's current values as a residual approximation
+    rather than the true as-of-date figures, since yfinance doesn't expose
+    historical versions of those; (c) YoY revenue growth needs a quarter
+    from ~a year before the as-of quarter, which the 4-5-quarter window
+    frequently doesn't reach - when it doesn't, the YoY figure is simply
+    omitted from the earnings block rather than guessed. All of these are
+    deliberate, bounded approximations, not silently-ignored gaps - see the
+    module docstring.
 
     Fails soft per-field: any individual fetch that raises leaves that
     field None rather than aborting the whole ticker.
     """
-    result = {"income": None, "balance": None, "earnings_dates": None, "shares_outstanding": None}
+    result = {
+        "income": None, "earnings_dates": None, "shares_outstanding": None,
+        "sector": None, "payout_ratio": None, "free_cash_flow": None, "dividend_rate": None,
+        "growth_0y": None, "growth_1y": None, "growth_0y_low": None, "growth_0y_high": None,
+    }
     try:
         result["income"] = ticker_obj.quarterly_income_stmt
     except Exception as e:
         print(f"    Warning: quarterly_income_stmt fetch failed: {e}", flush=True)
     try:
-        result["balance"] = ticker_obj.quarterly_balance_sheet
-    except Exception as e:
-        print(f"    Warning: quarterly_balance_sheet fetch failed: {e}", flush=True)
-    try:
         result["earnings_dates"] = ticker_obj.earnings_dates
     except Exception as e:
         print(f"    Warning: earnings_dates fetch failed: {e}", flush=True)
     try:
-        result["shares_outstanding"] = ticker_obj.info.get("sharesOutstanding")
+        info = ticker_obj.info
+        result["shares_outstanding"] = info.get("sharesOutstanding")
+        result["sector"] = info.get("sector")
+        result["payout_ratio"] = info.get("payoutRatio")
+        result["free_cash_flow"] = info.get("freeCashflow")
+        result["dividend_rate"] = info.get("dividendRate") or info.get("trailingAnnualDividendRate")
     except Exception as e:
         print(f"    Warning: shares_outstanding/info fetch failed: {e}", flush=True)
+    # Same shape/reasoning as financial-sentiment-api's fundamentals.py
+    # _fetch_growth_consensus - current-year/next-year consensus EPS growth,
+    # used by build_scenarios' g1 derivation. Independent try/except: a
+    # growth-estimate outage shouldn't fail sector/payout/FCF above, same
+    # as production's own independence between these two fetches.
+    try:
+        estimate = ticker_obj.earnings_estimate
+        row_0y = estimate.loc["0y"]
+        row_1y = estimate.loc["+1y"]
+        year_ago = row_0y["yearAgoEps"]
+        if year_ago:
+            result["growth_0y"] = row_0y["growth"]
+            result["growth_1y"] = row_1y["growth"]
+            result["growth_0y_low"] = (row_0y["low"] - year_ago) / abs(year_ago)
+            result["growth_0y_high"] = (row_0y["high"] - year_ago) / abs(year_ago)
+    except Exception as e:
+        print(f"    Warning: earnings_estimate/growth-consensus fetch failed: {e}", flush=True)
     return result
+
+
+# ---------------------------------------------------------------------------
+# Scenario-DCF valuation model - ported from financial-sentiment-api's
+# app/services/valuation.py, byte-identical to the copy in
+# generate_synthetic_dataset.py (see that file's own copy of this comment
+# for the full rationale: this replaces the old Graham Number formula,
+# which had drifted from what production actually serves). Keep all three
+# copies in sync on any future change to valuation.py - see CONTRIBUTING.md's
+# 4-way sync rule, now extended to cover this block too.
+# ---------------------------------------------------------------------------
+STAGE_1_YEARS = 5
+STAGE_2_YEARS = 5
+
+ASSET_HEAVY_SECTORS = {"Energy", "Industrials", "Basic Materials", "Utilities"}
+DIVIDEND_PAYOUT_THRESHOLD = 0.40
+DIVIDEND_PAYOUT_CEILING = 1.20
+REIT_SECTORS = {"Real Estate"}
+
+BASIS_LABELS = {
+    "revenue": "Revenue-based",
+    "eps": "EPS-based",
+    "fcf": "FCF-based",
+    "dividends": "Dividend-based",
+}
+
+DISCOUNT_RATE = 0.10
+SCENARIO_PROBABILITY = 1 / 3
+
+CURATED_SCENARIOS = {
+    "NVDA": {
+        "normal": {"g1": 0.30, "g2": 0.10, "exit_multiple": 20.0},
+        "best": {"g1": 0.30, "g2": 0.15, "exit_multiple": 25.0},
+        "worst": {"g1": 0.05, "g2": 0.05, "exit_multiple": 10.0},
+    },
+    "MSFT": {
+        "normal": {"g1": 0.15, "g2": 0.10, "exit_multiple": 20.0},
+        "best": {"g1": 0.20, "g2": 0.10, "exit_multiple": 25.0},
+        "worst": {"g1": 0.05, "g2": 0.05, "exit_multiple": 12.0},
+    },
+    "PEP": {
+        "normal": {"g1": 0.03, "g2": 0.03, "exit_multiple": 20.0},
+        "best": {"g1": 0.05, "g2": 0.05, "exit_multiple": 25.0},
+        "worst": {"g1": 0.03, "g2": -0.05, "exit_multiple": 15.0},
+    },
+    "NFLX": {
+        "normal": {"g1": 0.12, "g2": 0.10, "exit_multiple": 20.0},
+        "best": {"g1": 0.15, "g2": 0.12, "exit_multiple": 25.0},
+        "worst": {"g1": 0.08, "g2": 0.06, "exit_multiple": 15.0},
+    },
+    "XOM": {
+        "normal": {"g1": 0.04, "g2": 0.04, "exit_multiple": 20.0},
+        "best": {"g1": 0.06, "g2": 0.06, "exit_multiple": 30.0},
+        "worst": {"g1": 0.03, "g2": 0.03, "exit_multiple": 12.0},
+    },
+}
+
+WORST_EXIT_MULTIPLE_ASSET_HEAVY = 12.0
+WORST_EXIT_MULTIPLE_DEFAULT = 13.0
+NORMAL_EXIT_MULTIPLE = 20.0
+BEST_EXIT_MULTIPLE = 25.0
+
+REVENUE_WORST_EXIT_MULTIPLE = 1.0
+REVENUE_NORMAL_EXIT_MULTIPLE = 3.0
+REVENUE_BEST_EXIT_MULTIPLE = 6.0
+
+GROWTH_BASIS_G2 = {"normal": 0.10, "best": 0.12, "worst": 0.04}
+G1_FALLBACK = {"normal": 0.08, "best": 0.10, "worst": 0.04}
+
+
+def classify_valuation_basis(eps_trailing, payout_ratio, sector, free_cash_flow):
+    if sector in REIT_SECTORS:
+        return "dividends"
+    if eps_trailing is None or eps_trailing <= 0:
+        return "revenue"
+    if payout_ratio is not None and DIVIDEND_PAYOUT_THRESHOLD <= payout_ratio <= DIVIDEND_PAYOUT_CEILING:
+        return "dividends"
+    if sector in ASSET_HEAVY_SECTORS and free_cash_flow is not None and free_cash_flow > 0:
+        return "fcf"
+    return "eps"
+
+
+def _shares_outstanding_approx(market_cap, price):
+    if not market_cap or not price:
+        return None
+    return market_cap / price
+
+
+def cash_flow_basis_value(basis, fnd):
+    if basis == "eps":
+        return fnd.get("eps_trailing")
+    if basis == "dividends":
+        return fnd.get("dividend_rate")
+
+    shares = _shares_outstanding_approx(fnd.get("market_cap"), fnd.get("price"))
+    if not shares:
+        return None
+    if basis == "revenue":
+        revenue = fnd.get("total_revenue")
+        return revenue / shares if revenue else None
+    if basis == "fcf":
+        fcf = fnd.get("free_cash_flow")
+        return fcf / shares if fcf else None
+    return None
+
+
+def build_scenarios(ticker, fnd, basis):
+    if ticker and ticker in CURATED_SCENARIOS:
+        return {
+            name: {**scenario, "probability": SCENARIO_PROBABILITY}
+            for name, scenario in CURATED_SCENARIOS[ticker].items()
+        }
+
+    g1_values = dict(G1_FALLBACK)
+    growth_0y = fnd.get("growth_0y")
+    growth_1y = fnd.get("growth_1y")
+    consensus_reliable = growth_0y is not None and growth_1y is not None and (growth_0y >= 0) == (growth_1y >= 0)
+    if consensus_reliable:
+        g1_values["normal"] = (growth_0y + growth_1y) / 2
+        growth_0y_high = fnd.get("growth_0y_high")
+        growth_0y_low = fnd.get("growth_0y_low")
+        if growth_0y_high is not None:
+            g1_values["best"] = growth_0y_high
+        if growth_0y_low is not None:
+            g1_values["worst"] = growth_0y_low
+
+    g2_values = dict(g1_values) if basis == "dividends" else dict(GROWTH_BASIS_G2)
+
+    if basis == "revenue":
+        exit_multiples = {
+            "normal": REVENUE_NORMAL_EXIT_MULTIPLE,
+            "best": REVENUE_BEST_EXIT_MULTIPLE,
+            "worst": REVENUE_WORST_EXIT_MULTIPLE,
+        }
+    else:
+        worst_exit_multiple = (
+            WORST_EXIT_MULTIPLE_ASSET_HEAVY if fnd.get("sector") in ASSET_HEAVY_SECTORS
+            else WORST_EXIT_MULTIPLE_DEFAULT
+        )
+        exit_multiples = {"normal": NORMAL_EXIT_MULTIPLE, "best": BEST_EXIT_MULTIPLE, "worst": worst_exit_multiple}
+
+    return {
+        name: {
+            "g1": g1_values[name],
+            "g2": g2_values[name],
+            "exit_multiple": exit_multiples[name],
+            "probability": SCENARIO_PROBABILITY,
+        }
+        for name in ("normal", "best", "worst")
+    }
+
+
+def scenario_dcf_value(cf0, g1, g2, exit_multiple, discount_rate):
+    pv = 0.0
+    cf = cf0
+    for year in range(1, STAGE_1_YEARS + 1):
+        cf *= 1 + g1
+        pv += cf / (1 + discount_rate) ** year
+    for year in range(STAGE_1_YEARS + 1, STAGE_1_YEARS + STAGE_2_YEARS + 1):
+        cf *= 1 + g2
+        pv += cf / (1 + discount_rate) ** year
+    terminal_value = cf * exit_multiple
+    pv += terminal_value / (1 + discount_rate) ** (STAGE_1_YEARS + STAGE_2_YEARS)
+    return pv
+
+
+def scenario_terminal_value(cf0, g1, g2, exit_multiple, discount_rate):
+    future_cf = cf0 * (1 + g1) ** STAGE_1_YEARS * (1 + g2) ** STAGE_2_YEARS
+    terminal_value = future_cf * exit_multiple
+    return terminal_value / (1 + discount_rate) ** (STAGE_1_YEARS + STAGE_2_YEARS)
+
+
+def _scenario_pv(basis, cf0, g1, g2, exit_multiple, discount_rate):
+    if basis == "dividends":
+        return scenario_dcf_value(cf0, g1, g2, exit_multiple, discount_rate)
+    return scenario_terminal_value(cf0, g1, g2, exit_multiple, discount_rate)
+
+
+def scenario_present_values(cf0, basis, scenarios):
+    return {
+        name: _scenario_pv(basis, cf0, scenario["g1"], scenario["g2"], scenario["exit_multiple"], DISCOUNT_RATE)
+        for name, scenario in scenarios.items()
+    }
+
+
+def intrinsic_value(cf0, basis, scenarios):
+    if cf0 is None or cf0 <= 0:
+        return None
+    pvs = scenario_present_values(cf0, basis, scenarios)
+    return sum(scenario["probability"] * pvs[name] for name, scenario in scenarios.items())
+
+
+def valuation_block(price, intrinsic, basis):
+    label = BASIS_LABELS[basis]
+    if intrinsic is None:
+        return f"Not applicable (insufficient data for the {label.lower()} valuation basis)."
+    if price is None:
+        return "Data unavailable."
+
+    pct = (price - intrinsic) / intrinsic * 100
+    verdict = "overvalued" if pct >= 0 else "undervalued"
+    return (
+        f"Intrinsic Value ({label}): ${intrinsic:.2f}\n"
+        f"vs Current Price: {verdict} by ~{abs(pct):.0f}%"
+    )
 
 
 def _row_series(df, row_names):
@@ -768,7 +1018,6 @@ def build_fundamentals_blocks(ticker_obj, fundamentals_history, as_of_date):
     see served in production.
     """
     income = fundamentals_history["income"]
-    balance = fundamentals_history["balance"]
     shares = fundamentals_history["shares_outstanding"]
 
     price = as_of_price(ticker_obj, as_of_date)
@@ -787,13 +1036,7 @@ def build_fundamentals_blocks(ticker_obj, fundamentals_history, as_of_date):
             eps_trailing = float(prior_eps.iloc[0]) * 4
 
     revenue, rev_period = as_of_quarterly(_row_series(income, ["Total Revenue"]), as_of_date)
-    equity, _ = as_of_quarterly(
-        _row_series(balance, ["Common Stock Equity", "Stockholders Equity",
-                               "Total Equity Gross Minority Interest"]),
-        as_of_date,
-    )
 
-    book_value_per_share = (equity / shares) if (equity is not None and shares) else None
     market_cap = (price * shares) if (price is not None and shares) else None
 
     # --- market_data block ---
@@ -823,19 +1066,37 @@ def build_fundamentals_blocks(ticker_obj, fundamentals_history, as_of_date):
         market_data_block = "Data unavailable."
 
     # --- valuation block ---
-    if eps_trailing and book_value_per_share and price is not None:
-        if eps_trailing <= 0 or book_value_per_share <= 0:
-            valuation_block = "Not applicable (negative or missing EPS/book value)."
-        else:
-            graham = (22.5 * eps_trailing * book_value_per_share) ** 0.5
-            pct = (price - graham) / graham * 100
-            verdict = "overvalued" if pct >= 0 else "undervalued"
-            valuation_block = (
-                f"Intrinsic Value (Graham Number): ${graham:.2f}\n"
-                f"vs Current Price: {verdict} by ~{abs(pct):.0f}%"
-            )
+    # Same scenario-DCF pipeline as valuation.py's valuation_block_for /
+    # generate_synthetic_dataset.py's render_valuation (see the ported
+    # block above this function). Unlike the old Graham Number, this model
+    # doesn't need book value/share at all - quarterly_balance_sheet
+    # (equity's only consumer) was dropped from fetch_ticker_fundamentals_
+    # history entirely rather than fetched and left unused.
+    if price is not None:
+        classify_eps = eps_trailing if eps_trailing else None
+        basis = classify_valuation_basis(
+            classify_eps, fundamentals_history["payout_ratio"],
+            fundamentals_history["sector"], fundamentals_history["free_cash_flow"],
+        )
+        valuation_fnd = {
+            "eps_trailing": classify_eps,
+            "dividend_rate": fundamentals_history["dividend_rate"],
+            "market_cap": market_cap,
+            "price": price,
+            "total_revenue": revenue,
+            "free_cash_flow": fundamentals_history["free_cash_flow"],
+            "sector": fundamentals_history["sector"],
+            "growth_0y": fundamentals_history["growth_0y"],
+            "growth_1y": fundamentals_history["growth_1y"],
+            "growth_0y_low": fundamentals_history["growth_0y_low"],
+            "growth_0y_high": fundamentals_history["growth_0y_high"],
+        }
+        cf0 = cash_flow_basis_value(basis, valuation_fnd)
+        scenarios = build_scenarios(ticker_obj.ticker, valuation_fnd, basis)
+        intrinsic = intrinsic_value(cf0, basis, scenarios)
+        valuation_block_text = valuation_block(price, intrinsic, basis)
     else:
-        valuation_block = "Data unavailable."
+        valuation_block_text = "Data unavailable."
 
     # --- earnings block ---
     earnings_dates = fundamentals_history["earnings_dates"]
@@ -888,7 +1149,7 @@ def build_fundamentals_blocks(ticker_obj, fundamentals_history, as_of_date):
             f"{next_line}"
         )
 
-    return market_data_block, valuation_block, earnings_block
+    return market_data_block, valuation_block_text, earnings_block
 
 
 def build_news_block(primary_headline_line):
@@ -918,17 +1179,36 @@ def _template_reasoning(ticker, direction, pct_change, actual_window_days):
     )
 
 
+# {valuation_alignment} is computed in Python (see valuation_alignment()
+# below), not left for Gemini to derive - whether "overvalued by ~86%"
+# agrees or disagrees with a BULLISH/BEARISH label is a small, fully-
+# determined arithmetic/logic step, and there's no reason to trust an LLM
+# to get that right when the answer is already known from data already in
+# hand. Feeding it the precomputed fact keeps Gemini's actual job limited
+# to prose quality, not judgment calls it doesn't need to make.
+#
+# This addresses a real, confirmed-live gap in how this dataset previously
+# treated the Valuation block: the old instruction only ever said "weave
+# it in where relevant," which is soft enough that Gemini can - and,
+# unmeasured, likely did - skip it by default. Explicitly telling it when
+# valuation genuinely agrees with the label (rather than asking it to
+# figure that out) is the same fix generate_synthetic_dataset.py's
+# VALUATION_SIGNAL_SCENARIOS category applies on the synthetic side: make
+# the "valuation actually correlates with direction sometimes" fact
+# concrete and visible in training data, instead of leaving it as
+# something the model was never shown had any bearing on the answer.
 GEMINI_REASONING_PROMPT = """You are labeling training data for a financial-news analyst model.
 
 You are given a stock ticker, its current market data, a valuation estimate, its most recent earnings, a real news headline about it, a user's question, and a directional label (BULLISH, BEARISH, or NEUTRAL). That label was already determined from the stock's ACTUAL subsequent price move over the next few trading days - not from reading anything below. You do not have access to that price-move data, and you must not reference it, invent a percentage move, or write anything implying you know what the stock did afterward.
 
 Write THREE things, each as its own labeled line (see OUTPUT FORMAT):
 
-1. REASONING (2-3 sentences): Reads the headline and explains why it's plausibly consistent with a {direction} outlook - the way a financial analyst would talk through the available evidence, not the outcome. Weave in the market data, valuation, or earnings below ONLY where they genuinely reinforce or complicate the headline's own signal - don't force a mention if a block is irrelevant to this specific headline or says "Data unavailable."/"Not applicable", and never invent facts or numbers that aren't in what you were given.
+1. REASONING (2-3 sentences): Reads the headline and explains why it's plausibly consistent with a {direction} outlook - the way a financial analyst would talk through the available evidence, not the outcome. Weave in the market data or earnings below ONLY where they genuinely reinforce or complicate the headline's own signal - don't force a mention if a block is irrelevant to this specific headline or says "Data unavailable."/"Not applicable", and never invent facts or numbers that aren't in what you were given.
+   - Valuation alignment (already computed, not your judgment to make): {valuation_alignment}. If "yes", the valuation estimate below points the SAME way as {direction} - actively mention it as one piece of corroborating evidence (still subject to the "never invent numbers" rule - only state what the Valuation block actually says). If "no", the valuation estimate points the OPPOSITE way from {direction} - don't lean on it as support, and don't invent a story explaining why the valuation estimate is wrong either; a brief, honest note that valuation reads the other way is fine, an elaborate defense is not. If "no_data", the Valuation block has no usable reading (NEUTRAL label, "Data unavailable.", or "Not applicable...") - don't mention it at all.
    - If the headline's content does not obviously support {direction} (this happens often - many price moves in a short window are unrelated to the nearest headline), say so plainly - call it a weak or indirect signal rather than forcing a confident causal claim that isn't there.
    - If the headline's content clearly points the OPPOSITE way from {direction} (e.g. a headline reporting good news paired with a BEARISH label, or bad news paired with BULLISH - this happens often, since the label reflects the actual subsequent move and headlines don't always predict it), do NOT invent a contrarian story to force a fit - phrases like "already priced in," "overbought/oversold," or "the market sees through this" sound analytical but aren't something you can actually know from a single headline. Acknowledge honestly, in your own words, that this specific headline runs the other way and the labeled move likely came from something not shown here - but vary your phrasing and sentence structure from one headline to the next. This case recurs across many rows in this dataset; if you settle into one stock formulation for it, the model trained on your output will learn to recite that sentence instead of genuinely reasoning about each headline.
 2. ANSWER (1-2 sentences): A direct, plain answer to the user's question below, consistent with {direction} and, where relevant, the data above. If the question is empty, give a general one-line read on {ticker} instead.
-3. CONTRADICTS: yes if the headline's own content clearly points the OPPOSITE way from {direction} (the case described in REASONING's second bullet above) - no otherwise, including the "weak/indirect signal" case (first bullet), which is NOT a contradiction, just a lack of strong support. This drives the confidence score a downstream step assigns to this example (low if yes) - answer based on what the headline itself says, not on any hedging language you used in REASONING.
+3. CONTRADICTS: yes if the headline's own content clearly points the OPPOSITE way from {direction} (the case described in REASONING's second bullet above) - no otherwise, including the "weak/indirect signal" case (first bullet), which is NOT a contradiction, just a lack of strong support. This drives the confidence score a downstream step assigns to this example (low if yes) - answer based on what the headline itself says, not on any hedging language you used in REASONING. This is about the HEADLINE only, not the valuation alignment note above.
 
 Ticker: {ticker}
 Current Market Data:
@@ -948,6 +1228,24 @@ OUTPUT FORMAT - exactly three lines, nothing else, no preamble or quotes:
 REASONING: <text>
 ANSWER: <text>
 CONTRADICTS: <yes or no>"""
+
+
+def valuation_alignment(valuation_text, direction):
+    """"yes"/"no"/"no_data" - whether the Valuation block's own over/
+    undervalued reading points the same way as `direction`. See
+    GEMINI_REASONING_PROMPT's own comment for why this is computed here
+    rather than left for Gemini to work out. NEUTRAL always resolves to
+    "no_data" - "does an over/undervalued reading agree with NEUTRAL" isn't
+    a meaningful question the way it is for BULLISH/BEARISH."""
+    if direction == "NEUTRAL":
+        return "no_data"
+    if "undervalued" in valuation_text:
+        implied_direction = "BULLISH"
+    elif "overvalued" in valuation_text:
+        implied_direction = "BEARISH"
+    else:
+        return "no_data"
+    return "yes" if implied_direction == direction else "no"
 
 
 def _retry_delay_seconds(error_text, default=10.0):
@@ -1039,6 +1337,7 @@ def generate_grounded_reasoning(ticker, title, direction, pct_change, actual_win
         ticker=ticker, headline=title, direction=direction,
         market_data=market_data, valuation=valuation, earnings=earnings,
         user_query=user_query or "(none)",
+        valuation_alignment=valuation_alignment(valuation, direction),
     )
     for attempt in range(GEMINI_MAX_RETRIES + 1):
         try:

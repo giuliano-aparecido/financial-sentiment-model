@@ -90,6 +90,22 @@ for the full diagnosis.
     hoped to handle, partial production data gaps. `answer` is a templated
     1-sentence direct response to `user_query`, looked up by (question type,
     resolved direction) from ANSWER_TEMPLATES.
+11. Replaced the Graham Number valuation formula with the same scenario-DCF
+    model financial-sentiment-api's valuation.py actually serves (ported,
+    not imported - see that block's own comment). Two real, confirmed-live
+    problems this fixes: (a) production's Valuation block had drifted to a
+    different label/methodology ("Revenue-based"/"EPS-based"/"FCF-based"/
+    "Dividend-based") than every training example ever showed ("Graham
+    Number") - the model was reasoning about a block shape it had never
+    seen trained; (b) more fundamentally, render_valuation's inputs were
+    rolled completely independently of `direction` in 100% of prior
+    training data, so the model had no basis to ever learn to weigh
+    valuation at all (confirmed live in production: a FLUT query with a
+    heavily-undervalued reading still resolved non-bullish). Added the new
+    VALUATION_SIGNAL scenario category (see its own comment) specifically
+    to correlate the two in a controlled way - teaching signal-weighing,
+    not "big gap always wins," the same principle MIXED_SIGNAL_SCENARIOS
+    already applies to conflicting headlines.
 
 Output schema (v4) - {"ticker", "user_query", "market_data", "valuation",
 "earnings", "news", "output"} where output is
@@ -116,7 +132,10 @@ VAL_HOLDOUT_TEMPLATE_INDEX_FRACTION = 0.2                       # ~20% of each
                                                                   # category's templates
                                                                   # are validation-only
 
-SENTIMENT_WEIGHTS = {"BULLISH": 0.34, "BEARISH": 0.34, "NEUTRAL": 0.22, "MIXED": 0.10}
+# VALUATION_SIGNAL is new - carved proportionally out of the other four
+# rather than added on top, so NUM_EXAMPLES still yields roughly the same
+# per-category row counts as before for everything else.
+SENTIMENT_WEIGHTS = {"BULLISH": 0.32, "BEARISH": 0.32, "NEUTRAL": 0.20, "MIXED": 0.08, "VALUATION_SIGNAL": 0.08}
 
 # ---------------------------------------------------------------------------
 # Companies - (ticker, name, sector, (quarterly revenue low, high in $B))
@@ -157,6 +176,35 @@ INVENTED_COMPANIES = [
 
 ALL_COMPANIES = COMPANIES + INVENTED_COMPANIES
 
+# Maps each company's informal sector label (COMPANIES/INVENTED_COMPANIES'
+# 3rd tuple field, e.g. "e-commerce") to the yfinance Ticker.info["sector"]
+# string classify_valuation_basis below actually branches on (see that
+# function's docstring - REIT_SECTORS/ASSET_HEAVY_SECTORS are yfinance
+# sector strings, not this dataset's own informal labels). No company here
+# maps to "Real Estate" - this dataset has no REIT, so that branch is
+# untested by synthetic data (a known, documented gap, not an oversight).
+SECTOR_MAP = {
+    "tech": "Technology",
+    "auto": "Consumer Cyclical",
+    "semiconductors": "Technology",
+    "e-commerce": "Consumer Cyclical",
+    "software": "Technology",
+    "social-media": "Communication Services",
+    "banking": "Financial Services",
+    "entertainment": "Communication Services",
+    "streaming": "Communication Services",
+    "fintech": "Financial Services",
+    "gig-economy": "Technology",
+    "retail": "Consumer Cyclical",
+    "crypto": "Financial Services",
+    "robotics": "Industrials",
+    "biotech": "Healthcare",
+    "logistics": "Industrials",
+    "energy": "Energy",
+    "industrials": "Industrials",
+    "aerospace": "Industrials",
+}
+
 # Per-ticker plausible price bands ($) - the single anchor each company's
 # other synthetic fundamentals (EPS, book value/share, market cap, 52-week
 # range) are derived from, so a given example's market_data/valuation/
@@ -183,11 +231,251 @@ PRICE_RANGES = {
 DATA_UNAVAILABLE_PROB = 0.15
 
 # Chance a company's synthetic trailing EPS is negative this example -
-# forces the Graham Number valuation into its "not applicable" path (no
-# sqrt of a negative number), matching the real valuation.py's behavior for
-# loss-making companies. Kept low since most real large/mid-caps are
-# profitable most quarters.
+# forces the valuation basis classifier into its "revenue" path (see
+# classify_valuation_basis below), matching the real valuation.py's
+# behavior for loss-making companies. Kept low since most real large/
+# mid-caps are profitable most quarters.
 LOSS_MAKING_PROB = 0.08
+
+# ---------------------------------------------------------------------------
+# Scenario-DCF valuation model - ported from financial-sentiment-api's
+# app/services/valuation.py (see that module's own history-of-rejected-
+# approaches comment for why it looks like this), NOT the old Graham Number
+# formula this generator used through v4. That mismatch was a real, live
+# bug: production's Valuation block has rendered "Intrinsic Value
+# (Revenue-based/EPS-based/FCF-based/Dividend-based)" since valuation.py's
+# scenario-DCF rewrite, but every training example still showed "Intrinsic
+# Value (Graham Number)" - a label and methodology the model never saw
+# trained, on a block it was nonetheless supposed to be able to reason
+# about. Ported (not imported) because this repo and financial-sentiment-api
+# are separate repos with no shared package - CONTRIBUTING.md's 4-way sync
+# rule already requires the market_data/earnings block renderers to be
+# hand-kept-identical the same way; this extends that to valuation. Keep
+# this block byte-for-byte in step with valuation.py's own constants/
+# functions on any future change there.
+STAGE_1_YEARS = 5
+STAGE_2_YEARS = 5
+
+ASSET_HEAVY_SECTORS = {"Energy", "Industrials", "Basic Materials", "Utilities"}
+DIVIDEND_PAYOUT_THRESHOLD = 0.40
+DIVIDEND_PAYOUT_CEILING = 1.20
+REIT_SECTORS = {"Real Estate"}
+
+BASIS_LABELS = {
+    "revenue": "Revenue-based",
+    "eps": "EPS-based",
+    "fcf": "FCF-based",
+    "dividends": "Dividend-based",
+}
+
+DISCOUNT_RATE = 0.10
+SCENARIO_PROBABILITY = 1 / 3
+
+# Same curated per-ticker DCF assumptions as valuation.py - NVDA/MSFT/PEP/
+# NFLX/XOM are all in COMPANIES above, so synthetic examples for those five
+# tickers get the exact same scenario assumptions production would use for
+# them, instead of the generic/derived fallback every other ticker gets.
+CURATED_SCENARIOS = {
+    "NVDA": {
+        "normal": {"g1": 0.30, "g2": 0.10, "exit_multiple": 20.0},
+        "best": {"g1": 0.30, "g2": 0.15, "exit_multiple": 25.0},
+        "worst": {"g1": 0.05, "g2": 0.05, "exit_multiple": 10.0},
+    },
+    "MSFT": {
+        "normal": {"g1": 0.15, "g2": 0.10, "exit_multiple": 20.0},
+        "best": {"g1": 0.20, "g2": 0.10, "exit_multiple": 25.0},
+        "worst": {"g1": 0.05, "g2": 0.05, "exit_multiple": 12.0},
+    },
+    "PEP": {
+        "normal": {"g1": 0.03, "g2": 0.03, "exit_multiple": 20.0},
+        "best": {"g1": 0.05, "g2": 0.05, "exit_multiple": 25.0},
+        "worst": {"g1": 0.03, "g2": -0.05, "exit_multiple": 15.0},
+    },
+    "NFLX": {
+        "normal": {"g1": 0.12, "g2": 0.10, "exit_multiple": 20.0},
+        "best": {"g1": 0.15, "g2": 0.12, "exit_multiple": 25.0},
+        "worst": {"g1": 0.08, "g2": 0.06, "exit_multiple": 15.0},
+    },
+    "XOM": {
+        "normal": {"g1": 0.04, "g2": 0.04, "exit_multiple": 20.0},
+        "best": {"g1": 0.06, "g2": 0.06, "exit_multiple": 30.0},
+        "worst": {"g1": 0.03, "g2": 0.03, "exit_multiple": 12.0},
+    },
+}
+
+WORST_EXIT_MULTIPLE_ASSET_HEAVY = 12.0
+WORST_EXIT_MULTIPLE_DEFAULT = 13.0
+NORMAL_EXIT_MULTIPLE = 20.0
+BEST_EXIT_MULTIPLE = 25.0
+
+# P/S-style multiples for the "revenue" basis specifically - see
+# financial-sentiment-api PR (fix: revenue-basis valuation reused
+# earnings-grade exit multiples) for why these can't share the eps/fcf/
+# dividends multiples above (confirmed live: FLUT came back "94%
+# undervalued" when routed to "revenue" with the old shared 20-25x
+# multiples). Ported here so synthetic training data reflects the fix too,
+# not just production.
+REVENUE_WORST_EXIT_MULTIPLE = 1.0
+REVENUE_NORMAL_EXIT_MULTIPLE = 3.0
+REVENUE_BEST_EXIT_MULTIPLE = 6.0
+
+GROWTH_BASIS_G2 = {"normal": 0.10, "best": 0.12, "worst": 0.04}
+G1_FALLBACK = {"normal": 0.08, "best": 0.10, "worst": 0.04}
+
+
+def classify_valuation_basis(eps_trailing, payout_ratio, sector, free_cash_flow):
+    """See financial-sentiment-api's valuation.py for the full rationale -
+    ported verbatim. Real Estate -> dividends; unprofitable/unknown ->
+    revenue; high-but-plausible payout -> dividends; asset-heavy sector with
+    real positive FCF -> fcf; otherwise -> eps."""
+    if sector in REIT_SECTORS:
+        return "dividends"
+    if eps_trailing is None or eps_trailing <= 0:
+        return "revenue"
+    if payout_ratio is not None and DIVIDEND_PAYOUT_THRESHOLD <= payout_ratio <= DIVIDEND_PAYOUT_CEILING:
+        return "dividends"
+    if sector in ASSET_HEAVY_SECTORS and free_cash_flow is not None and free_cash_flow > 0:
+        return "fcf"
+    return "eps"
+
+
+def _shares_outstanding_approx(market_cap, price):
+    if not market_cap or not price:
+        return None
+    return market_cap / price
+
+
+def cash_flow_basis_value(basis, fnd):
+    """Extracts the per-share cash-flow figure for the classified basis -
+    ported from valuation.py's identically-named function, adapted to this
+    generator's fnd dict field names."""
+    if basis == "eps":
+        return fnd.get("eps_trailing")
+    if basis == "dividends":
+        return fnd.get("dividend_rate")
+
+    shares = _shares_outstanding_approx(fnd.get("market_cap"), fnd.get("price"))
+    if not shares:
+        return None
+    if basis == "revenue":
+        revenue = fnd.get("total_revenue")
+        return revenue / shares if revenue else None
+    if basis == "fcf":
+        fcf = fnd.get("free_cash_flow")
+        return fcf / shares if fcf else None
+    return None
+
+
+def build_scenarios(ticker, fnd, basis):
+    """Ported from valuation.py's identically-named function - see that
+    module for the full rationale behind each piece."""
+    if ticker and ticker in CURATED_SCENARIOS:
+        return {
+            name: {**scenario, "probability": SCENARIO_PROBABILITY}
+            for name, scenario in CURATED_SCENARIOS[ticker].items()
+        }
+
+    g1_values = dict(G1_FALLBACK)
+    growth_0y = fnd.get("growth_0y")
+    growth_1y = fnd.get("growth_1y")
+    consensus_reliable = growth_0y is not None and growth_1y is not None and (growth_0y >= 0) == (growth_1y >= 0)
+    if consensus_reliable:
+        g1_values["normal"] = (growth_0y + growth_1y) / 2
+        growth_0y_high = fnd.get("growth_0y_high")
+        growth_0y_low = fnd.get("growth_0y_low")
+        if growth_0y_high is not None:
+            g1_values["best"] = growth_0y_high
+        if growth_0y_low is not None:
+            g1_values["worst"] = growth_0y_low
+
+    g2_values = dict(g1_values) if basis == "dividends" else dict(GROWTH_BASIS_G2)
+
+    if basis == "revenue":
+        exit_multiples = {
+            "normal": REVENUE_NORMAL_EXIT_MULTIPLE,
+            "best": REVENUE_BEST_EXIT_MULTIPLE,
+            "worst": REVENUE_WORST_EXIT_MULTIPLE,
+        }
+    else:
+        worst_exit_multiple = (
+            WORST_EXIT_MULTIPLE_ASSET_HEAVY if fnd.get("sector") in ASSET_HEAVY_SECTORS
+            else WORST_EXIT_MULTIPLE_DEFAULT
+        )
+        exit_multiples = {"normal": NORMAL_EXIT_MULTIPLE, "best": BEST_EXIT_MULTIPLE, "worst": worst_exit_multiple}
+
+    return {
+        name: {
+            "g1": g1_values[name],
+            "g2": g2_values[name],
+            "exit_multiple": exit_multiples[name],
+            "probability": SCENARIO_PROBABILITY,
+        }
+        for name in ("normal", "best", "worst")
+    }
+
+
+def scenario_dcf_value(cf0, g1, g2, exit_multiple, discount_rate):
+    """Full-sum (interim years + terminal), used only for "dividends" -
+    ported verbatim from valuation.py."""
+    pv = 0.0
+    cf = cf0
+    for year in range(1, STAGE_1_YEARS + 1):
+        cf *= 1 + g1
+        pv += cf / (1 + discount_rate) ** year
+    for year in range(STAGE_1_YEARS + 1, STAGE_1_YEARS + STAGE_2_YEARS + 1):
+        cf *= 1 + g2
+        pv += cf / (1 + discount_rate) ** year
+    terminal_value = cf * exit_multiple
+    pv += terminal_value / (1 + discount_rate) ** (STAGE_1_YEARS + STAGE_2_YEARS)
+    return pv
+
+
+def scenario_terminal_value(cf0, g1, g2, exit_multiple, discount_rate):
+    """Terminal-only (no interim summation), used for "eps"/"fcf"/
+    "revenue" - ported verbatim from valuation.py."""
+    future_cf = cf0 * (1 + g1) ** STAGE_1_YEARS * (1 + g2) ** STAGE_2_YEARS
+    terminal_value = future_cf * exit_multiple
+    return terminal_value / (1 + discount_rate) ** (STAGE_1_YEARS + STAGE_2_YEARS)
+
+
+def _scenario_pv(basis, cf0, g1, g2, exit_multiple, discount_rate):
+    if basis == "dividends":
+        return scenario_dcf_value(cf0, g1, g2, exit_multiple, discount_rate)
+    return scenario_terminal_value(cf0, g1, g2, exit_multiple, discount_rate)
+
+
+def scenario_present_values(cf0, basis, scenarios):
+    return {
+        name: _scenario_pv(basis, cf0, scenario["g1"], scenario["g2"], scenario["exit_multiple"], DISCOUNT_RATE)
+        for name, scenario in scenarios.items()
+    }
+
+
+def intrinsic_value(cf0, basis, scenarios):
+    """None (not a fetch failure) when cf0 is missing or non-positive -
+    ported verbatim from valuation.py."""
+    if cf0 is None or cf0 <= 0:
+        return None
+    pvs = scenario_present_values(cf0, basis, scenarios)
+    return sum(scenario["probability"] * pvs[name] for name, scenario in scenarios.items())
+
+
+def valuation_block(price, intrinsic, basis):
+    """Renders the 'Valuation' prompt block - byte-identical to
+    valuation.py's identically-named function, since this IS what the model
+    is trained on and served against."""
+    label = BASIS_LABELS[basis]
+    if intrinsic is None:
+        return f"Not applicable (insufficient data for the {label.lower()} valuation basis)."
+    if price is None:
+        return "Data unavailable."
+
+    pct = (price - intrinsic) / intrinsic * 100
+    verdict = "overvalued" if pct >= 0 else "undervalued"
+    return (
+        f"Intrinsic Value ({label}): ${intrinsic:.2f}\n"
+        f"vs Current Price: {verdict} by ~{abs(pct):.0f}%"
+    )
 
 PUBLISHERS = [
     "Reuters", "Bloomberg", "MarketWatch", "CNBC", "Yahoo Finance",
@@ -551,6 +839,70 @@ MIXED_SIGNAL_SCENARIOS = [
     s if len(s) == 3 else (s[0], s[1], "BEARISH") for s in MIXED_SIGNAL_SCENARIOS
 ]
 
+# Teaches the model to actually weigh the Valuation block, which - before
+# this category existed - was rendered every example (ported scenario-DCF
+# math above) but never once correlated with `direction`, in either this
+# dataset or generate_real_dataset.py: render_valuation's inputs were
+# rolled independently of whatever news-driven direction/reasoning the
+# example resolved to, and no reasoning_template anywhere ever referenced
+# it. A model can't learn to use a signal that's pure noise relative to the
+# label in 100% of its training data - this is the fix.
+#
+# Deliberately NOT "big valuation gap always wins" - MIXED_SIGNAL_SCENARIOS
+# exists because signal-weighing, not blind rule-following, is the actual
+# skill; this category applies the same principle to valuation specifically,
+# including entries where a concrete near-term news catalyst overrides an
+# extreme valuation gap (see the "_wins" tier entries below). That
+# distinction matters here more than for headline-vs-headline conflicts:
+# this project has direct, first-hand evidence (see financial-sentiment-api
+# PR "fix: revenue-basis valuation reused earnings-grade exit multiples")
+# that the DCF model itself can be badly wrong, so teaching "trust a big
+# gap unconditionally" would be trading one bug for another. Every "_alone"/
+# "_reinforced" entry's reasoning explicitly names that uncertainty rather
+# than treating the valuation read as ground truth.
+#
+# Each entry: (headline_templates, reasoning_template, direction,
+# valuation_verdict, gap_tier, confidence_tier). valuation_verdict/gap_tier
+# feed _valuation_block_with_gap (defined below, after the ported valuation
+# functions) to construct a Valuation block with a controlled, specific gap
+# size instead of the normal random draw - the same reason
+# MIXED_SIGNAL_SCENARIOS hand-authors its headline pairs rather than
+# sampling them: this needs a deliberately clean, specific setup to teach a
+# clean lesson.
+VALUATION_SIGNAL_SCENARIOS = [
+    # --- extreme gap, no corroborating news: valuation is the only signal ---
+    (["{name} ({ticker}) held a routine analyst call with no notable updates to prior commentary"],
+     "No fresh news moves the needle here, but {ticker} is trading at a steep discount to its estimated intrinsic value - a real, if imperfect, signal on its own. DCF-style estimates carry real model uncertainty, so this leans bullish without the higher confidence a concrete catalyst would justify.",
+     "BULLISH", "undervalued", "extreme", "extreme_alone"),
+    (["{name} ({ticker}) reiterated prior full-year guidance with no other updates this week"],
+     "Nothing new in the news, but {ticker} is trading at a steep premium to its estimated intrinsic value - worth weighing even without a fresh catalyst, tempered by the real uncertainty in any DCF-style estimate.",
+     "BEARISH", "overvalued", "extreme", "extreme_alone"),
+    # --- moderate gap, no corroborating news: weaker evidence, lower confidence ---
+    (["{name} ({ticker}) traded in a narrow range this week with no company-specific news"],
+     "No headline catalyst, but {ticker}'s current price sits at a modest discount to its estimated intrinsic value - a real but comparatively soft signal, especially with no news to corroborate it, so confidence here stays low.",
+     "BULLISH", "undervalued", "moderate", "moderate_alone"),
+    (["{name} ({ticker}) saw light trading volume in an otherwise uneventful week"],
+     "No headline catalyst, but {ticker}'s current price sits at a modest premium to its estimated intrinsic value - a real but comparatively soft signal on its own, so confidence here stays low.",
+     "BEARISH", "overvalued", "moderate", "moderate_alone"),
+    # --- extreme gap, reinforced by a mild/subtle same-direction headline ---
+    (["{name} ({ticker}) saw a modest uptick in institutional buying interest, according to the latest filings"],
+     "{ticker} already looks meaningfully undervalued against its estimated intrinsic value, and the pickup in institutional interest is a soft but same-direction confirmation - still tempered by the underlying uncertainty in any valuation estimate, but more confident than the valuation gap alone would justify.",
+     "BULLISH", "undervalued", "extreme", "extreme_reinforced"),
+    (["{name} ({ticker}) saw a modest uptick in insider selling activity, according to the latest filings"],
+     "{ticker} already looks meaningfully overvalued against its estimated intrinsic value, and the pickup in insider selling is a soft but same-direction confirmation - still tempered by the underlying uncertainty in any valuation estimate, but more confident than the valuation gap alone would justify.",
+     "BEARISH", "overvalued", "extreme", "extreme_reinforced"),
+    # --- extreme gap, but a concrete near-term catalyst points the other
+    # way - the news should win, same principle as MIXED_SIGNAL_SCENARIOS ---
+    (["{name} ({ticker}) cut its full-year guidance, citing softening {product} demand heading into next quarter"],
+     "{ticker} screens as meaningfully undervalued on an estimated-intrinsic-value basis, but a concrete, company-issued guidance cut is a more reliable near-term signal than a longer-horizon valuation estimate - the guidance cut should dominate here, not the valuation gap.",
+     "BEARISH", "undervalued", "extreme", "news_wins"),
+    (["{name} ({ticker}) raised its full-year guidance, citing accelerating {product} demand"],
+     "{ticker} screens as meaningfully overvalued on an estimated-intrinsic-value basis, but a concrete, company-issued guidance raise is a more reliable near-term signal than a longer-horizon valuation estimate - the guidance raise should dominate here, not the valuation gap.",
+     "BULLISH", "overvalued", "extreme", "news_wins"),
+]
+
+VALUATION_GAP_RANGES = {"extreme": (70.0, 95.0), "moderate": (15.0, 35.0)}
+
 # BULLISH/BEARISH now nested by tier - "subtle" gets a lower range than
 # "clear" (a softer signal genuinely warrants less certainty) but still well
 # above NEUTRAL's range, so low confidence alone doesn't become another
@@ -560,6 +912,18 @@ CONFIDENCE_RANGES = {
     "BEARISH": {"clear": (0.83, 0.96), "subtle": (0.66, 0.80)},
     "NEUTRAL": {"clear": (0.60, 0.82)},
     "MIXED": {"clear": (0.55, 0.75)},
+    # Deliberately lower ceilings than BULLISH/BEARISH "clear" even for the
+    # "extreme" gap tier - a DCF-style estimate is documented, first-hand,
+    # to carry real model risk (see VALUATION_SIGNAL_SCENARIOS' own
+    # comment), so it should never earn the same confidence a concrete news
+    # catalyst does. "news_wins" is the exception: confidence there reflects
+    # the (real, concrete) news catalyst, not the valuation gap it overrides.
+    "VALUATION_SIGNAL": {
+        "extreme_alone": (0.58, 0.70),
+        "moderate_alone": (0.45, 0.56),
+        "extreme_reinforced": (0.68, 0.80),
+        "news_wins": (0.80, 0.93),
+    },
 }
 
 
@@ -579,6 +943,7 @@ BULLISH_HOLDOUT_IDX = held_out_template_indices(BULLISH_SCENARIOS)
 BEARISH_HOLDOUT_IDX = held_out_template_indices(BEARISH_SCENARIOS)
 NEUTRAL_HOLDOUT_IDX = held_out_template_indices(NEUTRAL_SCENARIOS)
 MIXED_HOLDOUT_IDX = held_out_template_indices(MIXED_SIGNAL_SCENARIOS)
+VALUATION_SIGNAL_HOLDOUT_IDX = held_out_template_indices(VALUATION_SIGNAL_SCENARIOS)
 
 
 def make_fields(company):
@@ -629,10 +994,10 @@ def format_market_cap(value):
 def make_fundamentals(company, fields):
     # Derives every other synthetic fundamental from a single random price
     # draw so a given example's numbers stay internally consistent (e.g.
-    # price implies EPS implies Graham Number implies over/undervalued -
+    # price implies EPS implies intrinsic value implies over/undervalued -
     # they can't independently contradict each other the way unrelated
     # random draws could).
-    ticker = company[0]
+    ticker, _name, informal_sector, rev_range = company
     price_low, price_high = PRICE_RANGES[ticker]
     price = round(random.uniform(price_low, price_high), 2)
 
@@ -647,15 +1012,16 @@ def make_fundamentals(company, fields):
     year_low = round(price * random.uniform(0.72, 0.93), 2)
     year_high = round(price * random.uniform(1.07, 1.38), 2)
 
-    # Tuned (jointly with pe_trailing above) so PE*PB dips below the Graham
-    # Number's implicit 22.5 threshold roughly a third of the time - an
-    # earlier, higher-floor range made almost every synthetic row land on
-    # "overvalued" regardless of the actual numbers, which would just teach
-    # the model to ignore this block rather than actually read it.
+    # Book value/share is no longer consumed by valuation math (the
+    # scenario-DCF model doesn't use it - see build_scenarios/
+    # cash_flow_basis_value above), but market_data's Graham-era P/B
+    # grounding isn't part of production's market_data_block either, so
+    # this is kept only as a plausible, unused-by-valuation figure - no
+    # downstream consumer left to tune it against.
     pb_ratio = round(random.uniform(0.4, 4.0), 1)
     book_value_per_share = round(price / pb_ratio, 2)
 
-    rev_low, rev_high = company[3]
+    rev_low, rev_high = rev_range
     # Loosely ties market cap to the company's revenue band (bigger revenue
     # -> more shares outstanding, roughly) without needing a second hand-
     # authored per-ticker range - precision doesn't matter here, only that
@@ -675,6 +1041,53 @@ def make_fundamentals(company, fields):
     last_q_eps = round(max(eps_trailing, 0.05) / 4 * random.uniform(0.85, 1.15), 2) \
         if eps_trailing > 0 else round(-abs(eps_trailing) / 4 * random.uniform(0.85, 1.15), 2)
 
+    # --- valuation-model inputs (classify_valuation_basis/build_scenarios
+    # above) - none of these existed before the scenario-DCF port; each is
+    # derived from figures already rolled above so nothing here can
+    # contradict last_q_revenue/yoy_growth/eps_trailing.
+    sector = SECTOR_MAP[informal_sector]
+
+    # Annualized from the same quarterly draw headlines/earnings use, with
+    # mild quarter-to-quarter variance - not an independent roll, so it
+    # can't land on an annualized figure wildly out of step with the
+    # quarter actually being discussed.
+    total_revenue = last_q_revenue * 4 * random.uniform(0.92, 1.08) * 1e9
+
+    dividend_rate = round(div_yield / 100 * price, 2) if div_yield > 0 else 0.0
+    # Payout ratio only makes sense against positive earnings - matches
+    # cash_flow_basis_value's own "dividends" branch, which reads
+    # dividend_rate directly and never divides by eps_trailing itself, but
+    # classify_valuation_basis's payout check needs a real ratio to compare
+    # against DIVIDEND_PAYOUT_THRESHOLD/_CEILING.
+    payout_ratio = round(dividend_rate / eps_trailing, 2) if (div_yield > 0 and eps_trailing > 0) else None
+
+    # Mostly positive, roughly proportional to revenue (a plausible margin
+    # band) - occasionally negative or None so the asset-heavy/fcf
+    # classification branch's fallbacks (see classify_valuation_basis) get
+    # exercised too, not just its happy path.
+    fcf_roll = random.random()
+    if fcf_roll < 0.85:
+        free_cash_flow = total_revenue * random.uniform(0.05, 0.20)
+    elif fcf_roll < 0.93:
+        free_cash_flow = total_revenue * random.uniform(-0.08, -0.01)
+    else:
+        free_cash_flow = None
+
+    # Consensus growth estimates (build_scenarios' g1 derivation) - based on
+    # the same yoy_growth draw so a company already shown growing fast
+    # doesn't also roll a consensus implying decline. ~15% of the time the
+    # two years point in opposite directions on purpose, exercising
+    # build_scenarios' "unreliable consensus -> G1_FALLBACK" branch the same
+    # way a real rebound-then-giveback base year does in production.
+    growth_0y = round(yoy_growth / 100 + random.uniform(-0.03, 0.03), 4)
+    if random.random() < 0.15:
+        growth_1y = round(-growth_0y * random.uniform(0.3, 1.2), 4)
+    else:
+        growth_1y = round(growth_0y + random.uniform(-0.04, 0.04), 4)
+    spread = random.uniform(0.05, 0.15)
+    growth_0y_high = round(growth_0y + spread, 4)
+    growth_0y_low = round(growth_0y - spread, 4)
+
     return {
         "price": price,
         "pe_trailing": pe_trailing,
@@ -690,6 +1103,15 @@ def make_fundamentals(company, fields):
         "last_q_revenue": last_q_revenue,
         "yoy_growth": yoy_growth,
         "last_q_eps": last_q_eps,
+        "sector": sector,
+        "total_revenue": total_revenue,
+        "dividend_rate": dividend_rate,
+        "payout_ratio": payout_ratio,
+        "free_cash_flow": free_cash_flow,
+        "growth_0y": growth_0y,
+        "growth_1y": growth_1y,
+        "growth_0y_high": growth_0y_high,
+        "growth_0y_low": growth_0y_low,
     }
 
 
@@ -704,18 +1126,41 @@ def render_market_data(fnd):
     )
 
 
-def render_valuation(fnd):
+def render_valuation(fnd, ticker=None):
+    """Classifies the valuation basis and runs the scenario-DCF math ported
+    above - same pipeline as valuation.py's valuation_block_for, adapted to
+    this generator's already-in-hand fnd dict instead of a live yfinance
+    fetch. `ticker` (optional) lets NVDA/MSFT/PEP/NFLX/XOM draw the same
+    CURATED_SCENARIOS assumptions production would use for them."""
     if random.random() < DATA_UNAVAILABLE_PROB:
         return "Data unavailable."
-    if fnd["eps_trailing"] <= 0 or fnd["book_value_per_share"] <= 0:
-        return "Not applicable (negative or missing EPS/book value)."
-    graham = (22.5 * fnd["eps_trailing"] * fnd["book_value_per_share"]) ** 0.5
-    pct = (fnd["price"] - graham) / graham * 100
-    verdict = "overvalued" if pct >= 0 else "undervalued"
-    return (
-        f"Intrinsic Value (Graham Number): ${graham:.2f}\n"
-        f"vs Current Price: {verdict} by ~{abs(pct):.0f}%"
+    basis = classify_valuation_basis(
+        fnd["eps_trailing"], fnd["payout_ratio"], fnd["sector"], fnd["free_cash_flow"],
     )
+    cf0 = cash_flow_basis_value(basis, fnd)
+    scenarios = build_scenarios(ticker, fnd, basis)
+    intrinsic = intrinsic_value(cf0, basis, scenarios)
+    return valuation_block(fnd["price"], intrinsic, basis)
+
+
+def valuation_block_with_gap(price, gap_pct, verdict):
+    """Builds a Valuation block with a SPECIFIC, controlled over/undervalued
+    percentage - used only by VALUATION_SIGNAL_SCENARIOS (see that list's
+    own comment), which needs a deliberately clean, specific gap to teach a
+    clean lesson, rather than whatever build_scenarios/intrinsic_value's
+    full random-draw pipeline happens to produce. Still renders through the
+    same valuation_block() formatter as every other row, so the shape
+    (basis label, wording) is identical - only these rows' underlying
+    numbers are directly constructed instead of DCF-derived. `basis` is
+    randomly chosen per call purely for label variety across training
+    examples; VALUATION_SIGNAL_SCENARIOS' lesson is about the gap, not
+    about which basis produced it."""
+    basis = random.choice(list(BASIS_LABELS))
+    if verdict == "overvalued":
+        intrinsic = price / (1 + gap_pct / 100)
+    else:
+        intrinsic = price / (1 - gap_pct / 100)
+    return valuation_block(price, intrinsic, basis)
 
 
 def render_earnings(fnd, direction):
@@ -752,6 +1197,7 @@ def render_earnings(fnd, direction):
 
 def make_example(company, category):
     ticker = company[0]
+    valuation_signal = None  # set below only for category == "VALUATION_SIGNAL"
 
     if category == "MIXED":
         idx = random.randrange(len(MIXED_SIGNAL_SCENARIOS))
@@ -764,6 +1210,13 @@ def make_example(company, category):
         direction = "NEUTRAL"
         is_holdout_template = idx in NEUTRAL_HOLDOUT_IDX
         conf_low, conf_high = CONFIDENCE_RANGES["NEUTRAL"]["clear"]
+    elif category == "VALUATION_SIGNAL":
+        idx = random.randrange(len(VALUATION_SIGNAL_SCENARIOS))
+        (headline_templates, reasoning_template, direction,
+         valuation_verdict, gap_tier, confidence_tier) = VALUATION_SIGNAL_SCENARIOS[idx]
+        valuation_signal = (valuation_verdict, gap_tier)
+        is_holdout_template = idx in VALUATION_SIGNAL_HOLDOUT_IDX
+        conf_low, conf_high = CONFIDENCE_RANGES["VALUATION_SIGNAL"][confidence_tier]
     else:
         scenarios = {"BULLISH": BULLISH_SCENARIOS, "BEARISH": BEARISH_SCENARIOS}[category]
         holdout_idx = {"BULLISH": BULLISH_HOLDOUT_IDX, "BEARISH": BEARISH_HOLDOUT_IDX}[category]
@@ -781,9 +1234,15 @@ def make_example(company, category):
     user_query, qtype = build_user_query(ticker)
 
     fnd = make_fundamentals(company, fields)
-    market_data_block = render_market_data(fnd)
-    valuation_block = render_valuation(fnd)
-    earnings_block = render_earnings(fnd, direction)
+    market_data_text = render_market_data(fnd)
+    if valuation_signal is not None:
+        verdict, gap_tier = valuation_signal
+        gap_low, gap_high = VALUATION_GAP_RANGES[gap_tier]
+        gap_pct = round(random.uniform(gap_low, gap_high), 1)
+        valuation_text = valuation_block_with_gap(fnd["price"], gap_pct, verdict)
+    else:
+        valuation_text = render_valuation(fnd, ticker)
+    earnings_text = render_earnings(fnd, direction)
 
     answer = ANSWER_TEMPLATES[qtype][direction].format(ticker=ticker)
 
@@ -809,9 +1268,9 @@ def make_example(company, category):
                            # training script can build "Target Stock: {ticker}" without
                            # parsing the output JSON string
         "user_query": user_query,
-        "market_data": market_data_block,
-        "valuation": valuation_block,
-        "earnings": earnings_block,
+        "market_data": market_data_text,
+        "valuation": valuation_text,
+        "earnings": earnings_text,
         "news": news_block,
         "output": json.dumps(output_payload, indent=2),
         "_split": split,  # stripped before writing - see main()

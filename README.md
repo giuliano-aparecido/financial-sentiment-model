@@ -114,7 +114,7 @@ Practical consequences:
   `transformers peft trl accelerate datasets` (plus whatever `torch_xla`
   build Colab's TPU runtime already ships).
 - Both paths push an **adapter-only** model to the same naming scheme
-  (`{HF_USER}/{model}-financial-reasoner-v8`), except the TPU path adds a
+  (`{HF_USER}/{model}-financial-reasoner-v9`), except the TPU path adds a
   `-tpu` suffix so a TPU run never overwrites a GPU-trained adapter at the
   same name, or vice versa. The trailing number is bumped by hand each time
   a new training attempt is pushed (v4 → v7 so far), so it tracks
@@ -172,7 +172,7 @@ running the whole notebook unattended via "Run all."
 | Name | What it is |
 |---|---|
 | `HF_TOKEN` | A Hugging Face **write**-access token, used to push the fine-tuned model. |
-| `HF_USER` | Your Hugging Face username, used to build the target repo name (`{HF_USER}/{model}-financial-reasoner-v8`). |
+| `HF_USER` | Your Hugging Face username, used to build the target repo name (`{HF_USER}/{model}-financial-reasoner-v9`). |
 | `GEMINI_API_KEY` | A free key from [aistudio.google.com/apikey](https://aistudio.google.com/apikey), used by `generate_real_dataset.py` to write headline-grounded `reasoning` and `answer` text (`gemini-3.5-flash-lite` — cost for the whole real dataset is well under $1). |
 | `MODEL_VERSION` *(optional)* | Overrides the `-vN` suffix in the target repo name for this session only, without editing any file - e.g. set to `v6` to reload/evaluate an older push for comparison. Every script falls back to the git-committed `MODEL_VERSION_DEFAULT` (bumped via `python bump_model_version.py vN`) if this isn't set, so it's safe to leave unset entirely. |
 | `MODEL_CHOICE` *(optional)* | Overrides which `MODEL_REGISTRY` entry (base model family, e.g. `apertus-8b`) to train/reload for this session only, without editing any file. Falls back to the git-committed `MODEL_CHOICE_DEFAULT` (`"llama-3.2-3b"`) if unset. When reloading a pushed model in an eval script, this must match whatever `MODEL_CHOICE` that specific push was actually trained under, not whatever you'd like to try next. |
