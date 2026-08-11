@@ -57,7 +57,7 @@ except NameError:
     # MODEL_VERSION_DEFAULT is the git-committed baseline (bumped by
     # bump_model_version.py). Add an OPTIONAL "MODEL_VERSION" Colab/Kaggle
     # Secret to reload a different push ad-hoc, without editing this file.
-    MODEL_VERSION_DEFAULT = "v8"
+    MODEL_VERSION_DEFAULT = "v9"
     try:
         MODEL_VERSION = get_secret("MODEL_VERSION") or MODEL_VERSION_DEFAULT
     except Exception:
