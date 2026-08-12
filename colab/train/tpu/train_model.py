@@ -352,7 +352,7 @@ HF_USER = get_secret("HF_USER")
 # here since Colab/Kaggle raise different exception types for "no such
 # secret", and this one specific secret is optional by design, so any
 # failure to read it should silently fall back, never block or crash.
-MODEL_VERSION_DEFAULT = "v9"
+MODEL_VERSION_DEFAULT = "v10"
 try:
     MODEL_VERSION = get_secret("MODEL_VERSION") or MODEL_VERSION_DEFAULT
 except Exception:
