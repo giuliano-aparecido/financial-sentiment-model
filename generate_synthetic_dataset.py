@@ -861,6 +861,24 @@ MIXED_SIGNAL_SCENARIOS = [
 # "_reinforced" entry's reasoning explicitly names that uncertainty rather
 # than treating the valuation read as ground truth.
 #
+# "_wins" tier deliberately spans multiple concrete-catalyst phrasings
+# (guidance change, earnings beat/miss, analyst rating change, a price move
+# tied to a demand catalyst), not just guidance cut/raise - a v9 eval
+# (real-val accuracy 36%, barely above the 33% chance baseline) showed the
+# fine-tuned model overriding plainly bullish/bearish real headlines
+# ("Coca-Cola stock pops after earnings," "ExxonMobil rides 6-day winning
+# streak," "JPMorgan's historic Q2 profit") toward whatever the valuation
+# gap implied instead, with reasoning that explicitly deferred to valuation
+# over a catalyst just as concrete as guidance cut/raise. Narrow phrasing
+# coverage in "_wins" is the likely cause: the model had no training
+# example of "beat earnings" or "stock pops" as a catalyst strong enough to
+# beat valuation, only guidance changes, so it may not have generalized the
+# lesson to other equally-concrete catalyst phrasings. "_wins" is now 8
+# templates against "_alone"/"_reinforced"'s combined 6, a deliberate
+# slight majority rather than the prior 2-of-8 minority, given how
+# consistently the v9 eval failures leaned toward valuation over a clear
+# catalyst.
+#
 # Each entry: (headline_templates, reasoning_template, direction,
 # valuation_verdict, gap_tier, confidence_tier). valuation_verdict/gap_tier
 # feed _valuation_block_with_gap (defined below, after the ported valuation
@@ -898,6 +916,30 @@ VALUATION_SIGNAL_SCENARIOS = [
      "BEARISH", "undervalued", "extreme", "news_wins"),
     (["{name} ({ticker}) raised its full-year guidance, citing accelerating {product} demand"],
      "{ticker} screens as meaningfully overvalued on an estimated-intrinsic-value basis, but a concrete, company-issued guidance raise is a more reliable near-term signal than a longer-horizon valuation estimate - the guidance raise should dominate here, not the valuation gap.",
+     "BULLISH", "overvalued", "extreme", "news_wins"),
+    # --- same principle, earnings-beat/miss phrasing (the real headline
+    # style this category was missing - see comment above) ---
+    (["{name} ({ticker}) missed Q{q} revenue estimates by {beat}%"],
+     "{ticker} screens as meaningfully undervalued on an estimated-intrinsic-value basis, but a confirmed revenue miss is a concrete, current-quarter signal that carries more weight than a longer-horizon valuation estimate - the miss should dominate here, not the valuation gap.",
+     "BEARISH", "undervalued", "extreme", "news_wins"),
+    (["{name} ({ticker}) beat Q{q} revenue estimates by {beat}%"],
+     "{ticker} screens as meaningfully overvalued on an estimated-intrinsic-value basis, but a confirmed revenue beat is a concrete, current-quarter signal that carries more weight than a longer-horizon valuation estimate - the beat should dominate here, not the valuation gap.",
+     "BULLISH", "overvalued", "extreme", "news_wins"),
+    # --- same principle, analyst rating-change phrasing ---
+    (["Analysts downgraded {ticker} ({name}) to 'Sell', citing slowing {product} demand"],
+     "{ticker} screens as meaningfully undervalued on an estimated-intrinsic-value basis, but a fresh analyst downgrade reflects a specific, current view of deteriorating {product} demand that a static valuation estimate can't capture - the downgrade should dominate here, not the valuation gap.",
+     "BEARISH", "undervalued", "extreme", "news_wins"),
+    (["Analysts upgraded {ticker} ({name}) to 'Buy', citing accelerating {product} demand"],
+     "{ticker} screens as meaningfully overvalued on an estimated-intrinsic-value basis, but a fresh analyst upgrade reflects a specific, current view of improving {product} demand that a static valuation estimate can't capture - the upgrade should dominate here, not the valuation gap.",
+     "BULLISH", "overvalued", "extreme", "news_wins"),
+    # --- same principle, price-move-tied-to-a-demand-catalyst phrasing
+    # (matches how real headlines like "stock pops after earnings" or
+    # "rides winning streak to an X% gain" actually read) ---
+    (["{name} ({ticker}) shares fell {drop}% after {product} demand came in well below expectations"],
+     "{ticker} screens as meaningfully undervalued on an estimated-intrinsic-value basis, but a sharp move tied to a concrete demand shortfall is a more reliable near-term signal than a longer-horizon valuation estimate - the demand shortfall should dominate here, not the valuation gap.",
+     "BEARISH", "undervalued", "extreme", "news_wins"),
+    (["{name} ({ticker}) shares rallied {rally}% after {product} demand blew past expectations"],
+     "{ticker} screens as meaningfully overvalued on an estimated-intrinsic-value basis, but a sharp move tied to a concrete demand beat is a more reliable near-term signal than a longer-horizon valuation estimate - the demand beat should dominate here, not the valuation gap.",
      "BULLISH", "overvalued", "extreme", "news_wins"),
 ]
 
