@@ -27,7 +27,7 @@ version and risk a stale or mistyped one silently no-op-ing.
 
 Replaces TWO distinct string shapes, both needed to keep every reference
 in sync:
-1. `MODEL_VERSION_DEFAULT = "v12"` - the actual runtime default each
+1. `MODEL_VERSION_DEFAULT = "v13"` - the actual runtime default each
    script falls back to when no "MODEL_VERSION" Colab/Kaggle Secret
    override is set (see README's "Required Colab Secrets" - this default
    is what every session actually uses unless someone deliberately

@@ -358,7 +358,7 @@ stopping fires.
 from google.colab import userdata
 HF_TOKEN = userdata.get("HF_TOKEN")
 HF_USER = userdata.get("HF_USER")
-MODEL_VERSION_DEFAULT = "v12"  # bumped by bump_model_version.py
+MODEL_VERSION_DEFAULT = "v13"  # bumped by bump_model_version.py
 MODEL_VERSION = userdata.get("MODEL_VERSION") or MODEL_VERSION_DEFAULT  # optional Secret override, see README
 HF_REPO = f"{HF_USER}/{MODEL_CHOICE}-financial-reasoner-{MODEL_VERSION}"
 

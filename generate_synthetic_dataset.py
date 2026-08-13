@@ -161,6 +161,13 @@ COMPANIES = [
     ("SBUX", "Starbucks Corp.", "retail", (8.5, 9.5)),
     ("COIN", "Coinbase Global", "crypto", (0.6, 1.8)),
     ("PLTR", "Palantir Technologies", "software", (0.5, 0.75)),
+    # XOM/PEP were already in CURATED_SCENARIOS below (that comment claimed
+    # they were "in COMPANIES above" - they weren't, a stale/wrong claim,
+    # not just missing data). Meant zero synthetic training exposure for
+    # either ticker while XOM specifically dominated real-eval misses
+    # throughout this project's debugging history. Added for real now.
+    ("XOM", "Exxon Mobil Corp.", "energy", (80.0, 115.0)),
+    ("PEP", "PepsiCo Inc.", "consumer-staples", (20.0, 25.0)),
 ]
 
 # Invented tickers so the model can't fall back on per-ticker priors learned
@@ -203,6 +210,7 @@ SECTOR_MAP = {
     "energy": "Energy",
     "industrials": "Industrials",
     "aerospace": "Industrials",
+    "consumer-staples": "Consumer Defensive",
 }
 
 # Per-ticker plausible price bands ($) - the single anchor each company's
@@ -218,6 +226,7 @@ PRICE_RANGES = {
     "CRM": (230.0, 330.0), "BA": (150.0, 220.0), "PYPL": (55.0, 90.0),
     "SHOP": (60.0, 100.0), "UBER": (60.0, 95.0), "SBUX": (75.0, 110.0),
     "COIN": (150.0, 280.0), "PLTR": (25.0, 45.0),
+    "XOM": (100.0, 160.0), "PEP": (150.0, 185.0),
     "ZVEX": (15.0, 40.0), "QRNL": (5.0, 20.0), "FLTX": (20.0, 45.0),
     "NMBS": (10.0, 30.0), "VLTR": (25.0, 60.0), "HRZN": (15.0, 35.0),
 }
@@ -604,8 +613,12 @@ def random_recent_date(days_back_max=6):
     return f"{WEEKDAYS[d.weekday()]}, {d.day:02d} {MONTHS[d.month - 1]} {d.year}"
 
 
-def format_headline(text, publisher=None):
-    date = random_recent_date()
+STALE_HEADLINE_DAYS_BACK_MAX = 60
+STALE_HEADLINE_PROB = 0.25
+
+
+def format_headline(text, publisher=None, stale=False):
+    date = random_recent_date(days_back_max=STALE_HEADLINE_DAYS_BACK_MAX if stale else 6)
     publisher = publisher or random.choice(PUBLISHERS)
     return f"- [{date}] {text} - {publisher}"
 
@@ -799,7 +812,8 @@ MIXED_SIGNAL_SCENARIOS = [
      "BULLISH"),
     (["{name} ({ticker}) issued a recall affecting {units}k {product} units",
       "The recall follows a quarter of record {product} sales, reported just last week"],
-     "A recall's safety and legal risk outweighs the prior quarter's already-priced-in sales record."),
+     "A recall's safety and legal risk outweighs the prior quarter's already-priced-in sales record.",
+     "BEARISH"),
     (["{name} ({ticker}) disclosed a regulatory fine related to {product} practices",
       "{name} ({ticker}) also raised its full-year guidance, citing broad-based demand strength"],
      "A one-time fine is a sunk cost that doesn't change the forward outlook; the guidance raise, grounded in broad-based demand strength, is what should actually move the stock - bullish, tempered by the fine's reputational overhang.",
@@ -832,12 +846,35 @@ MIXED_SIGNAL_SCENARIOS = [
       "{name} ({ticker}) raised full-year guidance, citing accelerating {product} momentum"],
      "In-line current results don't cancel out a genuine guidance raise - forward-looking guidance is what should actually be priced in here - bullish.",
      "BULLISH"),
+    # --- two more orderly-CEO-transition pairings, different accompanying
+    # signal each time (one more bullish-paired, one bearish) - a single
+    # example of "orderly transition doesn't move the needle, the other
+    # signal does" wasn't enough repetition: confirmed live across multiple
+    # eval runs, the model kept defaulting to BEARISH/NEUTRAL on this exact
+    # pattern regardless of what the paired signal actually said, most
+    # likely because a CEO departure reads negative by default from
+    # pretraining alone and one counter-example can't overcome that prior.
+    # Varying which direction the OTHER signal points (not always bullish)
+    # is deliberate - the lesson is "the transition itself is near-neutral,
+    # weigh the real signal," not "CEO transition secretly means bullish."
+    (["{name} ({ticker}) raised its full-year guidance, citing accelerating {product} demand",
+      "{name} ({ticker}) separately announced its CEO will step down at year-end as part of a planned transition"],
+     "A guidance raise is a concrete, forward-looking signal from management itself; an orderly, pre-planned leadership transition doesn't offset that - bullish, tempered only by the normal uncertainty a CEO change introduces.",
+     "BULLISH"),
+    (["{name} ({ticker}) missed Q{q} revenue estimates by {beat}%",
+      "{name} ({ticker}) separately announced its CEO will step down at year-end as part of a planned transition"],
+     "A revenue miss is the harder, more decision-relevant data point here; an orderly, pre-planned leadership transition doesn't make a miss any less real - bearish, tempered only by the normal uncertainty a CEO change introduces.",
+     "BEARISH"),
 ]
-# Backfill a uniform 4-tuple shape (some entries above omit the explicit
-# resolved_direction when it's unambiguous from the reasoning text itself).
-MIXED_SIGNAL_SCENARIOS = [
-    s if len(s) == 3 else (s[0], s[1], "BEARISH") for s in MIXED_SIGNAL_SCENARIOS
-]
+# Every entry above is now a required 3-tuple (headline_templates,
+# reasoning_template, direction) - used to silently default a missing
+# direction to "BEARISH" for entries that omitted it. Harmless by luck (the
+# one entry that relied on it did want BEARISH) but a real risk: a future
+# entry wanting BULLISH that forgot the third element would've been
+# silently mislabeled instead of erroring. assert here instead, so a
+# missing direction fails loudly at import time.
+assert all(len(s) == 3 for s in MIXED_SIGNAL_SCENARIOS), \
+    "MIXED_SIGNAL_SCENARIOS entries must all be explicit 3-tuples (headline_templates, reasoning_template, direction)"
 
 # Teaches the model to actually weigh the Valuation block, which - before
 # this category existed - was rendered every example (ported scenario-DCF
@@ -1010,7 +1047,17 @@ def make_fields(company):
 
 
 def build_news_block(primary_headlines):
-    lines = [format_headline(h) for h in primary_headlines]
+    # Every headline used to render within 6 days of the fixed anchor date -
+    # real data doesn't look like that (generate_real_dataset.py pulls from
+    # a multi-week lookback window, and real eval rows routinely show the
+    # actual signal-bearing headline dated weeks or months back while
+    # background macro noise stays fresh). Give the PRIMARY (signal)
+    # headline a chance to render as older too, so the model sees that
+    # pattern in training instead of only ever "everything is this week."
+    # Noise headlines deliberately stay recent-only - they're generic
+    # macro news, which genuinely doesn't accumulate the same way a
+    # specific, dated company catalyst does.
+    lines = [format_headline(h, stale=random.random() < STALE_HEADLINE_PROB) for h in primary_headlines]
     n_noise = random.randint(1, 3)
     for noise in random.sample(NOISE_HEADLINES, n_noise):
         lines.append(format_headline(noise))
@@ -1238,6 +1285,16 @@ def render_earnings(fnd, direction):
 def make_example(company, category):
     ticker = company[0]
     valuation_signal = None  # set below only for category == "VALUATION_SIGNAL"
+    # render_earnings(fnd, direction) renders a beat/miss matching whatever
+    # direction is passed - fine for every category except VALUATION_SIGNAL's
+    # "_alone"/"_reinforced" tiers, whose headlines explicitly claim no fresh
+    # news ("no other updates," "no notable updates"). Confirmed live: those
+    # rows were getting a real, unmentioned earnings beat/miss that silently
+    # contradicts the headline's own "nothing happened" claim - a second
+    # channel telling the model "there IS a catalyst here" exactly where
+    # NEUTRAL_VALUATION_GAP_RANGE (above) is teaching the opposite. Only
+    # "_wins" describes an actual catalyst worth reflecting in earnings.
+    earnings_direction = None  # None => use `direction`; set explicitly to override
 
     if category == "MIXED":
         idx = random.randrange(len(MIXED_SIGNAL_SCENARIOS))
@@ -1257,6 +1314,8 @@ def make_example(company, category):
         valuation_signal = (valuation_verdict, gap_tier)
         is_holdout_template = idx in VALUATION_SIGNAL_HOLDOUT_IDX
         conf_low, conf_high = CONFIDENCE_RANGES["VALUATION_SIGNAL"][confidence_tier]
+        if confidence_tier != "news_wins":
+            earnings_direction = "NEUTRAL"  # no real catalyst - keep earnings "in line", see comment above
     else:
         scenarios = {"BULLISH": BULLISH_SCENARIOS, "BEARISH": BEARISH_SCENARIOS}[category]
         holdout_idx = {"BULLISH": BULLISH_HOLDOUT_IDX, "BEARISH": BEARISH_HOLDOUT_IDX}[category]
@@ -1299,7 +1358,7 @@ def make_example(company, category):
             valuation_text = valuation_block_with_gap(fnd["price"], gap_pct, verdict)
     else:
         valuation_text = render_valuation(fnd, ticker)
-    earnings_text = render_earnings(fnd, direction)
+    earnings_text = render_earnings(fnd, earnings_direction or direction)
 
     answer = ANSWER_TEMPLATES[qtype][direction].format(ticker=ticker)
 
