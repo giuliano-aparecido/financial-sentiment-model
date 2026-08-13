@@ -848,36 +848,27 @@ MIXED_SIGNAL_SCENARIOS = [
 # it. A model can't learn to use a signal that's pure noise relative to the
 # label in 100% of its training data - this is the fix.
 #
-# Deliberately NOT "big valuation gap always wins" - MIXED_SIGNAL_SCENARIOS
-# exists because signal-weighing, not blind rule-following, is the actual
-# skill; this category applies the same principle to valuation specifically,
-# including entries where a concrete near-term news catalyst overrides an
-# extreme valuation gap (see the "_wins" tier entries below). That
-# distinction matters here more than for headline-vs-headline conflicts:
-# this project has direct, first-hand evidence (see financial-sentiment-api
-# PR "fix: revenue-basis valuation reused earnings-grade exit multiples")
-# that the DCF model itself can be badly wrong, so teaching "trust a big
-# gap unconditionally" would be trading one bug for another. Every "_alone"/
-# "_reinforced" entry's reasoning explicitly names that uncertainty rather
-# than treating the valuation read as ground truth.
-#
-# "_wins" tier deliberately spans multiple concrete-catalyst phrasings
-# (guidance change, earnings beat/miss, analyst rating change, a price move
-# tied to a demand catalyst), not just guidance cut/raise - a v9 eval
-# (real-val accuracy 36%, barely above the 33% chance baseline) showed the
-# fine-tuned model overriding plainly bullish/bearish real headlines
-# ("Coca-Cola stock pops after earnings," "ExxonMobil rides 6-day winning
-# streak," "JPMorgan's historic Q2 profit") toward whatever the valuation
-# gap implied instead, with reasoning that explicitly deferred to valuation
-# over a catalyst just as concrete as guidance cut/raise. Narrow phrasing
-# coverage in "_wins" is the likely cause: the model had no training
-# example of "beat earnings" or "stock pops" as a catalyst strong enough to
-# beat valuation, only guidance changes, so it may not have generalized the
-# lesson to other equally-concrete catalyst phrasings. "_wins" is now 8
-# templates against "_alone"/"_reinforced"'s combined 6, a deliberate
-# slight majority rather than the prior 2-of-8 minority, given how
-# consistently the v9 eval failures leaned toward valuation over a clear
-# catalyst.
+# "_alone" (valuation is the only signal, no news at all) and "_reinforced"
+# (valuation + a soft same-direction headline) briefly got removed after a
+# v11 eval showed real-val NEUTRAL collapsing to ~10% correct, with
+# reasoning matching "_alone"'s phrasing verbatim even on trivial (2%)
+# valuation gaps. Root cause turned out narrower than "remove the lesson
+# entirely": "_alone"'s headlines ("held a routine analyst call with no
+# notable updates," "reiterated prior guidance with no other updates") are
+# near-duplicates of NEUTRAL_SCENARIOS' own "routine, no material news"
+# headlines - and NEUTRAL_SCENARIOS used a fully random (uncorrelated)
+# valuation draw, same as every other non-VALUATION_SIGNAL category, so it
+# could ALSO show a large gap purely by chance. Same surface shape (routine
+# headline + some gap) trained to opposite conclusions depending on which
+# category happened to roll it. Real fix (see NEUTRAL_SCENARIOS' own
+# valuation-rendering below): pin NEUTRAL's gap to a small, genuinely
+# insignificant range instead of letting it collide with "_alone"'s extreme
+# range - so gap SIZE, not headline wording, is what actually distinguishes
+# "ignore this" from "this is a real signal," which is what should have
+# been distinguishing them all along. That keeps the lesson an extreme
+# valuation gap with neutral-to-mild news should still lean toward the
+# valuation's direction, not fall back to NEUTRAL just because there's no
+# news catalyst - while a small/routine gap correctly stays NEUTRAL.
 #
 # Each entry: (headline_templates, reasoning_template, direction,
 # valuation_verdict, gap_tier, confidence_tier). valuation_verdict/gap_tier
@@ -944,6 +935,13 @@ VALUATION_SIGNAL_SCENARIOS = [
 ]
 
 VALUATION_GAP_RANGES = {"extreme": (70.0, 95.0), "moderate": (15.0, 35.0)}
+# NEUTRAL_SCENARIOS' own valuation gap is pinned to this range (see
+# make_example's NEUTRAL branch) instead of the fully random draw every
+# other non-VALUATION_SIGNAL category gets - genuinely insignificant, so it
+# can never collide with VALUATION_SIGNAL_SCENARIOS' "extreme"/"moderate"
+# ranges above by chance. See VALUATION_SIGNAL_SCENARIOS' own comment for
+# why this matters.
+NEUTRAL_VALUATION_GAP_RANGE = (0.0, 8.0)
 
 # BULLISH/BEARISH now nested by tier - "subtle" gets a lower range than
 # "clear" (a softer signal genuinely warrants less certainty) but still well
@@ -1282,6 +1280,23 @@ def make_example(company, category):
         gap_low, gap_high = VALUATION_GAP_RANGES[gap_tier]
         gap_pct = round(random.uniform(gap_low, gap_high), 1)
         valuation_text = valuation_block_with_gap(fnd["price"], gap_pct, verdict)
+    elif category == "NEUTRAL":
+        # Pinned to a small, genuinely insignificant gap instead of the
+        # fully random draw every other category gets - see
+        # VALUATION_SIGNAL_SCENARIOS' own comment and
+        # NEUTRAL_VALUATION_GAP_RANGE for why: a random draw could
+        # occasionally produce a large gap by chance, teaching "routine
+        # headline + large gap = NEUTRAL" in direct conflict with
+        # VALUATION_SIGNAL_SCENARIOS' "_alone"/"_reinforced" tiers, which
+        # teach the same input shape should lean toward the valuation's
+        # direction once the gap is actually large.
+        if random.random() < DATA_UNAVAILABLE_PROB:
+            valuation_text = "Data unavailable."
+        else:
+            verdict = random.choice(["undervalued", "overvalued"])
+            gap_low, gap_high = NEUTRAL_VALUATION_GAP_RANGE
+            gap_pct = round(random.uniform(gap_low, gap_high), 1)
+            valuation_text = valuation_block_with_gap(fnd["price"], gap_pct, verdict)
     else:
         valuation_text = render_valuation(fnd, ticker)
     earnings_text = render_earnings(fnd, direction)
