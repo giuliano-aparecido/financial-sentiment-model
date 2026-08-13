@@ -1617,13 +1617,32 @@ def make_example(company, category):
     }
 
 
+# VALUATION_SIGNAL and NEUTRAL both construct a valuation gap via
+# valuation_block_with_gap - a deliberately FABRICATED intrinsic value
+# backward-solved from a target gap percentage, not run through the real
+# DCF. Reported live: an AAPL row (a CURATED_SCENARIOS ticker, real
+# analyst-verified intrinsic value ~$124.65) showed a fabricated "$108.91,
+# overvalued ~67%" that has nothing to do with AAPL's actual curated
+# value - correct as an isolated teaching example, but wrong as a claim
+# about AAPL specifically. A curated ticker has a real, known answer;
+# fabricating a different one for it is a factual error, not a design
+# tradeoff - unlike a non-curated company, whose valuation is synthetic/
+# derived by construction either way, so no real value exists to
+# contradict. Excluded from the pool used for these two categories only -
+# still fully available for BULLISH/BEARISH/MIXED, which run the real
+# DCF (render_valuation) and correctly use CURATED_SCENARIOS there.
+GAP_CONSTRUCTED_CATEGORIES = {"VALUATION_SIGNAL", "NEUTRAL"}
+NON_CURATED_COMPANIES = [c for c in ALL_COMPANIES if c[0] not in CURATED_SCENARIOS]
+
+
 def generate(n=NUM_EXAMPLES):
     examples = []
     categories = list(SENTIMENT_WEIGHTS.keys())
     weights = list(SENTIMENT_WEIGHTS.values())
     for _ in range(n):
         category = random.choices(categories, weights=weights)[0]
-        company = random.choice(ALL_COMPANIES)
+        pool = NON_CURATED_COMPANIES if category in GAP_CONSTRUCTED_CATEGORIES else ALL_COMPANIES
+        company = random.choice(pool)
         examples.append(make_example(company, category))
     return examples
 
