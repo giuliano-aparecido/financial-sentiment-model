@@ -1342,7 +1342,7 @@ def render_valuation(fnd, ticker=None):
     return valuation_block(fnd["price"], intrinsic, basis)
 
 
-def valuation_block_with_gap(price, gap_pct, verdict):
+def valuation_block_with_gap(fnd, gap_pct, verdict):
     """Builds a Valuation block with a SPECIFIC, controlled over/undervalued
     percentage - used only by VALUATION_SIGNAL_SCENARIOS (see that list's
     own comment), which needs a deliberately clean, specific gap to teach a
@@ -1350,11 +1350,25 @@ def valuation_block_with_gap(price, gap_pct, verdict):
     full random-draw pipeline happens to produce. Still renders through the
     same valuation_block() formatter as every other row, so the shape
     (basis label, wording) is identical - only these rows' underlying
-    numbers are directly constructed instead of DCF-derived. `basis` is
-    randomly chosen per call purely for label variety across training
-    examples; VALUATION_SIGNAL_SCENARIOS' lesson is about the gap, not
-    about which basis produced it."""
-    basis = random.choice(list(BASIS_LABELS))
+    numbers are directly constructed instead of DCF-derived.
+
+    `basis` used to be `random.choice(list(BASIS_LABELS))` - reported live:
+    that put AAPL (Technology, not asset-heavy) at "Intrinsic Value
+    (FCF-based)", a basis classify_valuation_basis would never actually
+    assign it (FCF requires an asset-heavy sector AND positive free cash
+    flow). Uniform-random label variety was papering over an internal
+    inconsistency: production's real classify_valuation_basis is
+    deterministic per company (sector/profitability/payout ratio), so a
+    training row showing a basis that company could never actually get is
+    a fabricated combination the model has no business learning from. Now
+    classified the same way every other category's valuation gets
+    classified - basis varies across ROWS (different companies, different
+    classifications) rather than being randomized WITHIN a single row
+    independent of the company it's describing."""
+    basis = classify_valuation_basis(
+        fnd["eps_trailing"], fnd["payout_ratio"], fnd["sector"], fnd["free_cash_flow"],
+    )
+    price = fnd["price"]
     if verdict == "overvalued":
         intrinsic = price / (1 + gap_pct / 100)
     else:
@@ -1476,7 +1490,7 @@ def make_example(company, category):
         verdict, gap_tier = valuation_signal
         gap_low, gap_high = VALUATION_GAP_RANGES[gap_tier]
         gap_pct = round(random.uniform(gap_low, gap_high), 1)
-        valuation_text = valuation_block_with_gap(fnd["price"], gap_pct, verdict)
+        valuation_text = valuation_block_with_gap(fnd, gap_pct, verdict)
     elif category == "NEUTRAL":
         # Pinned to a small, genuinely insignificant gap instead of the
         # fully random draw every other category gets - see
@@ -1493,7 +1507,7 @@ def make_example(company, category):
             verdict = random.choice(["undervalued", "overvalued"])
             gap_low, gap_high = NEUTRAL_VALUATION_GAP_RANGE
             gap_pct = round(random.uniform(gap_low, gap_high), 1)
-            valuation_text = valuation_block_with_gap(fnd["price"], gap_pct, verdict)
+            valuation_text = valuation_block_with_gap(fnd, gap_pct, verdict)
     else:
         valuation_text = render_valuation(fnd, ticker)
     earnings_text = render_earnings(fnd, earnings_direction or direction)
