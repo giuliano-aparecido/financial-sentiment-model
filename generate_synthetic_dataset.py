@@ -299,6 +299,13 @@ SCENARIO_PROBABILITY = 1 / 3
 # tickers get the exact same scenario assumptions production would use for
 # them, instead of the generic/derived fallback every other ticker gets.
 CURATED_SCENARIOS = {
+    "AAPL": {
+        # Confirmed live: reproduces the analyst's own $128 target within
+        # 2.6% ($124.65 at trailing EPS $8.26, the analyst's own cf0).
+        "normal": {"g1": 0.07, "g2": 0.07, "exit_multiple": 20.0},
+        "best": {"g1": 0.12, "g2": 0.07, "exit_multiple": 25.0},
+        "worst": {"g1": 0.05, "g2": 0.05, "exit_multiple": 10.0},
+    },
     "NVDA": {
         "normal": {"g1": 0.30, "g2": 0.10, "exit_multiple": 20.0},
         "best": {"g1": 0.30, "g2": 0.15, "exit_multiple": 25.0},
@@ -352,6 +359,33 @@ G1_FALLBACK = {"normal": 0.08, "best": 0.10, "worst": 0.04}
 # above NVDA's own curated "best" g1 (0.30), CURATED_SCENARIOS tickers
 # bypass this entirely.
 G1_CAP = 0.40
+
+# Sustainable growth rate (ROE x retention ratio) as a middle tier in g1's
+# derivation - ported from valuation.py's _sustainable_growth_rate/
+# SUSTAINABLE_GROWTH_*_SPREAD after being asked directly what a non-flat
+# g1 default should be based on. See that module's own comment for the
+# full rationale, in short: NOT P/E (circular - P/E already prices in the
+# market's growth expectations, so deriving a DCF growth input from it and
+# valuing the company with that input concludes "fairly valued" almost by
+# construction). ROE x retention only uses the company's own profitability
+# and reinvestment behavior - already-generated fnd fields (eps_trailing,
+# book_value_per_share, payout_ratio), no new dependency.
+SUSTAINABLE_GROWTH_BEST_SPREAD = 0.02
+SUSTAINABLE_GROWTH_WORST_SPREAD = -0.04
+
+
+def _sustainable_growth_rate(fnd):
+    """ROE x (1 - payout_ratio). None (not a fetch failure) when
+    eps_trailing/book_value_per_share aren't usable - caller falls back to
+    G1_FALLBACK. Missing payout_ratio defaults to 0 (full reinvestment,
+    correct for a non-dividend-payer), not treated as unusable."""
+    eps_trailing = fnd.get("eps_trailing")
+    book_value_per_share = fnd.get("book_value_per_share")
+    if not eps_trailing or eps_trailing <= 0 or not book_value_per_share or book_value_per_share <= 0:
+        return None
+    roe = eps_trailing / book_value_per_share
+    payout_ratio = fnd.get("payout_ratio") or 0.0
+    return roe * (1 - payout_ratio)
 
 
 def classify_valuation_basis(eps_trailing, payout_ratio, sector, free_cash_flow):
@@ -407,6 +441,15 @@ def build_scenarios(ticker, fnd, basis):
         }
 
     g1_values = dict(G1_FALLBACK)
+
+    sustainable_g1 = _sustainable_growth_rate(fnd)
+    if sustainable_g1 is not None:
+        g1_values = {
+            "normal": sustainable_g1,
+            "best": sustainable_g1 + SUSTAINABLE_GROWTH_BEST_SPREAD,
+            "worst": sustainable_g1 + SUSTAINABLE_GROWTH_WORST_SPREAD,
+        }
+
     growth_0y = fnd.get("growth_0y")
     growth_1y = fnd.get("growth_1y")
     consensus_reliable = growth_0y is not None and growth_1y is not None and (growth_0y >= 0) == (growth_1y >= 0)
