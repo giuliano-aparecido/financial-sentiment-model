@@ -132,10 +132,20 @@ VAL_HOLDOUT_TEMPLATE_INDEX_FRACTION = 0.2                       # ~20% of each
                                                                   # category's templates
                                                                   # are validation-only
 
-# VALUATION_SIGNAL is new - carved proportionally out of the other four
-# rather than added on top, so NUM_EXAMPLES still yields roughly the same
-# per-category row counts as before for everything else.
-SENTIMENT_WEIGHTS = {"BULLISH": 0.32, "BEARISH": 0.32, "NEUTRAL": 0.20, "MIXED": 0.08, "VALUATION_SIGNAL": 0.08}
+# VALUATION_SIGNAL is now the DOMINANT category by design, not a minority
+# one - explicit product direction: fundamentals (valuation, P/E, earnings
+# quality) should be the model's primary, default driver most of the time,
+# with news as a secondary signal that reinforces or occasionally overrides
+# it, not the other way around. Previously 8%, same as MIXED - too small to
+# be a "usually" for anything. BULLISH/BEARISH (pure news-driven, no
+# valuation influence on the resolved label) roughly halved to make room -
+# still large enough to keep "sometimes a concrete company event is the
+# whole story" a real, well-represented lesson, just no longer the default.
+# NEUTRAL/MIXED left untouched: NEUTRAL's weight is deliberately protected
+# (see NEUTRAL_VALUATION_GAP_RANGE's own history - it was the direct victim
+# of an earlier synthetic-data collision, not something to risk starving
+# again), and MIXED's signal-weighing lesson is orthogonal to this change.
+SENTIMENT_WEIGHTS = {"BULLISH": 0.16, "BEARISH": 0.16, "NEUTRAL": 0.20, "MIXED": 0.08, "VALUATION_SIGNAL": 0.40}
 
 # ---------------------------------------------------------------------------
 # Companies - (ticker, name, sector, (quarterly revenue low, high in $B))
@@ -971,6 +981,81 @@ VALUATION_SIGNAL_SCENARIOS = [
      "BULLISH", "overvalued", "extreme", "news_wins"),
 ]
 
+# Sector-wide macro/geopolitical developments whose fundamental linkage to
+# companies in that sector is direct and well-established - a REAL change
+# to the business's own economics (revenue per unit sold, margin, funding
+# cost, addressable market), not just market sentiment about the sector.
+# Explicit product direction: news should reinforce the valuation-led
+# default most strongly when it's this kind of concrete economic linkage,
+# not a generic "institutional buying ticked up"-style soft signal (see
+# "_reinforced" tier above, which stays for that weaker case). Picked at
+# generation time based on the actual company's own informal sector (see
+# make_example), not a static template - a "moderate" gap tier isn't used
+# here on purpose: a sector-wide economic shift paired with an already-
+# large valuation gap is meant to be the single most confident case in this
+# category, short of a concrete company-specific catalyst ("_wins" tier).
+# Only 7 of ~20 informal sectors are covered - covers two of the four
+# held-out tickers (BA -> aerospace, HRZN -> industrials) so this pattern
+# actually gets held-out eval coverage, not just training exposure.
+#
+# Each value: (bullish_headline, bearish_headline, linkage_phrase).
+# linkage_phrase fills SECTOR_REINFORCED_REASONING's own {linkage} slot -
+# names the specific economic channel, not just "this sector is affected."
+SECTOR_MACRO_HEADLINES = {
+    "energy": (
+        "Crude oil prices surge amid escalating Middle East tensions and supply disruption fears",
+        "Oil prices plunge as OPEC+ unexpectedly raises production quotas",
+        "the price of the commodity {ticker} sells directly sets its revenue per barrel",
+    ),
+    "semiconductors": (
+        "Global chip shortage intensifies, driving up prices and demand across the semiconductor industry",
+        "New export restrictions on advanced semiconductor technology threaten industry-wide international revenue",
+        "industry-wide pricing power and addressable market directly set {ticker}'s own revenue opportunity",
+    ),
+    "banking": (
+        "The Federal Reserve signals it will hold interest rates higher for longer, boosting bank net interest margins",
+        "A deepening yield curve inversion raises funding costs and default risk across the lending sector",
+        "the rate environment directly sets the net interest margin {ticker}'s lending business earns",
+    ),
+    "consumer-staples": (
+        "Consumer staples demand proves resilient as shoppers trade down during economic uncertainty",
+        "Persistent input cost inflation continues to squeeze margins across the consumer staples sector",
+        "sector-wide demand and input costs directly set {ticker}'s own volume and margin trajectory",
+    ),
+    "crypto": (
+        "Regulators signal a friendlier stance toward digital assets, lifting sentiment and volumes across the crypto sector",
+        "Regulators announce a sweeping crackdown on digital asset exchanges, roiling the crypto sector",
+        "sector-wide regulatory treatment directly sets the addressable market {ticker} can operate in",
+    ),
+    "aerospace": (
+        "Escalating geopolitical tensions drive a sustained increase in global defense spending",
+        "The aerospace and defense industry faces sector-wide program cost overruns and delivery delays",
+        "defense budgets and program execution directly set the order book {ticker} draws revenue from",
+    ),
+    "industrials": (
+        "A new infrastructure spending package signals sustained demand for industrial materials and equipment",
+        "Manufacturing activity contracts for a third straight month, signaling weakening industrial demand",
+        "sector-wide demand directly sets the order volume {ticker}'s own business depends on",
+    ),
+}
+
+SECTOR_REINFORCED_REASONING = (
+    "{ticker} already looks meaningfully {verdict} against its estimated intrinsic value, and this "
+    "sector-wide development is a real reinforcement rather than generic sentiment - {linkage} - so it "
+    "carries more weight than a same-direction signal without a clear fundamental channel, though still "
+    "tempered by the underlying uncertainty in any valuation estimate."
+)
+
+# Higher than generic "_reinforced" (0.68-0.80) - a direct economic linkage
+# is a stronger reinforcement than a soft, indirect signal like an uptick
+# in institutional buying, but still below "news_wins" (a concrete,
+# company-specific catalyst is stronger evidence than a sector-wide one).
+SECTOR_REINFORCED_CONFIDENCE = (0.75, 0.88)
+# Fraction of VALUATION_SIGNAL rows that use this path INSTEAD of the
+# static VALUATION_SIGNAL_SCENARIOS list, when the company's sector is
+# covered above (falls through to the static list otherwise).
+SECTOR_REINFORCED_PROB = 0.40
+
 VALUATION_GAP_RANGES = {"extreme": (70.0, 95.0), "moderate": (15.0, 35.0)}
 # NEUTRAL_SCENARIOS' own valuation gap is pinned to this range (see
 # make_example's NEUTRAL branch) instead of the fully random draw every
@@ -1308,14 +1393,40 @@ def make_example(company, category):
         is_holdout_template = idx in NEUTRAL_HOLDOUT_IDX
         conf_low, conf_high = CONFIDENCE_RANGES["NEUTRAL"]["clear"]
     elif category == "VALUATION_SIGNAL":
-        idx = random.randrange(len(VALUATION_SIGNAL_SCENARIOS))
-        (headline_templates, reasoning_template, direction,
-         valuation_verdict, gap_tier, confidence_tier) = VALUATION_SIGNAL_SCENARIOS[idx]
-        valuation_signal = (valuation_verdict, gap_tier)
-        is_holdout_template = idx in VALUATION_SIGNAL_HOLDOUT_IDX
-        conf_low, conf_high = CONFIDENCE_RANGES["VALUATION_SIGNAL"][confidence_tier]
-        if confidence_tier != "news_wins":
-            earnings_direction = "NEUTRAL"  # no real catalyst - keep earnings "in line", see comment above
+        sector_key = company[2]  # informal sector label, e.g. "energy"
+        use_sector_reinforced = (
+            sector_key in SECTOR_MACRO_HEADLINES and random.random() < SECTOR_REINFORCED_PROB
+        )
+        if use_sector_reinforced:
+            verdict = random.choice(["undervalued", "overvalued"])
+            direction = "BULLISH" if verdict == "undervalued" else "BEARISH"
+            bullish_headline, bearish_headline, linkage = SECTOR_MACRO_HEADLINES[sector_key]
+            headline_templates = [bullish_headline if direction == "BULLISH" else bearish_headline]
+            # {ticker} is passed through literally (both the outer slot and
+            # the one embedded in `linkage`) so the shared
+            # reasoning_template.format(**fields) call below resolves it
+            # together with every other template in this function - only
+            # `verdict`/`linkage` are real values to fill now.
+            reasoning_template = SECTOR_REINFORCED_REASONING.format(
+                ticker="{ticker}", verdict=verdict, linkage=linkage,
+            )
+            valuation_signal = (verdict, "extreme")
+            # Procedurally generated (keyed off the company's sector, not a
+            # fixed template index) - held-out coverage instead comes from
+            # the sector list itself including aerospace/industrials (BA/
+            # HRZN, both holdout tickers - see SECTOR_MACRO_HEADLINES).
+            is_holdout_template = False
+            conf_low, conf_high = SECTOR_REINFORCED_CONFIDENCE
+            earnings_direction = "NEUTRAL"  # forward-looking macro shift, not a reported quarter - see comment above
+        else:
+            idx = random.randrange(len(VALUATION_SIGNAL_SCENARIOS))
+            (headline_templates, reasoning_template, direction,
+             valuation_verdict, gap_tier, confidence_tier) = VALUATION_SIGNAL_SCENARIOS[idx]
+            valuation_signal = (valuation_verdict, gap_tier)
+            is_holdout_template = idx in VALUATION_SIGNAL_HOLDOUT_IDX
+            conf_low, conf_high = CONFIDENCE_RANGES["VALUATION_SIGNAL"][confidence_tier]
+            if confidence_tier != "news_wins":
+                earnings_direction = "NEUTRAL"  # no real catalyst - keep earnings "in line", see comment above
     else:
         scenarios = {"BULLISH": BULLISH_SCENARIOS, "BEARISH": BEARISH_SCENARIOS}[category]
         holdout_idx = {"BULLISH": BULLISH_HOLDOUT_IDX, "BEARISH": BEARISH_HOLDOUT_IDX}[category]
