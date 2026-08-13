@@ -1083,7 +1083,19 @@ SECTOR_REINFORCED_CONFIDENCE = (0.75, 0.88)
 # covered above (falls through to the static list otherwise).
 SECTOR_REINFORCED_PROB = 0.40
 
-VALUATION_GAP_RANGES = {"extreme": (70.0, 95.0), "moderate": (15.0, 35.0)}
+# Reported live (twice): a controlled gap this large is implausible for
+# real companies, especially the large, liquid, heavily-covered names in
+# COMPANIES (AAPL at "92% overvalued" was the specific example) - genuinely
+# mispriced blue-chips rarely show more than roughly 40-60% DCF-implied
+# gaps even in real crisis-level events, and this dataset applies the SAME
+# range regardless of which company gets picked. Capping the display at
+# VALUATION_PCT_DISPLAY_CAP (150%) was a different fix (bounds the
+# uncapped random-DCF pipeline's occasional blowup) and didn't address
+# this - a controlled, INTENTIONAL 70-95% gap is well under that cap, so
+# it was never touched by it. Tightened both tiers down; still clearly
+# differentiated and large enough to teach "this is a real, decisive
+# signal," just no longer cartoonish for a company like AAPL.
+VALUATION_GAP_RANGES = {"extreme": (40.0, 70.0), "moderate": (12.0, 25.0)}
 # NEUTRAL_SCENARIOS' own valuation gap is pinned to this range (see
 # make_example's NEUTRAL branch) instead of the fully random draw every
 # other non-VALUATION_SIGNAL category gets - genuinely insignificant, so it
