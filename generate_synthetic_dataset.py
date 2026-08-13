@@ -1002,10 +1002,22 @@ VALUATION_SIGNAL_SCENARIOS = [
 # linkage_phrase fills SECTOR_REINFORCED_REASONING's own {linkage} slot -
 # names the specific economic channel, not just "this sector is affected."
 SECTOR_MACRO_HEADLINES = {
+    # Deliberately NOT "oil price up = bullish, oil price down = bearish" -
+    # that's momentum-following, the opposite of the value-investing
+    # principle this whole category exists to teach. Oil is a cyclical
+    # commodity: a LOW price (~$60/bbl or below) is historically closer to
+    # the trough where value investors buy energy names, not a reason to
+    # be bearish - and a HIGH price is closer to a cycle peak, where
+    # trailing earnings (and the P/E/valuation gap computed from them) are
+    # inflated and can look deceptively cheap right before a downturn - a
+    # classic value trap. So: low price + undervalued -> BULLISH (buying
+    # the trough), high price + overvalued -> BEARISH (wary of a peak
+    # that's about to mean-revert), matching how the direction/verdict
+    # pairing already works elsewhere in this dict.
     "energy": (
-        "Crude oil prices surge amid escalating Middle East tensions and supply disruption fears",
-        "Oil prices plunge as OPEC+ unexpectedly raises production quotas",
-        "the price of the commodity {ticker} sells directly sets its revenue per barrel",
+        "Crude oil prices slide to multi-year lows near $55/barrel amid oversupply concerns - historically close to where energy-sector value investors start buying, not where they sell",
+        "Crude oil prices surge to decade highs above $110/barrel amid supply fears - a classic late-cycle peak, when trailing earnings and P/E ratios can look deceptively cheap right before a downturn",
+        "oil is a cyclical commodity, so {ticker}'s current earnings and trailing multiples reflect where in that cycle prices are right now, not the cycle's long-run average",
     ),
     "semiconductors": (
         "Global chip shortage intensifies, driving up prices and demand across the semiconductor industry",
