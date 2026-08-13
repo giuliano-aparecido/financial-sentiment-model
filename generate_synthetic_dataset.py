@@ -333,6 +333,23 @@ CURATED_SCENARIOS = {
     },
 }
 
+# The basis each CURATED_SCENARIOS ticker's assumptions were actually
+# calibrated against - ported from valuation.py's identically-named
+# constant after a confirmed live bug: a ticker's classify_valuation_basis
+# result can legitimately differ call to call (payout_ratio varies), and
+# applying growth assumptions calibrated for one basis's cash flow to a
+# DIFFERENT basis's cash flow produces a number with no relationship to
+# the analyst's actual target, not just a less accurate one. See that
+# module's own comment for the full rationale.
+CURATED_SCENARIOS_BASIS = {
+    "AAPL": "eps",
+    "NVDA": "eps",
+    "MSFT": "eps",
+    "PEP": "dividends",
+    "NFLX": "eps",
+    "XOM": "eps",
+}
+
 WORST_EXIT_MULTIPLE_ASSET_HEAVY = 12.0
 WORST_EXIT_MULTIPLE_DEFAULT = 13.0
 NORMAL_EXIT_MULTIPLE = 20.0
@@ -434,7 +451,7 @@ def cash_flow_basis_value(basis, fnd):
 def build_scenarios(ticker, fnd, basis):
     """Ported from valuation.py's identically-named function - see that
     module for the full rationale behind each piece."""
-    if ticker and ticker in CURATED_SCENARIOS:
+    if ticker and ticker in CURATED_SCENARIOS and CURATED_SCENARIOS_BASIS.get(ticker) == basis:
         return {
             name: {**scenario, "probability": SCENARIO_PROBABILITY}
             for name, scenario in CURATED_SCENARIOS[ticker].items()
