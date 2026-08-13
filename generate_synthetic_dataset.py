@@ -287,6 +287,10 @@ BASIS_LABELS = {
     "dividends": "Dividend-based",
 }
 
+# Backstop cap on the displayed over/undervalued percentage - ported from
+# valuation.py's identically-named constant, see that module's comment.
+VALUATION_PCT_DISPLAY_CAP = 150.0
+
 DISCOUNT_RATE = 0.10
 SCENARIO_PROBABILITY = 1 / 3
 
@@ -340,6 +344,14 @@ REVENUE_BEST_EXIT_MULTIPLE = 6.0
 
 GROWTH_BASIS_G2 = {"normal": 0.10, "best": 0.12, "worst": 0.04}
 G1_FALLBACK = {"normal": 0.08, "best": 0.10, "worst": 0.04}
+# Ceiling on DERIVED g1 (real per-ticker consensus growth, not
+# CURATED_SCENARIOS) - ported from valuation.py's G1_CAP after a confirmed
+# live DCF blowup (this exact formula, run at scale via this generator,
+# showed a 90th-percentile gap of 91%, 99th of 354%, max 760%). See that
+# module's G1_CAP comment for the full rationale - upper bound only, set
+# above NVDA's own curated "best" g1 (0.30), CURATED_SCENARIOS tickers
+# bypass this entirely.
+G1_CAP = 0.40
 
 
 def classify_valuation_basis(eps_trailing, payout_ratio, sector, free_cash_flow):
@@ -406,6 +418,8 @@ def build_scenarios(ticker, fnd, basis):
             g1_values["best"] = growth_0y_high
         if growth_0y_low is not None:
             g1_values["worst"] = growth_0y_low
+
+    g1_values = {name: min(value, G1_CAP) for name, value in g1_values.items()}  # see G1_CAP's comment
 
     g2_values = dict(g1_values) if basis == "dividends" else dict(GROWTH_BASIS_G2)
 
@@ -491,9 +505,10 @@ def valuation_block(price, intrinsic, basis):
 
     pct = (price - intrinsic) / intrinsic * 100
     verdict = "overvalued" if pct >= 0 else "undervalued"
+    displayed_pct = min(abs(pct), VALUATION_PCT_DISPLAY_CAP)  # backstop, see valuation.py's own comment
     return (
         f"Intrinsic Value ({label}): ${intrinsic:.2f}\n"
-        f"vs Current Price: {verdict} by ~{abs(pct):.0f}%"
+        f"vs Current Price: {verdict} by ~{displayed_pct:.0f}%"
     )
 
 PUBLISHERS = [
