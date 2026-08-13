@@ -702,6 +702,7 @@ def fetch_ticker_fundamentals_history(ticker_obj):
         "income": None, "earnings_dates": None, "shares_outstanding": None,
         "sector": None, "payout_ratio": None, "free_cash_flow": None, "dividend_rate": None,
         "growth_0y": None, "growth_1y": None, "growth_0y_low": None, "growth_0y_high": None,
+        "book_value_per_share": None,
     }
     try:
         result["income"] = ticker_obj.quarterly_income_stmt
@@ -718,6 +719,10 @@ def fetch_ticker_fundamentals_history(ticker_obj):
         result["payout_ratio"] = info.get("payoutRatio")
         result["free_cash_flow"] = info.get("freeCashflow")
         result["dividend_rate"] = info.get("dividendRate") or info.get("trailingAnnualDividendRate")
+        # Feeds _sustainable_growth_rate's ROE approximation (eps_trailing /
+        # book_value_per_share) - same yfinance field financial-sentiment-
+        # api's fundamentals.py already fetches for the same purpose.
+        result["book_value_per_share"] = info.get("bookValue")
     except Exception as e:
         print(f"    Warning: shares_outstanding/info fetch failed: {e}", flush=True)
     # Same shape/reasoning as financial-sentiment-api's fundamentals.py
@@ -764,10 +769,21 @@ BASIS_LABELS = {
     "dividends": "Dividend-based",
 }
 
+# Backstop cap on the displayed over/undervalued percentage - ported from
+# valuation.py's identically-named constant, see that module's comment.
+VALUATION_PCT_DISPLAY_CAP = 150.0
+
 DISCOUNT_RATE = 0.10
 SCENARIO_PROBABILITY = 1 / 3
 
 CURATED_SCENARIOS = {
+    "AAPL": {
+        # Confirmed live: reproduces the analyst's own $128 target within
+        # 2.6% ($124.65 at trailing EPS $8.26, the analyst's own cf0).
+        "normal": {"g1": 0.07, "g2": 0.07, "exit_multiple": 20.0},
+        "best": {"g1": 0.12, "g2": 0.07, "exit_multiple": 25.0},
+        "worst": {"g1": 0.05, "g2": 0.05, "exit_multiple": 10.0},
+    },
     "NVDA": {
         "normal": {"g1": 0.30, "g2": 0.10, "exit_multiple": 20.0},
         "best": {"g1": 0.30, "g2": 0.15, "exit_multiple": 25.0},
@@ -795,6 +811,23 @@ CURATED_SCENARIOS = {
     },
 }
 
+# The basis each CURATED_SCENARIOS ticker's assumptions were actually
+# calibrated against - ported from valuation.py's identically-named
+# constant after a confirmed live bug: a ticker's classify_valuation_basis
+# result can legitimately differ call to call (payout_ratio varies), and
+# applying growth assumptions calibrated for one basis's cash flow to a
+# DIFFERENT basis's cash flow produces a number with no relationship to
+# the analyst's actual target, not just a less accurate one. See that
+# module's own comment for the full rationale.
+CURATED_SCENARIOS_BASIS = {
+    "AAPL": "eps",
+    "NVDA": "eps",
+    "MSFT": "eps",
+    "PEP": "dividends",
+    "NFLX": "eps",
+    "XOM": "eps",
+}
+
 WORST_EXIT_MULTIPLE_ASSET_HEAVY = 12.0
 WORST_EXIT_MULTIPLE_DEFAULT = 13.0
 NORMAL_EXIT_MULTIPLE = 20.0
@@ -806,6 +839,36 @@ REVENUE_BEST_EXIT_MULTIPLE = 6.0
 
 GROWTH_BASIS_G2 = {"normal": 0.10, "best": 0.12, "worst": 0.04}
 G1_FALLBACK = {"normal": 0.08, "best": 0.10, "worst": 0.04}
+# Ceiling on DERIVED g1 (real per-ticker consensus growth, not
+# CURATED_SCENARIOS) - ported from valuation.py's G1_CAP after a confirmed
+# live DCF blowup. See that module's G1_CAP comment for the full
+# rationale - upper bound only, set above NVDA's own curated "best" g1
+# (0.30), CURATED_SCENARIOS tickers bypass this entirely.
+G1_CAP = 0.40
+
+# Sustainable growth rate (ROE x retention ratio) as a middle tier in g1's
+# derivation - ported from valuation.py's _sustainable_growth_rate/
+# SUSTAINABLE_GROWTH_*_SPREAD. See that module's own comment for the full
+# rationale: NOT P/E (circular - P/E already prices in the market's growth
+# expectations). ROE x retention only uses the company's own profitability
+# and reinvestment behavior (eps_trailing, book_value_per_share,
+# payout_ratio - already fetched for other purposes, no new dependency).
+SUSTAINABLE_GROWTH_BEST_SPREAD = 0.02
+SUSTAINABLE_GROWTH_WORST_SPREAD = -0.04
+
+
+def _sustainable_growth_rate(fnd):
+    """ROE x (1 - payout_ratio). None (not a fetch failure) when
+    eps_trailing/book_value_per_share aren't usable - caller falls back to
+    G1_FALLBACK. Missing payout_ratio defaults to 0 (full reinvestment,
+    correct for a non-dividend-payer), not treated as unusable."""
+    eps_trailing = fnd.get("eps_trailing")
+    book_value_per_share = fnd.get("book_value_per_share")
+    if not eps_trailing or eps_trailing <= 0 or not book_value_per_share or book_value_per_share <= 0:
+        return None
+    roe = eps_trailing / book_value_per_share
+    payout_ratio = fnd.get("payout_ratio") or 0.0
+    return roe * (1 - payout_ratio)
 
 
 def classify_valuation_basis(eps_trailing, payout_ratio, sector, free_cash_flow):
@@ -845,13 +908,22 @@ def cash_flow_basis_value(basis, fnd):
 
 
 def build_scenarios(ticker, fnd, basis):
-    if ticker and ticker in CURATED_SCENARIOS:
+    if ticker and ticker in CURATED_SCENARIOS and CURATED_SCENARIOS_BASIS.get(ticker) == basis:
         return {
             name: {**scenario, "probability": SCENARIO_PROBABILITY}
             for name, scenario in CURATED_SCENARIOS[ticker].items()
         }
 
     g1_values = dict(G1_FALLBACK)
+
+    sustainable_g1 = _sustainable_growth_rate(fnd)
+    if sustainable_g1 is not None:
+        g1_values = {
+            "normal": sustainable_g1,
+            "best": sustainable_g1 + SUSTAINABLE_GROWTH_BEST_SPREAD,
+            "worst": sustainable_g1 + SUSTAINABLE_GROWTH_WORST_SPREAD,
+        }
+
     growth_0y = fnd.get("growth_0y")
     growth_1y = fnd.get("growth_1y")
     consensus_reliable = growth_0y is not None and growth_1y is not None and (growth_0y >= 0) == (growth_1y >= 0)
@@ -863,6 +935,8 @@ def build_scenarios(ticker, fnd, basis):
             g1_values["best"] = growth_0y_high
         if growth_0y_low is not None:
             g1_values["worst"] = growth_0y_low
+
+    g1_values = {name: min(value, G1_CAP) for name, value in g1_values.items()}  # see G1_CAP's comment
 
     g2_values = dict(g1_values) if basis == "dividends" else dict(GROWTH_BASIS_G2)
 
@@ -939,9 +1013,10 @@ def valuation_block(price, intrinsic, basis):
 
     pct = (price - intrinsic) / intrinsic * 100
     verdict = "overvalued" if pct >= 0 else "undervalued"
+    displayed_pct = min(abs(pct), VALUATION_PCT_DISPLAY_CAP)  # backstop, see valuation.py's own comment
     return (
         f"Intrinsic Value ({label}): ${intrinsic:.2f}\n"
-        f"vs Current Price: {verdict} by ~{abs(pct):.0f}%"
+        f"vs Current Price: {verdict} by ~{displayed_pct:.0f}%"
     )
 
 
@@ -1068,10 +1143,13 @@ def build_fundamentals_blocks(ticker_obj, fundamentals_history, as_of_date):
     # --- valuation block ---
     # Same scenario-DCF pipeline as valuation.py's valuation_block_for /
     # generate_synthetic_dataset.py's render_valuation (see the ported
-    # block above this function). Unlike the old Graham Number, this model
-    # doesn't need book value/share at all - quarterly_balance_sheet
-    # (equity's only consumer) was dropped from fetch_ticker_fundamentals_
-    # history entirely rather than fetched and left unused.
+    # block above this function). The old Graham Number needed a full
+    # historical quarterly_balance_sheet for as-of-date book value - that's
+    # still not fetched, and still not needed. book_value_per_share below
+    # is a different, simpler thing: a CURRENT snapshot (info["bookValue"],
+    # see fetch_ticker_fundamentals_history) feeding
+    # _sustainable_growth_rate's ROE approximation, not a Graham Number
+    # input.
     if price is not None:
         classify_eps = eps_trailing if eps_trailing else None
         basis = classify_valuation_basis(
@@ -1090,6 +1168,8 @@ def build_fundamentals_blocks(ticker_obj, fundamentals_history, as_of_date):
             "growth_1y": fundamentals_history["growth_1y"],
             "growth_0y_low": fundamentals_history["growth_0y_low"],
             "growth_0y_high": fundamentals_history["growth_0y_high"],
+            "book_value_per_share": fundamentals_history["book_value_per_share"],
+            "payout_ratio": fundamentals_history["payout_ratio"],
         }
         cf0 = cash_flow_basis_value(basis, valuation_fnd)
         scenarios = build_scenarios(ticker_obj.ticker, valuation_fnd, basis)

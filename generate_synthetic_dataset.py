@@ -132,10 +132,20 @@ VAL_HOLDOUT_TEMPLATE_INDEX_FRACTION = 0.2                       # ~20% of each
                                                                   # category's templates
                                                                   # are validation-only
 
-# VALUATION_SIGNAL is new - carved proportionally out of the other four
-# rather than added on top, so NUM_EXAMPLES still yields roughly the same
-# per-category row counts as before for everything else.
-SENTIMENT_WEIGHTS = {"BULLISH": 0.32, "BEARISH": 0.32, "NEUTRAL": 0.20, "MIXED": 0.08, "VALUATION_SIGNAL": 0.08}
+# VALUATION_SIGNAL is now the DOMINANT category by design, not a minority
+# one - explicit product direction: fundamentals (valuation, P/E, earnings
+# quality) should be the model's primary, default driver most of the time,
+# with news as a secondary signal that reinforces or occasionally overrides
+# it, not the other way around. Previously 8%, same as MIXED - too small to
+# be a "usually" for anything. BULLISH/BEARISH (pure news-driven, no
+# valuation influence on the resolved label) roughly halved to make room -
+# still large enough to keep "sometimes a concrete company event is the
+# whole story" a real, well-represented lesson, just no longer the default.
+# NEUTRAL/MIXED left untouched: NEUTRAL's weight is deliberately protected
+# (see NEUTRAL_VALUATION_GAP_RANGE's own history - it was the direct victim
+# of an earlier synthetic-data collision, not something to risk starving
+# again), and MIXED's signal-weighing lesson is orthogonal to this change.
+SENTIMENT_WEIGHTS = {"BULLISH": 0.16, "BEARISH": 0.16, "NEUTRAL": 0.20, "MIXED": 0.08, "VALUATION_SIGNAL": 0.40}
 
 # ---------------------------------------------------------------------------
 # Companies - (ticker, name, sector, (quarterly revenue low, high in $B))
@@ -277,6 +287,10 @@ BASIS_LABELS = {
     "dividends": "Dividend-based",
 }
 
+# Backstop cap on the displayed over/undervalued percentage - ported from
+# valuation.py's identically-named constant, see that module's comment.
+VALUATION_PCT_DISPLAY_CAP = 150.0
+
 DISCOUNT_RATE = 0.10
 SCENARIO_PROBABILITY = 1 / 3
 
@@ -285,6 +299,13 @@ SCENARIO_PROBABILITY = 1 / 3
 # tickers get the exact same scenario assumptions production would use for
 # them, instead of the generic/derived fallback every other ticker gets.
 CURATED_SCENARIOS = {
+    "AAPL": {
+        # Confirmed live: reproduces the analyst's own $128 target within
+        # 2.6% ($124.65 at trailing EPS $8.26, the analyst's own cf0).
+        "normal": {"g1": 0.07, "g2": 0.07, "exit_multiple": 20.0},
+        "best": {"g1": 0.12, "g2": 0.07, "exit_multiple": 25.0},
+        "worst": {"g1": 0.05, "g2": 0.05, "exit_multiple": 10.0},
+    },
     "NVDA": {
         "normal": {"g1": 0.30, "g2": 0.10, "exit_multiple": 20.0},
         "best": {"g1": 0.30, "g2": 0.15, "exit_multiple": 25.0},
@@ -312,6 +333,23 @@ CURATED_SCENARIOS = {
     },
 }
 
+# The basis each CURATED_SCENARIOS ticker's assumptions were actually
+# calibrated against - ported from valuation.py's identically-named
+# constant after a confirmed live bug: a ticker's classify_valuation_basis
+# result can legitimately differ call to call (payout_ratio varies), and
+# applying growth assumptions calibrated for one basis's cash flow to a
+# DIFFERENT basis's cash flow produces a number with no relationship to
+# the analyst's actual target, not just a less accurate one. See that
+# module's own comment for the full rationale.
+CURATED_SCENARIOS_BASIS = {
+    "AAPL": "eps",
+    "NVDA": "eps",
+    "MSFT": "eps",
+    "PEP": "dividends",
+    "NFLX": "eps",
+    "XOM": "eps",
+}
+
 WORST_EXIT_MULTIPLE_ASSET_HEAVY = 12.0
 WORST_EXIT_MULTIPLE_DEFAULT = 13.0
 NORMAL_EXIT_MULTIPLE = 20.0
@@ -330,6 +368,41 @@ REVENUE_BEST_EXIT_MULTIPLE = 6.0
 
 GROWTH_BASIS_G2 = {"normal": 0.10, "best": 0.12, "worst": 0.04}
 G1_FALLBACK = {"normal": 0.08, "best": 0.10, "worst": 0.04}
+# Ceiling on DERIVED g1 (real per-ticker consensus growth, not
+# CURATED_SCENARIOS) - ported from valuation.py's G1_CAP after a confirmed
+# live DCF blowup (this exact formula, run at scale via this generator,
+# showed a 90th-percentile gap of 91%, 99th of 354%, max 760%). See that
+# module's G1_CAP comment for the full rationale - upper bound only, set
+# above NVDA's own curated "best" g1 (0.30), CURATED_SCENARIOS tickers
+# bypass this entirely.
+G1_CAP = 0.40
+
+# Sustainable growth rate (ROE x retention ratio) as a middle tier in g1's
+# derivation - ported from valuation.py's _sustainable_growth_rate/
+# SUSTAINABLE_GROWTH_*_SPREAD after being asked directly what a non-flat
+# g1 default should be based on. See that module's own comment for the
+# full rationale, in short: NOT P/E (circular - P/E already prices in the
+# market's growth expectations, so deriving a DCF growth input from it and
+# valuing the company with that input concludes "fairly valued" almost by
+# construction). ROE x retention only uses the company's own profitability
+# and reinvestment behavior - already-generated fnd fields (eps_trailing,
+# book_value_per_share, payout_ratio), no new dependency.
+SUSTAINABLE_GROWTH_BEST_SPREAD = 0.02
+SUSTAINABLE_GROWTH_WORST_SPREAD = -0.04
+
+
+def _sustainable_growth_rate(fnd):
+    """ROE x (1 - payout_ratio). None (not a fetch failure) when
+    eps_trailing/book_value_per_share aren't usable - caller falls back to
+    G1_FALLBACK. Missing payout_ratio defaults to 0 (full reinvestment,
+    correct for a non-dividend-payer), not treated as unusable."""
+    eps_trailing = fnd.get("eps_trailing")
+    book_value_per_share = fnd.get("book_value_per_share")
+    if not eps_trailing or eps_trailing <= 0 or not book_value_per_share or book_value_per_share <= 0:
+        return None
+    roe = eps_trailing / book_value_per_share
+    payout_ratio = fnd.get("payout_ratio") or 0.0
+    return roe * (1 - payout_ratio)
 
 
 def classify_valuation_basis(eps_trailing, payout_ratio, sector, free_cash_flow):
@@ -378,13 +451,22 @@ def cash_flow_basis_value(basis, fnd):
 def build_scenarios(ticker, fnd, basis):
     """Ported from valuation.py's identically-named function - see that
     module for the full rationale behind each piece."""
-    if ticker and ticker in CURATED_SCENARIOS:
+    if ticker and ticker in CURATED_SCENARIOS and CURATED_SCENARIOS_BASIS.get(ticker) == basis:
         return {
             name: {**scenario, "probability": SCENARIO_PROBABILITY}
             for name, scenario in CURATED_SCENARIOS[ticker].items()
         }
 
     g1_values = dict(G1_FALLBACK)
+
+    sustainable_g1 = _sustainable_growth_rate(fnd)
+    if sustainable_g1 is not None:
+        g1_values = {
+            "normal": sustainable_g1,
+            "best": sustainable_g1 + SUSTAINABLE_GROWTH_BEST_SPREAD,
+            "worst": sustainable_g1 + SUSTAINABLE_GROWTH_WORST_SPREAD,
+        }
+
     growth_0y = fnd.get("growth_0y")
     growth_1y = fnd.get("growth_1y")
     consensus_reliable = growth_0y is not None and growth_1y is not None and (growth_0y >= 0) == (growth_1y >= 0)
@@ -396,6 +478,8 @@ def build_scenarios(ticker, fnd, basis):
             g1_values["best"] = growth_0y_high
         if growth_0y_low is not None:
             g1_values["worst"] = growth_0y_low
+
+    g1_values = {name: min(value, G1_CAP) for name, value in g1_values.items()}  # see G1_CAP's comment
 
     g2_values = dict(g1_values) if basis == "dividends" else dict(GROWTH_BASIS_G2)
 
@@ -481,9 +565,10 @@ def valuation_block(price, intrinsic, basis):
 
     pct = (price - intrinsic) / intrinsic * 100
     verdict = "overvalued" if pct >= 0 else "undervalued"
+    displayed_pct = min(abs(pct), VALUATION_PCT_DISPLAY_CAP)  # backstop, see valuation.py's own comment
     return (
         f"Intrinsic Value ({label}): ${intrinsic:.2f}\n"
-        f"vs Current Price: {verdict} by ~{abs(pct):.0f}%"
+        f"vs Current Price: {verdict} by ~{displayed_pct:.0f}%"
     )
 
 PUBLISHERS = [
@@ -971,7 +1056,106 @@ VALUATION_SIGNAL_SCENARIOS = [
      "BULLISH", "overvalued", "extreme", "news_wins"),
 ]
 
-VALUATION_GAP_RANGES = {"extreme": (70.0, 95.0), "moderate": (15.0, 35.0)}
+# Sector-wide macro/geopolitical developments whose fundamental linkage to
+# companies in that sector is direct and well-established - a REAL change
+# to the business's own economics (revenue per unit sold, margin, funding
+# cost, addressable market), not just market sentiment about the sector.
+# Explicit product direction: news should reinforce the valuation-led
+# default most strongly when it's this kind of concrete economic linkage,
+# not a generic "institutional buying ticked up"-style soft signal (see
+# "_reinforced" tier above, which stays for that weaker case). Picked at
+# generation time based on the actual company's own informal sector (see
+# make_example), not a static template - a "moderate" gap tier isn't used
+# here on purpose: a sector-wide economic shift paired with an already-
+# large valuation gap is meant to be the single most confident case in this
+# category, short of a concrete company-specific catalyst ("_wins" tier).
+# Only 7 of ~20 informal sectors are covered - covers two of the four
+# held-out tickers (BA -> aerospace, HRZN -> industrials) so this pattern
+# actually gets held-out eval coverage, not just training exposure.
+#
+# Each value: (bullish_headline, bearish_headline, linkage_phrase).
+# linkage_phrase fills SECTOR_REINFORCED_REASONING's own {linkage} slot -
+# names the specific economic channel, not just "this sector is affected."
+SECTOR_MACRO_HEADLINES = {
+    # Deliberately NOT "oil price up = bullish, oil price down = bearish" -
+    # that's momentum-following, the opposite of the value-investing
+    # principle this whole category exists to teach. Oil is a cyclical
+    # commodity: a LOW price (~$60/bbl or below) is historically closer to
+    # the trough where value investors buy energy names, not a reason to
+    # be bearish - and a HIGH price is closer to a cycle peak, where
+    # trailing earnings (and the P/E/valuation gap computed from them) are
+    # inflated and can look deceptively cheap right before a downturn - a
+    # classic value trap. So: low price + undervalued -> BULLISH (buying
+    # the trough), high price + overvalued -> BEARISH (wary of a peak
+    # that's about to mean-revert), matching how the direction/verdict
+    # pairing already works elsewhere in this dict.
+    "energy": (
+        "Crude oil prices slide to multi-year lows near $55/barrel amid oversupply concerns - historically close to where energy-sector value investors start buying, not where they sell",
+        "Crude oil prices surge to decade highs above $110/barrel amid supply fears - a classic late-cycle peak, when trailing earnings and P/E ratios can look deceptively cheap right before a downturn",
+        "oil is a cyclical commodity, so {ticker}'s current earnings and trailing multiples reflect where in that cycle prices are right now, not the cycle's long-run average",
+    ),
+    "semiconductors": (
+        "Global chip shortage intensifies, driving up prices and demand across the semiconductor industry",
+        "New export restrictions on advanced semiconductor technology threaten industry-wide international revenue",
+        "industry-wide pricing power and addressable market directly set {ticker}'s own revenue opportunity",
+    ),
+    "banking": (
+        "The Federal Reserve signals it will hold interest rates higher for longer, boosting bank net interest margins",
+        "A deepening yield curve inversion raises funding costs and default risk across the lending sector",
+        "the rate environment directly sets the net interest margin {ticker}'s lending business earns",
+    ),
+    "consumer-staples": (
+        "Consumer staples demand proves resilient as shoppers trade down during economic uncertainty",
+        "Persistent input cost inflation continues to squeeze margins across the consumer staples sector",
+        "sector-wide demand and input costs directly set {ticker}'s own volume and margin trajectory",
+    ),
+    "crypto": (
+        "Regulators signal a friendlier stance toward digital assets, lifting sentiment and volumes across the crypto sector",
+        "Regulators announce a sweeping crackdown on digital asset exchanges, roiling the crypto sector",
+        "sector-wide regulatory treatment directly sets the addressable market {ticker} can operate in",
+    ),
+    "aerospace": (
+        "Escalating geopolitical tensions drive a sustained increase in global defense spending",
+        "The aerospace and defense industry faces sector-wide program cost overruns and delivery delays",
+        "defense budgets and program execution directly set the order book {ticker} draws revenue from",
+    ),
+    "industrials": (
+        "A new infrastructure spending package signals sustained demand for industrial materials and equipment",
+        "Manufacturing activity contracts for a third straight month, signaling weakening industrial demand",
+        "sector-wide demand directly sets the order volume {ticker}'s own business depends on",
+    ),
+}
+
+SECTOR_REINFORCED_REASONING = (
+    "{ticker} already looks meaningfully {verdict} against its estimated intrinsic value, and this "
+    "sector-wide development is a real reinforcement rather than generic sentiment - {linkage} - so it "
+    "carries more weight than a same-direction signal without a clear fundamental channel, though still "
+    "tempered by the underlying uncertainty in any valuation estimate."
+)
+
+# Higher than generic "_reinforced" (0.68-0.80) - a direct economic linkage
+# is a stronger reinforcement than a soft, indirect signal like an uptick
+# in institutional buying, but still below "news_wins" (a concrete,
+# company-specific catalyst is stronger evidence than a sector-wide one).
+SECTOR_REINFORCED_CONFIDENCE = (0.75, 0.88)
+# Fraction of VALUATION_SIGNAL rows that use this path INSTEAD of the
+# static VALUATION_SIGNAL_SCENARIOS list, when the company's sector is
+# covered above (falls through to the static list otherwise).
+SECTOR_REINFORCED_PROB = 0.40
+
+# Reported live (twice): a controlled gap this large is implausible for
+# real companies, especially the large, liquid, heavily-covered names in
+# COMPANIES (AAPL at "92% overvalued" was the specific example) - genuinely
+# mispriced blue-chips rarely show more than roughly 40-60% DCF-implied
+# gaps even in real crisis-level events, and this dataset applies the SAME
+# range regardless of which company gets picked. Capping the display at
+# VALUATION_PCT_DISPLAY_CAP (150%) was a different fix (bounds the
+# uncapped random-DCF pipeline's occasional blowup) and didn't address
+# this - a controlled, INTENTIONAL 70-95% gap is well under that cap, so
+# it was never touched by it. Tightened both tiers down; still clearly
+# differentiated and large enough to teach "this is a real, decisive
+# signal," just no longer cartoonish for a company like AAPL.
+VALUATION_GAP_RANGES = {"extreme": (40.0, 70.0), "moderate": (12.0, 25.0)}
 # NEUTRAL_SCENARIOS' own valuation gap is pinned to this range (see
 # make_example's NEUTRAL branch) instead of the fully random draw every
 # other non-VALUATION_SIGNAL category gets - genuinely insignificant, so it
@@ -1230,7 +1414,7 @@ def render_valuation(fnd, ticker=None):
     return valuation_block(fnd["price"], intrinsic, basis)
 
 
-def valuation_block_with_gap(price, gap_pct, verdict):
+def valuation_block_with_gap(fnd, gap_pct, verdict):
     """Builds a Valuation block with a SPECIFIC, controlled over/undervalued
     percentage - used only by VALUATION_SIGNAL_SCENARIOS (see that list's
     own comment), which needs a deliberately clean, specific gap to teach a
@@ -1238,11 +1422,25 @@ def valuation_block_with_gap(price, gap_pct, verdict):
     full random-draw pipeline happens to produce. Still renders through the
     same valuation_block() formatter as every other row, so the shape
     (basis label, wording) is identical - only these rows' underlying
-    numbers are directly constructed instead of DCF-derived. `basis` is
-    randomly chosen per call purely for label variety across training
-    examples; VALUATION_SIGNAL_SCENARIOS' lesson is about the gap, not
-    about which basis produced it."""
-    basis = random.choice(list(BASIS_LABELS))
+    numbers are directly constructed instead of DCF-derived.
+
+    `basis` used to be `random.choice(list(BASIS_LABELS))` - reported live:
+    that put AAPL (Technology, not asset-heavy) at "Intrinsic Value
+    (FCF-based)", a basis classify_valuation_basis would never actually
+    assign it (FCF requires an asset-heavy sector AND positive free cash
+    flow). Uniform-random label variety was papering over an internal
+    inconsistency: production's real classify_valuation_basis is
+    deterministic per company (sector/profitability/payout ratio), so a
+    training row showing a basis that company could never actually get is
+    a fabricated combination the model has no business learning from. Now
+    classified the same way every other category's valuation gets
+    classified - basis varies across ROWS (different companies, different
+    classifications) rather than being randomized WITHIN a single row
+    independent of the company it's describing."""
+    basis = classify_valuation_basis(
+        fnd["eps_trailing"], fnd["payout_ratio"], fnd["sector"], fnd["free_cash_flow"],
+    )
+    price = fnd["price"]
     if verdict == "overvalued":
         intrinsic = price / (1 + gap_pct / 100)
     else:
@@ -1308,14 +1506,40 @@ def make_example(company, category):
         is_holdout_template = idx in NEUTRAL_HOLDOUT_IDX
         conf_low, conf_high = CONFIDENCE_RANGES["NEUTRAL"]["clear"]
     elif category == "VALUATION_SIGNAL":
-        idx = random.randrange(len(VALUATION_SIGNAL_SCENARIOS))
-        (headline_templates, reasoning_template, direction,
-         valuation_verdict, gap_tier, confidence_tier) = VALUATION_SIGNAL_SCENARIOS[idx]
-        valuation_signal = (valuation_verdict, gap_tier)
-        is_holdout_template = idx in VALUATION_SIGNAL_HOLDOUT_IDX
-        conf_low, conf_high = CONFIDENCE_RANGES["VALUATION_SIGNAL"][confidence_tier]
-        if confidence_tier != "news_wins":
-            earnings_direction = "NEUTRAL"  # no real catalyst - keep earnings "in line", see comment above
+        sector_key = company[2]  # informal sector label, e.g. "energy"
+        use_sector_reinforced = (
+            sector_key in SECTOR_MACRO_HEADLINES and random.random() < SECTOR_REINFORCED_PROB
+        )
+        if use_sector_reinforced:
+            verdict = random.choice(["undervalued", "overvalued"])
+            direction = "BULLISH" if verdict == "undervalued" else "BEARISH"
+            bullish_headline, bearish_headline, linkage = SECTOR_MACRO_HEADLINES[sector_key]
+            headline_templates = [bullish_headline if direction == "BULLISH" else bearish_headline]
+            # {ticker} is passed through literally (both the outer slot and
+            # the one embedded in `linkage`) so the shared
+            # reasoning_template.format(**fields) call below resolves it
+            # together with every other template in this function - only
+            # `verdict`/`linkage` are real values to fill now.
+            reasoning_template = SECTOR_REINFORCED_REASONING.format(
+                ticker="{ticker}", verdict=verdict, linkage=linkage,
+            )
+            valuation_signal = (verdict, "extreme")
+            # Procedurally generated (keyed off the company's sector, not a
+            # fixed template index) - held-out coverage instead comes from
+            # the sector list itself including aerospace/industrials (BA/
+            # HRZN, both holdout tickers - see SECTOR_MACRO_HEADLINES).
+            is_holdout_template = False
+            conf_low, conf_high = SECTOR_REINFORCED_CONFIDENCE
+            earnings_direction = "NEUTRAL"  # forward-looking macro shift, not a reported quarter - see comment above
+        else:
+            idx = random.randrange(len(VALUATION_SIGNAL_SCENARIOS))
+            (headline_templates, reasoning_template, direction,
+             valuation_verdict, gap_tier, confidence_tier) = VALUATION_SIGNAL_SCENARIOS[idx]
+            valuation_signal = (valuation_verdict, gap_tier)
+            is_holdout_template = idx in VALUATION_SIGNAL_HOLDOUT_IDX
+            conf_low, conf_high = CONFIDENCE_RANGES["VALUATION_SIGNAL"][confidence_tier]
+            if confidence_tier != "news_wins":
+                earnings_direction = "NEUTRAL"  # no real catalyst - keep earnings "in line", see comment above
     else:
         scenarios = {"BULLISH": BULLISH_SCENARIOS, "BEARISH": BEARISH_SCENARIOS}[category]
         holdout_idx = {"BULLISH": BULLISH_HOLDOUT_IDX, "BEARISH": BEARISH_HOLDOUT_IDX}[category]
@@ -1338,7 +1562,7 @@ def make_example(company, category):
         verdict, gap_tier = valuation_signal
         gap_low, gap_high = VALUATION_GAP_RANGES[gap_tier]
         gap_pct = round(random.uniform(gap_low, gap_high), 1)
-        valuation_text = valuation_block_with_gap(fnd["price"], gap_pct, verdict)
+        valuation_text = valuation_block_with_gap(fnd, gap_pct, verdict)
     elif category == "NEUTRAL":
         # Pinned to a small, genuinely insignificant gap instead of the
         # fully random draw every other category gets - see
@@ -1355,7 +1579,7 @@ def make_example(company, category):
             verdict = random.choice(["undervalued", "overvalued"])
             gap_low, gap_high = NEUTRAL_VALUATION_GAP_RANGE
             gap_pct = round(random.uniform(gap_low, gap_high), 1)
-            valuation_text = valuation_block_with_gap(fnd["price"], gap_pct, verdict)
+            valuation_text = valuation_block_with_gap(fnd, gap_pct, verdict)
     else:
         valuation_text = render_valuation(fnd, ticker)
     earnings_text = render_earnings(fnd, earnings_direction or direction)
@@ -1393,13 +1617,32 @@ def make_example(company, category):
     }
 
 
+# VALUATION_SIGNAL and NEUTRAL both construct a valuation gap via
+# valuation_block_with_gap - a deliberately FABRICATED intrinsic value
+# backward-solved from a target gap percentage, not run through the real
+# DCF. Reported live: an AAPL row (a CURATED_SCENARIOS ticker, real
+# analyst-verified intrinsic value ~$124.65) showed a fabricated "$108.91,
+# overvalued ~67%" that has nothing to do with AAPL's actual curated
+# value - correct as an isolated teaching example, but wrong as a claim
+# about AAPL specifically. A curated ticker has a real, known answer;
+# fabricating a different one for it is a factual error, not a design
+# tradeoff - unlike a non-curated company, whose valuation is synthetic/
+# derived by construction either way, so no real value exists to
+# contradict. Excluded from the pool used for these two categories only -
+# still fully available for BULLISH/BEARISH/MIXED, which run the real
+# DCF (render_valuation) and correctly use CURATED_SCENARIOS there.
+GAP_CONSTRUCTED_CATEGORIES = {"VALUATION_SIGNAL", "NEUTRAL"}
+NON_CURATED_COMPANIES = [c for c in ALL_COMPANIES if c[0] not in CURATED_SCENARIOS]
+
+
 def generate(n=NUM_EXAMPLES):
     examples = []
     categories = list(SENTIMENT_WEIGHTS.keys())
     weights = list(SENTIMENT_WEIGHTS.values())
     for _ in range(n):
         category = random.choices(categories, weights=weights)[0]
-        company = random.choice(ALL_COMPANIES)
+        pool = NON_CURATED_COMPANIES if category in GAP_CONSTRUCTED_CATEGORIES else ALL_COMPANIES
+        company = random.choice(pool)
         examples.append(make_example(company, category))
     return examples
 
