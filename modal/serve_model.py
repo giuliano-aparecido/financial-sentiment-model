@@ -71,7 +71,7 @@ from pydantic import BaseModel
 app = modal.App("financial-sentiment-reasoner")
 
 MODEL_CHOICE_DEFAULT = "llama-3.2-3b"
-MODEL_VERSION_DEFAULT = "v14"
+MODEL_VERSION_DEFAULT = "v15"
 
 # unsloth is the one dependency most likely to need a version pin on your
 # first `modal deploy` - it's picky about matching torch/CUDA versions, and

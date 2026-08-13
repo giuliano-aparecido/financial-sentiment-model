@@ -51,7 +51,7 @@ except Exception:
 # Colab/Kaggle Secret to serve a different push ad-hoc, without editing
 # this file - useful for a quick rollback if a newly-trained version turns
 # out worse than the one it replaced.
-MODEL_VERSION_DEFAULT = "v14"
+MODEL_VERSION_DEFAULT = "v15"
 try:
     MODEL_VERSION = get_secret("MODEL_VERSION") or MODEL_VERSION_DEFAULT
 except Exception:
