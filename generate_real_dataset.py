@@ -702,7 +702,7 @@ def fetch_ticker_fundamentals_history(ticker_obj):
         "income": None, "earnings_dates": None, "shares_outstanding": None,
         "sector": None, "payout_ratio": None, "free_cash_flow": None, "dividend_rate": None,
         "growth_0y": None, "growth_1y": None, "growth_0y_low": None, "growth_0y_high": None,
-        "book_value_per_share": None,
+        "book_value_per_share": None, "operating_margin": None,
     }
     try:
         result["income"] = ticker_obj.quarterly_income_stmt
@@ -723,6 +723,11 @@ def fetch_ticker_fundamentals_history(ticker_obj):
         # book_value_per_share) - same yfinance field financial-sentiment-
         # api's fundamentals.py already fetches for the same purpose.
         result["book_value_per_share"] = info.get("bookValue")
+        # Feeds value_screen_metrics (see below) - same current-snapshot
+        # approximation as sector/payout_ratio/free_cash_flow/dividend_rate
+        # above (yfinance has no historical operating-margin series exposed
+        # any more than it does for those).
+        result["operating_margin"] = info.get("operatingMargins")
     except Exception as e:
         print(f"    Warning: shares_outstanding/info fetch failed: {e}", flush=True)
     # Same shape/reasoning as financial-sentiment-api's fundamentals.py
@@ -761,6 +766,24 @@ ASSET_HEAVY_SECTORS = {"Energy", "Industrials", "Basic Materials", "Utilities"}
 DIVIDEND_PAYOUT_THRESHOLD = 0.40
 DIVIDEND_PAYOUT_CEILING = 1.20
 REIT_SECTORS = {"Real Estate"}
+
+# Ported byte-identical from financial-sentiment-api's fundamentals.py (see
+# that module's own comment) - rough, illustrative per-sector median
+# trailing P/E, not fetched live. Real Estate deliberately omitted: REITs
+# route to a dividends/P/B-based valuation instead of P/E (see REIT_SECTORS
+# above), so a sector-median-P/E comparison isn't meaningful there.
+SECTOR_MEDIAN_PE = {
+    "Technology": 28.0,
+    "Healthcare": 22.0,
+    "Financial Services": 13.0,
+    "Consumer Cyclical": 19.0,
+    "Consumer Defensive": 21.0,
+    "Communication Services": 18.0,
+    "Industrials": 19.0,
+    "Energy": 12.0,
+    "Basic Materials": 15.0,
+    "Utilities": 17.0,
+}
 
 BASIS_LABELS = {
     "revenue": "Revenue-based",
@@ -869,6 +892,61 @@ def _sustainable_growth_rate(fnd):
     roe = eps_trailing / book_value_per_share
     payout_ratio = fnd.get("payout_ratio") or 0.0
     return roe * (1 - payout_ratio)
+
+
+def value_screen_metrics(fnd):
+    """Ported byte-identical from financial-sentiment-api's fundamentals.py
+    (see that module's own comment for the full rationale) - ROE, Price/
+    Sales, FCF yield, and PEG are all derived from fields already in `fnd`,
+    deliberately reusing the same formulas the DCF math above already uses
+    internally (e.g. ROE = eps_trailing / book_value_per_share, same as
+    _sustainable_growth_rate) rather than a second, independently-sourced
+    number for the same concept. Each value is None when its inputs are
+    missing/unusable."""
+    eps_trailing = fnd.get("eps_trailing")
+    book_value_per_share = fnd.get("book_value_per_share")
+    roe = None
+    if eps_trailing and book_value_per_share and book_value_per_share > 0:
+        roe = eps_trailing / book_value_per_share
+
+    market_cap = fnd.get("market_cap")
+    total_revenue = fnd.get("total_revenue")
+    price_to_sales = None
+    if market_cap and total_revenue and total_revenue > 0:
+        price_to_sales = market_cap / total_revenue
+
+    free_cash_flow = fnd.get("free_cash_flow")
+    fcf_yield = None
+    if free_cash_flow is not None and market_cap and market_cap > 0:
+        fcf_yield = free_cash_flow / market_cap
+
+    pe_trailing = fnd.get("pe_trailing")
+    growth_0y = fnd.get("growth_0y")
+    # PEG only means anything against POSITIVE expected growth - see
+    # fundamentals.py's identical comment for why a negative/zero growth_0y
+    # is left None rather than shown as a misleadingly "cheap" number.
+    peg_ratio = None
+    if pe_trailing and growth_0y and growth_0y > 0:
+        peg_ratio = pe_trailing / (growth_0y * 100)
+
+    price = fnd.get("price")
+    price_to_book = None
+    if price and book_value_per_share and book_value_per_share > 0:
+        price_to_book = price / book_value_per_share
+
+    sector = fnd.get("sector")
+    sector_median_pe = SECTOR_MEDIAN_PE.get(sector)
+
+    return {
+        "roe": roe,
+        "operating_margin": fnd.get("operating_margin"),
+        "price_to_sales": price_to_sales,
+        "fcf_yield": fcf_yield,
+        "peg_ratio": peg_ratio,
+        "price_to_book": price_to_book,
+        "is_reit_sector": sector in REIT_SECTORS,
+        "sector_median_pe": sector_median_pe,
+    }
 
 
 def classify_valuation_basis(eps_trailing, payout_ratio, sector, free_cash_flow):
@@ -1131,11 +1209,51 @@ def build_fundamentals_blocks(ticker_obj, fundamentals_history, as_of_date):
         div_yield_str = f"{div_yield:.2f}%" if div_yield else "0.00%"
         range_str = (f"${year_low:.2f} - ${year_high:.2f}"
                      if (year_low and year_high) else "N/A")
+
+        # `revenue` above is ONE quarter (as_of_quarterly's return, see its
+        # own docstring) - value_screen_metrics' price_to_sales expects
+        # ANNUAL revenue, so it's annualized here (x4, a rough approximation
+        # - same "known, bounded approximation" spirit as this function's
+        # other current-snapshot stand-ins) rather than passed straight
+        # through. NOTE: the valuation_fnd dict built further below (for the
+        # "revenue" DCF basis) passes this SAME quarterly `revenue` through
+        # UN-annualized as "total_revenue" - that looks like a pre-existing,
+        # separate bug (a revenue-basis DCF would be computing off a
+        # quarterly-not-annual per-share figure), flagged but deliberately
+        # NOT fixed here since it changes DCF valuation math, out of scope
+        # for this change.
+        annual_revenue = revenue * 4 if revenue is not None else None
+        screen = value_screen_metrics({
+            "eps_trailing": eps_trailing,
+            "book_value_per_share": fundamentals_history["book_value_per_share"],
+            "market_cap": market_cap,
+            "total_revenue": annual_revenue,
+            "free_cash_flow": fundamentals_history["free_cash_flow"],
+            "pe_trailing": pe_trailing,
+            "growth_0y": fundamentals_history["growth_0y"],
+            "price": price,
+            "sector": fundamentals_history["sector"],
+            "operating_margin": fundamentals_history["operating_margin"],
+        })
+        operating_margin_str = f"{screen['operating_margin'] * 100:.1f}%" if screen["operating_margin"] is not None else "N/A"
+        roe_str = f"{screen['roe'] * 100:.1f}%" if screen["roe"] is not None else "N/A"
+        price_to_book_str = f"{screen['price_to_book']:.1f}" if screen["price_to_book"] is not None else "N/A"
+        price_to_sales_str = f"{screen['price_to_sales']:.1f}" if screen["price_to_sales"] is not None else "N/A"
+        fcf_yield_str = f"{screen['fcf_yield'] * 100:.1f}%" if screen["fcf_yield"] is not None else "N/A"
+        peg_ratio_str = f"{screen['peg_ratio']:.1f}" if screen["peg_ratio"] is not None else "N/A"
+        sector_median_pe_str = (
+            f"{screen['sector_median_pe']:.1f} ({fundamentals_history['sector']})"
+            if screen["sector_median_pe"] is not None else "N/A"
+        )
+
         market_data_block = (
             f"Price: ${price:.2f} | Market Cap: {format_market_cap(market_cap)}\n"
             f"P/E (trailing): {pe_trailing_str} | P/E (forward): {pe_forward_str}\n"
             f"EPS (trailing): ${eps_trailing:.2f} | Dividend Yield: {div_yield_str}\n"
-            f"52-Week Range: {range_str}"
+            f"52-Week Range: {range_str}\n"
+            f"Operating Margin: {operating_margin_str} | ROE: {roe_str} | Price/Book: {price_to_book_str}\n"
+            f"Price/Sales: {price_to_sales_str} | FCF Yield: {fcf_yield_str} | PEG: {peg_ratio_str}\n"
+            f"Sector Median P/E: {sector_median_pe_str}"
         )
     else:
         market_data_block = "Data unavailable."

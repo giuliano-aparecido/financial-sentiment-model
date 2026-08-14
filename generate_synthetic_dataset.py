@@ -280,6 +280,24 @@ DIVIDEND_PAYOUT_THRESHOLD = 0.40
 DIVIDEND_PAYOUT_CEILING = 1.20
 REIT_SECTORS = {"Real Estate"}
 
+# Ported byte-identical from financial-sentiment-api's fundamentals.py (see
+# that module's own comment) - rough, illustrative per-sector median
+# trailing P/E, not fetched live. Real Estate deliberately omitted: REITs
+# route to a dividends/P/B-based valuation instead of P/E (see REIT_SECTORS
+# above), so a sector-median-P/E comparison isn't meaningful there.
+SECTOR_MEDIAN_PE = {
+    "Technology": 28.0,
+    "Healthcare": 22.0,
+    "Financial Services": 13.0,
+    "Consumer Cyclical": 19.0,
+    "Consumer Defensive": 21.0,
+    "Communication Services": 18.0,
+    "Industrials": 19.0,
+    "Energy": 12.0,
+    "Basic Materials": 15.0,
+    "Utilities": 17.0,
+}
+
 BASIS_LABELS = {
     "revenue": "Revenue-based",
     "eps": "EPS-based",
@@ -403,6 +421,114 @@ def _sustainable_growth_rate(fnd):
     roe = eps_trailing / book_value_per_share
     payout_ratio = fnd.get("payout_ratio") or 0.0
     return roe * (1 - payout_ratio)
+
+
+def value_screen_metrics(fnd):
+    """Ported byte-identical from financial-sentiment-api's fundamentals.py
+    (see that module's own comment for the full rationale) - ROE, Price/
+    Sales, FCF yield, and PEG are all derived from fields already in `fnd`,
+    deliberately reusing the same formulas the DCF math above already uses
+    internally (e.g. ROE = eps_trailing / book_value_per_share, same as
+    _sustainable_growth_rate) rather than a second, independently-rolled
+    number for the same concept. Each value is None when its inputs are
+    missing/unusable."""
+    eps_trailing = fnd.get("eps_trailing")
+    book_value_per_share = fnd.get("book_value_per_share")
+    roe = None
+    if eps_trailing and book_value_per_share and book_value_per_share > 0:
+        roe = eps_trailing / book_value_per_share
+
+    market_cap = fnd.get("market_cap")
+    total_revenue = fnd.get("total_revenue")
+    price_to_sales = None
+    if market_cap and total_revenue and total_revenue > 0:
+        price_to_sales = market_cap / total_revenue
+
+    free_cash_flow = fnd.get("free_cash_flow")
+    fcf_yield = None
+    if free_cash_flow is not None and market_cap and market_cap > 0:
+        fcf_yield = free_cash_flow / market_cap
+
+    pe_trailing = fnd.get("pe_trailing")
+    growth_0y = fnd.get("growth_0y")
+    # PEG only means anything against POSITIVE expected growth - see
+    # fundamentals.py's identical comment for why a negative/zero growth_0y
+    # is left None rather than shown as a misleadingly "cheap" number.
+    peg_ratio = None
+    if pe_trailing and growth_0y and growth_0y > 0:
+        peg_ratio = pe_trailing / (growth_0y * 100)
+
+    price = fnd.get("price")
+    price_to_book = None
+    if price and book_value_per_share and book_value_per_share > 0:
+        price_to_book = price / book_value_per_share
+
+    sector = fnd.get("sector")
+    sector_median_pe = SECTOR_MEDIAN_PE.get(sector)
+
+    return {
+        "roe": roe,
+        "operating_margin": fnd.get("operating_margin"),
+        "price_to_sales": price_to_sales,
+        "fcf_yield": fcf_yield,
+        "peg_ratio": peg_ratio,
+        "price_to_book": price_to_book,
+        "is_reit_sector": sector in REIT_SECTORS,
+        "sector_median_pe": sector_median_pe,
+    }
+
+
+# Graded confidence bands, not hard pass/fail cutoffs - see
+# value-investing-checklist.md's own framing. Deliberately only 3 tiers
+# per metric (not a continuous score) since this maps to discrete
+# reasoning LANGUAGE the model can actually learn to reproduce, not a
+# numeric field in the output schema (the model outputs a sentiment label
+# + reasoning text, not a confidence score per metric - see the earlier
+# design discussion this was scoped from).
+OPERATING_MARGIN_STRONG = 0.15
+OPERATING_MARGIN_WEAK = 0.08
+ROE_STRONG = 0.15
+ROE_WEAK = 0.08
+PEG_CHEAP = 1.0
+PEG_RICH = 2.0
+
+
+def describe_value_screen(fnd):
+    """Translates operating margin/ROE/PEG (see value_screen_metrics above)
+    into 1-2 sentences of graded value-checklist commentary - teaches the
+    model this vocabulary explicitly (see
+    VALUE_SCREEN_COMMENTARY_PROB's own comment for why this is spliced
+    into only a fraction of VALUATION_SIGNAL examples) rather than relying
+    purely on the model inferring quality/growth-adjusted-pricing language
+    from raw numbers in market_data on its own. Returns None (not a
+    placeholder sentence) when operating_margin/ROE aren't usable, so the
+    caller can skip appending anything - same "don't guess" convention as
+    the rest of this module's rendering.
+    """
+    screen = value_screen_metrics(fnd)
+    op_margin = screen["operating_margin"]
+    roe = screen["roe"]
+    peg = screen["peg_ratio"]
+    if op_margin is None or roe is None:
+        return None
+
+    if op_margin > OPERATING_MARGIN_STRONG and roe > ROE_STRONG:
+        quality = "Operating margins and ROE both point to a genuinely high-quality underlying business"
+    elif op_margin < OPERATING_MARGIN_WEAK or roe < ROE_WEAK:
+        quality = "Thin operating margins and weak ROE argue for caution regardless of the valuation gap"
+    else:
+        quality = "Operating margins and ROE are unremarkable here - adequate, not standout"
+
+    if peg is None:
+        growth_note = "growth looks too uncertain to gauge against the price"
+    elif peg < PEG_CHEAP:
+        growth_note = "the price looks reasonable relative to expected growth (PEG under 1)"
+    elif peg > PEG_RICH:
+        growth_note = "the price looks rich relative to expected growth (PEG over 2)"
+    else:
+        growth_note = "the price is roughly in line with expected growth"
+
+    return f"{quality}, and {growth_note}."
 
 
 def classify_valuation_basis(eps_trailing, payout_ratio, sector, free_cash_flow):
@@ -1143,6 +1269,14 @@ SECTOR_REINFORCED_CONFIDENCE = (0.75, 0.88)
 # covered above (falls through to the static list otherwise).
 SECTOR_REINFORCED_PROB = 0.40
 
+# Fraction of VALUATION_SIGNAL rows (either path above) that get an
+# appended value-screen commentary sentence (see describe_value_screen) -
+# NOT 1.0, so VALUATION_SIGNAL's existing hand-authored reasoning variety
+# doesn't collapse into "always ends the same way" - the model should
+# learn this vocabulary as ONE input among several it reasons over, not a
+# rigid suffix every valuation-driven example carries.
+VALUE_SCREEN_COMMENTARY_PROB = 0.50
+
 # Reported live (twice): a controlled gap this large is implausible for
 # real companies, especially the large, liquid, heavily-covered names in
 # COMPANIES (AAPL at "92% overvalued" was the specific example) - genuinely
@@ -1283,14 +1417,25 @@ def make_fundamentals(company, fields):
     year_low = round(price * random.uniform(0.72, 0.93), 2)
     year_high = round(price * random.uniform(1.07, 1.38), 2)
 
-    # Book value/share is no longer consumed by valuation math (the
-    # scenario-DCF model doesn't use it - see build_scenarios/
-    # cash_flow_basis_value above), but market_data's Graham-era P/B
-    # grounding isn't part of production's market_data_block either, so
-    # this is kept only as a plausible, unused-by-valuation figure - no
-    # downstream consumer left to tune it against.
+    # Book value/share isn't consumed by the DCF math itself (build_scenarios/
+    # cash_flow_basis_value above don't use it), but IS consumed by
+    # _sustainable_growth_rate's ROE approximation and by
+    # value_screen_metrics' ROE/Price-Book below - no longer a fully unused
+    # figure, despite the pb_ratio name suggesting a Graham-era P/B
+    # grounding that isn't actually how it's used anymore.
     pb_ratio = round(random.uniform(0.4, 4.0), 1)
     book_value_per_share = round(price / pb_ratio, 2)
+
+    # Loosely correlated with profitability (eps_trailing's sign, already
+    # rolled above) rather than an independent draw - a company already
+    # rolled as loss-making shouldn't also roll a strong operating margin,
+    # which would read as an internally-contradictory example (see this
+    # function's own opening comment on why every field derives from the
+    # same price/eps draw chain).
+    if eps_trailing < 0:
+        operating_margin = round(random.uniform(-0.15, 0.05), 4)
+    else:
+        operating_margin = round(random.uniform(0.03, 0.35), 4)
 
     rev_low, rev_high = rev_range
     # Loosely ties market cap to the company's revenue band (bigger revenue
@@ -1383,17 +1528,39 @@ def make_fundamentals(company, fields):
         "growth_1y": growth_1y,
         "growth_0y_high": growth_0y_high,
         "growth_0y_low": growth_0y_low,
+        "operating_margin": operating_margin,
     }
 
 
 def render_market_data(fnd):
     if random.random() < DATA_UNAVAILABLE_PROB:
         return "Data unavailable."
+
+    # N/A fallbacks even though synthetic fields are otherwise always
+    # populated - value_screen_metrics itself can still return None here
+    # (e.g. PEG when growth_0y rolled <= 0, see make_fundamentals' ~15%
+    # "opposite direction" branch) - same rendering convention as
+    # financial-sentiment-api's fundamentals.py/generate_real_dataset.py.
+    screen = value_screen_metrics(fnd)
+    operating_margin_str = f"{screen['operating_margin'] * 100:.1f}%" if screen["operating_margin"] is not None else "N/A"
+    roe_str = f"{screen['roe'] * 100:.1f}%" if screen["roe"] is not None else "N/A"
+    price_to_book_str = f"{screen['price_to_book']:.1f}" if screen["price_to_book"] is not None else "N/A"
+    price_to_sales_str = f"{screen['price_to_sales']:.1f}" if screen["price_to_sales"] is not None else "N/A"
+    fcf_yield_str = f"{screen['fcf_yield'] * 100:.1f}%" if screen["fcf_yield"] is not None else "N/A"
+    peg_ratio_str = f"{screen['peg_ratio']:.1f}" if screen["peg_ratio"] is not None else "N/A"
+    sector_median_pe_str = (
+        f"{screen['sector_median_pe']:.1f} ({fnd['sector']})"
+        if screen["sector_median_pe"] is not None else "N/A"
+    )
+
     return (
         f"Price: ${fnd['price']:.2f} | Market Cap: {format_market_cap(fnd['market_cap'])}\n"
         f"P/E (trailing): {fnd['pe_trailing']:.1f} | P/E (forward): {fnd['pe_forward']:.1f}\n"
         f"EPS (trailing): ${fnd['eps_trailing']:.2f} | Dividend Yield: {fnd['div_yield']:.2f}%\n"
-        f"52-Week Range: ${fnd['year_low']:.2f} - ${fnd['year_high']:.2f}"
+        f"52-Week Range: ${fnd['year_low']:.2f} - ${fnd['year_high']:.2f}\n"
+        f"Operating Margin: {operating_margin_str} | ROE: {roe_str} | Price/Book: {price_to_book_str}\n"
+        f"Price/Sales: {price_to_sales_str} | FCF Yield: {fcf_yield_str} | PEG: {peg_ratio_str}\n"
+        f"Sector Median P/E: {sector_median_pe_str}"
     )
 
 
@@ -1558,6 +1725,10 @@ def make_example(company, category):
 
     fnd = make_fundamentals(company, fields)
     market_data_text = render_market_data(fnd)
+    if category == "VALUATION_SIGNAL" and random.random() < VALUE_SCREEN_COMMENTARY_PROB:
+        commentary = describe_value_screen(fnd)
+        if commentary:
+            reasoning = f"{reasoning} {commentary}"
     if valuation_signal is not None:
         verdict, gap_tier = valuation_signal
         gap_low, gap_high = VALUATION_GAP_RANGES[gap_tier]
