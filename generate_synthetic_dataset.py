@@ -1725,7 +1725,18 @@ def make_example(company, category):
 
     fnd = make_fundamentals(company, fields)
     market_data_text = render_market_data(fnd)
-    if category == "VALUATION_SIGNAL" and random.random() < VALUE_SCREEN_COMMENTARY_PROB:
+    # Gated on market_data_text, not just `fnd` (which is always fully
+    # populated) - render_market_data can independently roll "Data
+    # unavailable." (DATA_UNAVAILABLE_PROB), and without this check the
+    # reasoning could cite operating margin/ROE/PEG numbers the model is
+    # simultaneously being shown as unavailable in market_data - a real,
+    # confirmed-live contradiction (found via a full generate() run before
+    # this fix: 78/2000 rows had exactly this mismatch).
+    if (
+        category == "VALUATION_SIGNAL"
+        and market_data_text != "Data unavailable."
+        and random.random() < VALUE_SCREEN_COMMENTARY_PROB
+    ):
         commentary = describe_value_screen(fnd)
         if commentary:
             reasoning = f"{reasoning} {commentary}"
