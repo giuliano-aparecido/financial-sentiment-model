@@ -1,5 +1,20 @@
-!pip install "unsloth[colab-new] @ git+https://github.com/unslothai/unsloth.git"
-!pip install --no-deps trl peft accelerate bitsandbytes
+import subprocess
+import sys
+
+# subprocess, not `!pip install` - runs identically whether this file is
+# pasted into a Colab/Kaggle notebook cell (subprocess calls work fine
+# there too - it was only ever `!pip install` for brevity, not because
+# Colab needs the magic syntax specifically) OR run as a plain script
+# (`python train_model.py`, e.g. on RunPod - no Jupyter kernel there to
+# interpret `!` cell-magic, which is a SyntaxError outside one).
+subprocess.run(
+    [sys.executable, "-m", "pip", "install", "unsloth[colab-new] @ git+https://github.com/unslothai/unsloth.git"],
+    check=True,
+)
+subprocess.run(
+    [sys.executable, "-m", "pip", "install", "--no-deps", "trl", "peft", "accelerate", "bitsandbytes"],
+    check=True,
+)
 
 import os
 import torch
