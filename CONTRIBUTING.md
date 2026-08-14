@@ -40,8 +40,9 @@ so there's nothing meaningful to mock or run in CI. Instead:
   8 total, but only one canonical string), and `financial-sentiment-api`'s
   `app/services/inference.py` — a mismatch anywhere in that set silently
   trains or serves a different shape than the others expect. Also keep
-  `runpod/train_model.py` (a RunPod-runnable copy of the gpu variant, same
-  string again - 9 total) in sync with the same set. This also
+  `runpod/train_model.py` and `runpod/evaluate_model.py` (RunPod-runnable
+  copies of the gpu variants, same string again - 10 total) in sync with
+  the same set. This also
   covers the `market_data`/`valuation`/`earnings` block FORMATTING (not
   just the outer template) — the block renderers in
   `generate_synthetic_dataset.py`, `generate_real_dataset.py`, and
