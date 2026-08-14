@@ -285,8 +285,15 @@ def get_secret(name):
     if os.environ.get("KAGGLE_KERNEL_RUN_TYPE"):
         from kaggle_secrets import UserSecretsClient
         return UserSecretsClient().get_secret(name)
-    from google.colab import userdata
-    return userdata.get(name)
+    try:
+        from google.colab import userdata
+        return userdata.get(name)
+    except ImportError:
+        # Not Colab or Kaggle - e.g. RunPod, or any plain GPU box. Neither
+        # has a secrets-vault API to call, so fall back to a real
+        # environment variable (set via RunPod's pod env-var config, a
+        # .env file, or `export NAME=value` before running this script).
+        return os.environ.get(name)
 
 # genai.Client() with no api_key reads GEMINI_API_KEY from the environment,
 # but Colab/Kaggle secrets aren't environment variables - passed explicitly.
