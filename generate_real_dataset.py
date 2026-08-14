@@ -1279,7 +1279,16 @@ def build_fundamentals_blocks(ticker_obj, fundamentals_history, as_of_date):
             "dividend_rate": fundamentals_history["dividend_rate"],
             "market_cap": market_cap,
             "price": price,
-            "total_revenue": revenue,
+            # `revenue` is a single quarter's figure (as_of_quarterly's
+            # return, see its docstring), not annual - the "revenue" DCF
+            # basis below (cash_flow_basis_value) needs an ANNUAL per-share
+            # figure to compound growth off correctly. Previously passed
+            # `revenue` straight through here un-annualized, a real bug: a
+            # revenue-basis DCF was computing off a ~4x-too-small base.
+            # `annual_revenue` (x4, same rough approximation
+            # value_screen_metrics' price_to_sales already uses above)
+            # fixes it.
+            "total_revenue": annual_revenue,
             "free_cash_flow": fundamentals_history["free_cash_flow"],
             "sector": fundamentals_history["sector"],
             "growth_0y": fundamentals_history["growth_0y"],
