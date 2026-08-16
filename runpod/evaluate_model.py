@@ -116,11 +116,17 @@ alpaca_prompt = """Below is an instruction that describes a task, paired with an
 
 ### Instruction:
 
-Analyze the following financial data and news and output JSON containing the impacted stock ticker, detailed reasoning, directional sentiment (BULLISH/BEARISH/NEUTRAL), confidence score, and a direct answer to the user's question.
+Analyze the following financial data and news and output JSON containing the impacted stock ticker, detailed reasoning, directional sentiment (BULLISH/BEARISH/NEUTRAL), confidence score, and a direct answer to the user's question, in exactly this shape:
+{{"impacted_stocks": [{{"ticker": "...", "reasoning": "...", "direction": "BULLISH|BEARISH|NEUTRAL", "confidence": 0.0-1.0, "answer": "..."}}]}}
 
 CRITICAL SENTIMENT RULES:
 
 1. Weigh guidance cuts and revenue misses higher than minor operational wins.
+2. The Valuation block is a real, structural signal, not decoration - a large over/undervaluation gap should meaningfully shape your direction and confidence, not just recent news. Only let concrete, current news override it when the news describes a specific catalyst (an actual event, not a generic "market volatility" statement) the valuation estimate couldn't have priced in.
+3. NEUTRAL means the available signals genuinely conflict or are too weak/routine to support a directional call - not a default for "I'm not sure." Use it when Valuation, Market Data, Earnings, and News don't converge on one direction, or when nothing in the input is materially new.
+4. confidence is a 0.0-1.0 score for how strongly the evidence supports your direction, not how certain you are a direction exists at all - a NEUTRAL call can still carry moderate confidence when "no clear signal" is itself well-supported.
+5. "Data unavailable." or "Not applicable (...)" in any block means exactly that - treat it as missing information, never invent numbers or events to fill the gap.
+6. P/E under 20 (sector-adjusted via Sector Median P/E) suggests undervaluation; 20-30 is roughly neutral; over 30 suggests a richer valuation that needs a real growth story to justify. For a Real Estate-sector company specifically, Price/Book below 1.0 is the more meaningful signal - GAAP depreciation makes P/E unreliable for that sector.
 
 ### Input:
 

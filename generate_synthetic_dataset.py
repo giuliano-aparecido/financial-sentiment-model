@@ -120,8 +120,10 @@ Output: two JSONL files (one JSON object per line), train and val.
 """
 
 import datetime
+import hashlib
 import json
 import random
+import re
 
 random.seed(42)  # reproducible across Colab runs
 
@@ -504,6 +506,11 @@ def _sustainable_growth_rate(fnd):
     return roe * (1 - payout_ratio)
 
 
+# See value_screen_metrics' own comment on peg_ratio - ported from
+# fundamentals.py's identically-named constant.
+PEG_MIN_GROWTH_FOR_COMPUTATION = 0.02
+
+
 def value_screen_metrics(fnd):
     """Ported byte-identical from financial-sentiment-api's fundamentals.py
     (see that module's own comment for the full rationale) - ROE, Price/
@@ -534,9 +541,12 @@ def value_screen_metrics(fnd):
     growth_0y = fnd.get("growth_0y")
     # PEG only means anything against POSITIVE expected growth - see
     # fundamentals.py's identical comment for why a negative/zero growth_0y
-    # is left None rather than shown as a misleadingly "cheap" number.
+    # is left None rather than shown as a misleadingly "cheap" number, and
+    # PEG_MIN_GROWTH_FOR_COMPUTATION for why near-zero growth is floored
+    # too (confirmed live: PEG values up to 525 in this generator's own
+    # output, purely from dividing by a growth rate close to 0%).
     peg_ratio = None
-    if pe_trailing and growth_0y and growth_0y > 0:
+    if pe_trailing and growth_0y and growth_0y > PEG_MIN_GROWTH_FOR_COMPUTATION:
         peg_ratio = pe_trailing / (growth_0y * 100)
 
     price = fnd.get("price")
@@ -973,7 +983,41 @@ PRODUCTS = [
     "AI infrastructure", "cloud services", "next-gen hardware", "enterprise software",
     "flagship consumer devices", "streaming platform", "payments network",
     "electric vehicle lineup", "chip manufacturing", "logistics network",
+    "drug development pipeline", "clinical trial portfolio", "energy production capacity",
+    "refining operations", "industrial equipment lineup", "manufacturing capacity",
+    "aircraft manufacturing", "product lineup",
 ]
+
+# Keyed off the company's informal sector (company[2], SECTOR_MAP's keys) -
+# confirmed live PRODUCTS picked with no sector gating produced 217/1600
+# rows (13.6%) with a nonsensical pairing ("PepsiCo... chip manufacturing
+# line", "Exxon Mobil... enterprise software margins", "Boeing...
+# AI infrastructure line"). Falls back to the full PRODUCTS list for any
+# sector not listed here (there shouldn't be one, given COMPANIES/
+# SECTOR_MAP's fixed set, but this keeps make_fields from crashing if a
+# new sector is ever added without updating this table in lockstep).
+PRODUCTS_BY_SECTOR = {
+    "tech": ["AI infrastructure", "cloud services", "enterprise software", "next-gen hardware"],
+    "software": ["enterprise software", "cloud services", "AI infrastructure"],
+    "semiconductors": ["chip manufacturing", "next-gen hardware", "AI infrastructure"],
+    "e-commerce": ["logistics network", "flagship consumer devices"],
+    "social-media": ["AI infrastructure", "cloud services"],
+    "banking": ["payments network"],
+    "entertainment": ["streaming platform"],
+    "streaming": ["streaming platform"],
+    "fintech": ["payments network"],
+    "gig-economy": ["logistics network"],
+    "retail": ["flagship consumer devices", "logistics network"],
+    "crypto": ["payments network"],
+    "robotics": ["next-gen hardware", "AI infrastructure"],
+    "biotech": ["drug development pipeline", "clinical trial portfolio"],
+    "logistics": ["logistics network"],
+    "energy": ["energy production capacity", "refining operations"],
+    "industrials": ["industrial equipment lineup", "manufacturing capacity"],
+    "aerospace": ["aircraft manufacturing", "next-gen hardware"],
+    "consumer-staples": ["flagship consumer devices", "product lineup"],
+    "auto": ["electric vehicle lineup"],
+}
 
 REGIONS = ["Southeast Asian", "European", "Latin American", "Indian", "Middle Eastern"]
 ROLES = ["Chief Marketing Officer", "VP of Engineering", "Chief Operating Officer", "Head of AI Research"]
@@ -1554,6 +1598,22 @@ SECTOR_REINFORCED_PROB = 0.40
 # often, and no longer identical even when it is seen.
 VALUE_SCREEN_COMMENTARY_PROB = 0.25
 
+# Extends commentary eligibility to BULLISH/BEARISH/MIXED, at a LOWER rate
+# than VALUATION_SIGNAL's own - confirmed live (dataset-quality audit)
+# checklist vocabulary (quality/growth-adjusted-pricing language) reached
+# reasoning text on only ~8% of ALL rows (VALUATION_SIGNAL's 32% category
+# weight x 25% commentary rate), leaving Price/Book, FCF yield, Price/
+# Sales, and the sector-relative P/E comparison shown in market_data but
+# never used in ANY target output - the model has no training signal to
+# attend to them. This is a COVERAGE fix (more categories), not a
+# repeat of the FREQUENCY mistake VALUE_SCREEN_COMMENTARY_PROB's own
+# comment documents (v16 memorized this phrasing near-verbatim at a
+# higher combined rate than even this addition reaches) - 0.15 here,
+# applied to categories together weighted 0.40, adds ~6 points of
+# coverage (8% -> ~14% of all rows), well under the previously-reverted
+# ~20% that caused memorization.
+VALUE_SCREEN_COMMENTARY_PROB_OTHER_CATEGORIES = 0.15
+
 # Reported live (twice): a controlled gap this large is implausible for
 # real companies, especially the large, liquid, heavily-covered names in
 # COMPANIES (AAPL at "92% overvalued" was the specific example) - genuinely
@@ -1611,11 +1671,37 @@ def held_out_template_indices(templates):
     return {int(i * stride) for i in range(n_holdout)}
 
 
+def held_out_template_indices_stratified(templates, direction_index):
+    """Like held_out_template_indices, but strides WITHIN each direction
+    group separately before merging - confirmed live the plain
+    evenly-spaced-across-the-whole-list version could land entirely on
+    ONE direction when a list is internally grouped by direction (as
+    VALUATION_SIGNAL_SCENARIOS and MIXED_SIGNAL_SCENARIOS both are):
+    VALUATION_SIGNAL's holdout at {0, 7} was BOTH BULLISH;
+    MIXED_SIGNAL's at {0, 7} was BOTH BEARISH. That inverted the val
+    split's direction mix for those two categories relative to train
+    (VALUATION_SIGNAL: 97 BULL/49 BEAR in val vs 120/173 in train; MIXED:
+    6 BULL/32 BEAR in val vs 57/38 in train), so held-out generalization
+    for them was only ever measured in one direction. `direction_index`
+    is each scenario tuple's direction field position (both lists this
+    is used for put it at index 2)."""
+    by_direction = {}
+    for idx, template in enumerate(templates):
+        by_direction.setdefault(template[direction_index], []).append(idx)
+    holdout = set()
+    for indices in by_direction.values():
+        n = len(indices)
+        n_holdout = max(1, round(n * VAL_HOLDOUT_TEMPLATE_INDEX_FRACTION))
+        stride = n / n_holdout
+        holdout.update(indices[int(i * stride)] for i in range(n_holdout))
+    return holdout
+
+
 BULLISH_HOLDOUT_IDX = held_out_template_indices(BULLISH_SCENARIOS)
 BEARISH_HOLDOUT_IDX = held_out_template_indices(BEARISH_SCENARIOS)
 NEUTRAL_HOLDOUT_IDX = held_out_template_indices(NEUTRAL_SCENARIOS)
-MIXED_HOLDOUT_IDX = held_out_template_indices(MIXED_SIGNAL_SCENARIOS)
-VALUATION_SIGNAL_HOLDOUT_IDX = held_out_template_indices(VALUATION_SIGNAL_SCENARIOS)
+MIXED_HOLDOUT_IDX = held_out_template_indices_stratified(MIXED_SIGNAL_SCENARIOS, direction_index=2)
+VALUATION_SIGNAL_HOLDOUT_IDX = held_out_template_indices_stratified(VALUATION_SIGNAL_SCENARIOS, direction_index=2)
 
 
 def make_fields(company):
@@ -1623,7 +1709,7 @@ def make_fields(company):
     # scenario (e.g. a recall headline plus a "prior quarter" headline) must
     # reference the same product/quarter/numbers in both lines, not
     # independently re-rolled ones.
-    ticker, name, _sector, rev_range = company
+    ticker, name, informal_sector, rev_range = company
     return {
         "ticker": ticker,
         "name": name,
@@ -1632,7 +1718,7 @@ def make_fields(company):
         "beat": round(random.uniform(3.2, 18.5), 1),
         "drop": round(random.uniform(2.5, 12.0), 1),
         "units": random.randint(50, 500),
-        "product": random.choice(PRODUCTS),
+        "product": random.choice(PRODUCTS_BY_SECTOR.get(informal_sector, PRODUCTS)),
         "region": random.choice(REGIONS),
         "role": random.choice(ROLES),
         "buyback": round(random.uniform(1.0, 20.0), 1),
@@ -1673,6 +1759,36 @@ def format_market_cap(value):
     return f"${value / 1e9:.1f}B"
 
 
+def _ticker_trait_roll(ticker, salt):
+    """Stable per-ticker pseudo-random value in [0, 1), independent of the
+    global `random` stream's per-row position - used for company-level
+    TRAITS (does this ticker pay a dividend at all? is it a richly-valued
+    growth name? what's its typical share count) that should stay
+    constant across every row for the same ticker, not re-rolled per row.
+    Confirmed live this was a real problem when traits WERE re-rolled per
+    row: ~60% of TSLA/PLTR/COIN rows fabricated a dividend yield up to
+    3.2% for companies that pay zero, and the same ticker's market cap
+    varied 3-10x row to row (MSFT $931B-$9.16T) purely from an
+    independent per-row multiplier draw. `salt` differentiates
+    independent traits for the same ticker so they don't accidentally
+    correlate (e.g. dividend-payer status vs share-count baseline)."""
+    digest = hashlib.sha256(f"{ticker}:{salt}".encode()).hexdigest()
+    return int(digest[:8], 16) / 0xFFFFFFFF
+
+
+# Fraction of tickers treated as genuine dividend payers (a STABLE
+# per-ticker trait - see _ticker_trait_roll) - roughly matches the real
+# mix of large/mid-cap payers vs non-payers (growth-tech-heavy universes
+# skew lower than the broader market's ~70-80% payer rate).
+DIVIDEND_PAYER_FRACTION = 0.45
+# Fraction of tickers treated as richly-valued growth/momentum names -
+# confirmed live the flat pe_trailing range (6.0-28.0, capped at
+# Technology's own SECTOR_MEDIAN_PE) meant the model never saw an
+# expensive stock, a real gap for a value-investing model whose job
+# includes recognizing them.
+HIGH_MULTIPLE_FRACTION = 0.12
+
+
 def make_fundamentals(company, fields):
     # Derives every other synthetic fundamental from a single random price
     # draw so a given example's numbers stay internally consistent (e.g.
@@ -1683,13 +1799,18 @@ def make_fundamentals(company, fields):
     price_low, price_high = PRICE_RANGES[ticker]
     price = round(random.uniform(price_low, price_high), 2)
 
-    pe_trailing = round(random.uniform(6.0, 28.0), 1)
+    is_high_multiple = _ticker_trait_roll(ticker, "high_pe") < HIGH_MULTIPLE_FRACTION
+    if is_high_multiple:
+        pe_trailing = round(random.uniform(30.0, 90.0), 1)
+    else:
+        pe_trailing = round(random.uniform(6.0, 28.0), 1)
     eps_trailing = round(price / pe_trailing, 2)
     if random.random() < LOSS_MAKING_PROB:
         eps_trailing = -abs(round(random.uniform(0.10, 3.0), 2))
     pe_forward = round(pe_trailing * random.uniform(0.82, 1.05), 1)
 
-    div_yield = round(random.uniform(0.1, 3.2), 2) if random.random() < 0.6 else 0.0
+    is_dividend_payer = _ticker_trait_roll(ticker, "dividend") < DIVIDEND_PAYER_FRACTION
+    div_yield = round(random.uniform(0.1, 3.2), 2) if is_dividend_payer else 0.0
 
     year_low = round(price * random.uniform(0.72, 0.93), 2)
     year_high = round(price * random.uniform(1.07, 1.38), 2)
@@ -1719,7 +1840,14 @@ def make_fundamentals(company, fields):
     # -> more shares outstanding, roughly) without needing a second hand-
     # authored per-ticker range - precision doesn't matter here, only that
     # price * shares stays a plausible, internally consistent market cap.
-    shares_b = max(0.05, min(20.0, ((rev_low + rev_high) / 2) * random.uniform(0.04, 0.35)))
+    # The multiplier's BASELINE is now a stable per-ticker trait (see
+    # _ticker_trait_roll) spanning the same overall 0.04-0.35 population
+    # range, with only mild +/-10% row-to-row noise on top (real day-to-
+    # day share-count changes are small) - confirmed live the old fully
+    # independent per-row draw let the SAME ticker's market cap vary
+    # 3-10x across rows (MSFT $931B-$9.16T, NVDA capped ~1/4 of reality).
+    shares_baseline = 0.04 + _ticker_trait_roll(ticker, "shares") * 0.31
+    shares_b = max(0.05, min(20.0, ((rev_low + rev_high) / 2) * shares_baseline * random.uniform(0.9, 1.1)))
     market_cap = price * shares_b * 1e9
 
     anchor = datetime.date(2026, 8, 5)
@@ -1825,10 +1953,16 @@ def render_market_data(fnd):
     price_to_sales_str = f"{screen['price_to_sales']:.1f}" if screen["price_to_sales"] is not None else "N/A"
     fcf_yield_str = f"{screen['fcf_yield'] * 100:.1f}%" if screen["fcf_yield"] is not None else "N/A"
     peg_ratio_str = f"{screen['peg_ratio']:.1f}" if screen["peg_ratio"] is not None else "N/A"
-    sector_median_pe_str = (
-        f"{screen['sector_median_pe']:.1f} ({fnd['sector']})"
-        if screen["sector_median_pe"] is not None else "N/A"
-    )
+    # Sector name now renders even when no median exists for it - ported
+    # from fundamentals.py's identically-structured block (P7: the model
+    # has no other reliable in-prompt signal it's looking at a REIT
+    # specifically).
+    if screen["sector_median_pe"] is not None:
+        sector_median_pe_str = f"{screen['sector_median_pe']:.1f} ({fnd['sector']})"
+    elif fnd.get("sector"):
+        sector_median_pe_str = f"N/A ({fnd['sector']})"
+    else:
+        sector_median_pe_str = "N/A"
 
     return (
         f"Price: ${fnd['price']:.2f} | Market Cap: {format_market_cap(fnd['market_cap'])}\n"
@@ -1863,6 +1997,46 @@ def _payout_blend_fraction(payout_ratio):
     if not (low <= payout_ratio <= high):
         return None
     return (payout_ratio - low) / (high - low)
+
+
+# Below this gap %, a contradiction between the real DCF and a news-driven
+# label isn't material enough to call out - matches VALUATION_GAP_RANGES'
+# own "moderate" tier floor, the smallest gap this generator otherwise
+# treats as a real signal worth a dedicated VALUATION_SIGNAL scenario.
+VALUATION_CONFLICT_ACKNOWLEDGMENT_THRESHOLD = 30.0
+
+# Confirmed live (dataset-quality audit): for BULLISH/BEARISH/MIXED rows,
+# render_valuation runs the REAL DCF independently of which news-driven
+# label the row's headline/reasoning template resolved to - fnd's random
+# fundamentals draw has no relationship to the scenario picked, so the two
+# are statistically independent. In ~50% of large-gap (>=30%) rows the
+# valuation pointed the OPPOSITE direction from the label, and the
+# reasoning text never mentioned it - training the model to silently
+# ignore the Valuation block whenever news is present, the exact opposite
+# of SENTIMENT_WEIGHTS' own stated goal ("fundamentals should be the
+# model's primary, default driver"). VALUATION_SIGNAL's own "news_wins"
+# tier already teaches "news beats valuation" explicitly, with reasoning
+# that says so - these phrasings extend that same explicit acknowledgment
+# to the 175 rows that were teaching it silently instead. Multiple
+# phrasings (not one fixed sentence) for the same memorization-avoidance
+# reason as QUALITY_*_PHRASINGS above.
+VALUATION_CONFLICT_PHRASINGS = [
+    "A DCF estimate actually points the other way here ({verdict} by ~{pct:.0f}%), but the news above is the more immediate, concrete signal.",
+    "The valuation model reads {verdict} by roughly {pct:.0f}% here, though a specific, current catalyst like this should carry more weight than a static estimate.",
+    "This does screen as {verdict} on a DCF basis (~{pct:.0f}%), but that's a slower-moving signal than what's driving today's read.",
+]
+
+_VALUATION_GAP_RE = re.compile(r"(overvalued|undervalued) by [~>](\d+)%")
+
+
+def _parse_valuation_gap(valuation_text):
+    """Extracts (verdict, pct) from a rendered valuation_block string, or
+    None when there's no real directional gap to parse ("Data
+    unavailable.", "Not applicable (...)", "trading near fair value")."""
+    match = _VALUATION_GAP_RE.search(valuation_text)
+    if not match:
+        return None
+    return match.group(1), float(match.group(2))
 
 
 def render_valuation(fnd, ticker=None):
@@ -2082,9 +2256,14 @@ def make_example(company, category):
     # confirmed-live contradiction (found via a full generate() run before
     # this fix: 78/2000 rows had exactly this mismatch).
     if (
-        category == "VALUATION_SIGNAL"
-        and market_data_text != "Data unavailable."
-        and random.random() < VALUE_SCREEN_COMMENTARY_PROB
+        market_data_text != "Data unavailable."
+        and (
+            (category == "VALUATION_SIGNAL" and random.random() < VALUE_SCREEN_COMMENTARY_PROB)
+            or (
+                category in ("BULLISH", "BEARISH", "MIXED")
+                and random.random() < VALUE_SCREEN_COMMENTARY_PROB_OTHER_CATEGORIES
+            )
+        )
     ):
         commentary = describe_value_screen(fnd)
         if commentary:
@@ -2112,7 +2291,23 @@ def make_example(company, category):
             gap_pct = round(random.uniform(gap_low, gap_high), 1)
             valuation_text = valuation_block_with_gap(fnd, gap_pct, verdict)
     else:
+        # BULLISH/BEARISH/MIXED: valuation_text is the REAL DCF, drawn
+        # independently of the label above - see VALUATION_CONFLICT_
+        # PHRASINGS' own comment for why a large, silent contradiction
+        # here needs to become an explicit acknowledgment in `reasoning`.
         valuation_text = render_valuation(fnd, ticker)
+        parsed_gap = _parse_valuation_gap(valuation_text)
+        if parsed_gap is not None:
+            gap_verdict, gap_pct = parsed_gap
+            contradicts_label = (
+                (direction == "BULLISH" and gap_verdict == "overvalued")
+                or (direction == "BEARISH" and gap_verdict == "undervalued")
+            )
+            if contradicts_label and gap_pct >= VALUATION_CONFLICT_ACKNOWLEDGMENT_THRESHOLD:
+                acknowledgment = random.choice(VALUATION_CONFLICT_PHRASINGS).format(
+                    verdict=gap_verdict, pct=gap_pct,
+                )
+                reasoning = f"{reasoning} {acknowledgment}"
     earnings_text = render_earnings(fnd, earnings_direction or direction)
 
     answer = ANSWER_TEMPLATES[qtype][direction].format(ticker=ticker)

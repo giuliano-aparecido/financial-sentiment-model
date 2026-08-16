@@ -960,6 +960,11 @@ def _sustainable_growth_rate(fnd):
     return roe * (1 - payout_ratio)
 
 
+# See value_screen_metrics' own comment on peg_ratio - ported from
+# fundamentals.py's identically-named constant.
+PEG_MIN_GROWTH_FOR_COMPUTATION = 0.02
+
+
 def value_screen_metrics(fnd):
     """Ported byte-identical from financial-sentiment-api's fundamentals.py
     (see that module's own comment for the full rationale) - ROE, Price/
@@ -990,9 +995,10 @@ def value_screen_metrics(fnd):
     growth_0y = fnd.get("growth_0y")
     # PEG only means anything against POSITIVE expected growth - see
     # fundamentals.py's identical comment for why a negative/zero growth_0y
-    # is left None rather than shown as a misleadingly "cheap" number.
+    # is left None rather than shown as a misleadingly "cheap" number, and
+    # PEG_MIN_GROWTH_FOR_COMPUTATION for why near-zero growth is floored too.
     peg_ratio = None
-    if pe_trailing and growth_0y and growth_0y > 0:
+    if pe_trailing and growth_0y and growth_0y > PEG_MIN_GROWTH_FOR_COMPUTATION:
         peg_ratio = pe_trailing / (growth_0y * 100)
 
     price = fnd.get("price")
@@ -1442,10 +1448,14 @@ def build_fundamentals_blocks(ticker_obj, fundamentals_history, as_of_date):
         price_to_sales_str = f"{screen['price_to_sales']:.1f}" if screen["price_to_sales"] is not None else "N/A"
         fcf_yield_str = f"{screen['fcf_yield'] * 100:.1f}%" if screen["fcf_yield"] is not None else "N/A"
         peg_ratio_str = f"{screen['peg_ratio']:.1f}" if screen["peg_ratio"] is not None else "N/A"
-        sector_median_pe_str = (
-            f"{screen['sector_median_pe']:.1f} ({fundamentals_history['sector']})"
-            if screen["sector_median_pe"] is not None else "N/A"
-        )
+        # Sector name now renders even when no median exists for it -
+        # ported from fundamentals.py's identically-structured block (P7).
+        if screen["sector_median_pe"] is not None:
+            sector_median_pe_str = f"{screen['sector_median_pe']:.1f} ({fundamentals_history['sector']})"
+        elif fundamentals_history.get("sector"):
+            sector_median_pe_str = f"N/A ({fundamentals_history['sector']})"
+        else:
+            sector_median_pe_str = "N/A"
 
         market_data_block = (
             f"Price: ${price:.2f} | Market Cap: {format_market_cap(market_cap)}\n"
