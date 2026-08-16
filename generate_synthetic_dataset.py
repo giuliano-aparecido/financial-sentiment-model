@@ -276,7 +276,12 @@ STAGE_1_YEARS = 5
 STAGE_2_YEARS = 5
 
 ASSET_HEAVY_SECTORS = {"Energy", "Industrials", "Basic Materials", "Utilities"}
-DIVIDEND_PAYOUT_THRESHOLD = 0.40
+# Raised from 0.40: live data across 26 real tickers showed payout ratios
+# just above the old threshold (QCOM 0.41, LOW 0.406, AVGO 0.413, CSCO
+# 0.498) belong to low-yield growth companies routed into an inappropriate
+# dividend-discount model, not mature dividend payers - see valuation.py's
+# own comment for the full live evidence.
+DIVIDEND_PAYOUT_THRESHOLD = 0.55
 DIVIDEND_PAYOUT_CEILING = 1.20
 REIT_SECTORS = {"Real Estate"}
 
@@ -358,7 +363,10 @@ CURATED_SCENARIOS = {
 # applying growth assumptions calibrated for one basis's cash flow to a
 # DIFFERENT basis's cash flow produces a number with no relationship to
 # the analyst's actual target, not just a less accurate one. See that
-# module's own comment for the full rationale.
+# module's own comment for the full rationale, including why
+# render_valuation below now overrides classify_valuation_basis's output
+# with this tag outright for curated tickers rather than merely checking
+# the two agree.
 CURATED_SCENARIOS_BASIS = {
     "AAPL": "eps",
     "NVDA": "eps",
@@ -1603,6 +1611,14 @@ def render_valuation(fnd, ticker=None):
     basis = classify_valuation_basis(
         fnd["eps_trailing"], fnd["payout_ratio"], fnd["sector"], fnd["free_cash_flow"],
     )
+    # Ported from valuation.py's valuation_block_for: curated tickers
+    # override the generic classifier's output outright rather than only
+    # being used when it happens to agree - see CURATED_SCENARIOS_BASIS's
+    # comment for why (a curated ticker's basis was hand-verified against
+    # real analyst work, so it shouldn't be silently dropped as a side
+    # effect of a threshold/constant change elsewhere).
+    if ticker and ticker in CURATED_SCENARIOS_BASIS:
+        basis = CURATED_SCENARIOS_BASIS[ticker]
     cf0 = cash_flow_basis_value(basis, fnd)
     scenarios = build_scenarios(ticker, fnd, basis)
     intrinsic = intrinsic_value(cf0, basis, scenarios)
