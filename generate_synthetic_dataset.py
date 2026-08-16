@@ -721,6 +721,20 @@ ONE_TIME_ITEM_PE_RATIO_THRESHOLD = 0.5
 # "reverts by next year" signal above never fires - a persistent, not
 # one-off, EPS distortion). See that module's own comment.
 PERSISTENTLY_LOW_PE_THRESHOLD = 6.0
+# Fraction above consensus EPS estimate, for the most recently reported
+# quarter, that flags a likely one-time/non-operating item - ported from
+# valuation.py's EARNINGS_SURPRISE_ONE_TIME_ITEM_THRESHOLD (GOOG: two
+# consecutive quarters beating consensus by +94%/+213%, almost certainly
+# mark-to-market gains on equity investment stakes, not organic growth -
+# a distortion invisible to the two P/E-based screens above since GOOG's
+# P/E looked completely normal). This generator has no real earnings-
+# surprise concept (synthetic fnd has no "recent_eps_surprise" field), so
+# this check is a structural no-op here, kept only to stay byte-for-byte
+# in step with valuation.py per the 4-way sync rule. See that module's
+# own comment for the full rationale, including why this is checked in
+# render_valuation (a short-circuit BEFORE the compute/blend/fallback
+# pipeline) rather than here.
+EARNINGS_SURPRISE_ONE_TIME_ITEM_THRESHOLD = 0.75
 
 
 def cash_flow_basis_value(basis, fnd):
@@ -828,12 +842,16 @@ def build_scenarios(ticker, fnd, basis):
         # see G2_DIVIDENDS_FLOOR's comment
         g2_values = {name: max(value, G2_DIVIDENDS_FLOOR) for name, value in g1_values.items()}
     else:
-        g2_values = dict(GROWTH_BASIS_G2)
-        # Worst-case g2 can now go negative (min with worst-case g1) -
-        # ported from valuation.py after a confirmed live gap: a fixed
-        # +4% worst-case g2 made a structural value trap mathematically
-        # unrepresentable. See that module's own comment.
-        g2_values["worst"] = min(g2_values["worst"], g1_values["worst"])
+        # g2 = min(flat GROWTH_BASIS_G2 default, this SAME tier's own g1)
+        # for ALL three tiers - ported from valuation.py after confirming
+        # g2 <= g1 in every single one of CURATED_SCENARIOS' 18 g1/g2
+        # pairs (all 6 tickers, all 3 tiers). The flat 0.10/0.12 defaults
+        # only ever matched cases where g1 was already positive and above
+        # them (real fades DOWN); applying the same flat values when g1
+        # is small or negative was an unevidenced extrapolation (QCOM:
+        # -7.8% for 5 years then an unexplained flip to +10% growth). See
+        # that module's own comment for the full rationale.
+        g2_values = {name: min(GROWTH_BASIS_G2[name], g1_values[name]) for name in GROWTH_BASIS_G2}
 
     if basis == "revenue":
         exit_multiples = {
@@ -1976,7 +1994,13 @@ def render_market_data(fnd):
 
 
 DIVIDEND_PAYOUT_BLEND_HALF_WIDTH = 0.05
-FALLBACK_BASIS_ORDER = ["dividends", "fcf", "eps", "revenue"]
+# "fcf" ranked above "dividends" - ported from valuation.py after a
+# confirmed live bug: cash_flow_basis_value("dividends", ...) succeeds
+# for ANY company with a nonzero dividend_rate, no payout-ratio gate at
+# all, so a company whose eps got screened out fell back to a token
+# dividend instead of its real free cash flow. See that module's own
+# comment.
+FALLBACK_BASIS_ORDER = ["fcf", "eps", "dividends", "revenue"]
 
 
 def _classify_alternate_basis(sector, free_cash_flow):
@@ -2059,6 +2083,19 @@ def render_valuation(fnd, ticker=None):
     is_curated = bool(ticker and ticker in CURATED_SCENARIOS_BASIS)
     if is_curated:
         basis = CURATED_SCENARIOS_BASIS[ticker]
+
+    # Short-circuits the whole compute/blend/fallback pipeline below when
+    # the eps basis's trailing EPS looks one-time-item-distorted - ported
+    # from valuation.py's identically-structured check (see that module's
+    # own comment on EARNINGS_SURPRISE_ONE_TIME_ITEM_THRESHOLD and why
+    # this renders "Not applicable" rather than falling back to another
+    # basis). Structural no-op here (fnd has no real "recent_eps_surprise"
+    # field), kept only to stay byte-for-byte in step per the 4-way sync
+    # rule.
+    if not is_curated and basis == "eps":
+        recent_eps_surprise = fnd.get("recent_eps_surprise")
+        if recent_eps_surprise is not None and recent_eps_surprise > EARNINGS_SURPRISE_ONE_TIME_ITEM_THRESHOLD:
+            return valuation_block(fnd["price"], None, "eps")
 
     def compute(b, include_dividend_pv):
         cf0_ = cash_flow_basis_value(b, fnd)

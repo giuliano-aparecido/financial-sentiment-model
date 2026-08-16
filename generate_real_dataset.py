@@ -1049,6 +1049,16 @@ ONE_TIME_ITEM_PE_RATIO_THRESHOLD = 0.5
 # actually failed this way: pe_forward~3.5, ALSO abnormally low - a
 # persistent, not one-off, EPS distortion). See that module's own comment.
 PERSISTENTLY_LOW_PE_THRESHOLD = 6.0
+# Fraction above consensus EPS estimate, for the most recently reported
+# quarter, that flags a likely one-time/non-operating item - ported from
+# valuation.py's EARNINGS_SURPRISE_ONE_TIME_ITEM_THRESHOLD (GOOG: two
+# consecutive quarters beating consensus by +94%/+213%, almost certainly
+# mark-to-market gains on equity investment stakes, not organic growth -
+# a distortion invisible to the two P/E-based screens above since GOOG's
+# P/E looked completely normal). See that module's own comment for the
+# full rationale, including why this is checked as a short-circuit
+# BEFORE the compute/blend/fallback pipeline runs, not here.
+EARNINGS_SURPRISE_ONE_TIME_ITEM_THRESHOLD = 0.75
 
 
 def cash_flow_basis_value(basis, fnd):
@@ -1148,12 +1158,16 @@ def build_scenarios(ticker, fnd, basis):
         # see G2_DIVIDENDS_FLOOR's comment
         g2_values = {name: max(value, G2_DIVIDENDS_FLOOR) for name, value in g1_values.items()}
     else:
-        g2_values = dict(GROWTH_BASIS_G2)
-        # Worst-case g2 can now go negative (min with worst-case g1) -
-        # ported from valuation.py after a confirmed live gap: a fixed
-        # +4% worst-case g2 made a structural value trap mathematically
-        # unrepresentable. See that module's own comment.
-        g2_values["worst"] = min(g2_values["worst"], g1_values["worst"])
+        # g2 = min(flat GROWTH_BASIS_G2 default, this SAME tier's own g1)
+        # for ALL three tiers - ported from valuation.py after confirming
+        # g2 <= g1 in every single one of CURATED_SCENARIOS' 18 g1/g2
+        # pairs (all 6 tickers, all 3 tiers). The flat 0.10/0.12 defaults
+        # only ever matched cases where g1 was already positive and above
+        # them (real fades DOWN); applying the same flat values when g1
+        # is small or negative was an unevidenced extrapolation (QCOM:
+        # -7.8% for 5 years then an unexplained flip to +10% growth). See
+        # that module's own comment for the full rationale.
+        g2_values = {name: min(GROWTH_BASIS_G2[name], g1_values[name]) for name in GROWTH_BASIS_G2}
 
     if basis == "revenue":
         exit_multiples = {
@@ -1346,7 +1360,13 @@ def as_of_price(ticker_obj, as_of_date):
 
 
 DIVIDEND_PAYOUT_BLEND_HALF_WIDTH = 0.05
-FALLBACK_BASIS_ORDER = ["dividends", "fcf", "eps", "revenue"]
+# "fcf" ranked above "dividends" - ported from valuation.py after a
+# confirmed live bug: cash_flow_basis_value("dividends", ...) succeeds
+# for ANY company with a nonzero dividend_rate, no payout-ratio gate at
+# all, so a company whose eps got screened out fell back to a token
+# dividend instead of its real free cash flow. See that module's own
+# comment.
+FALLBACK_BASIS_ORDER = ["fcf", "eps", "dividends", "revenue"]
 
 
 def _classify_alternate_basis(sector, free_cash_flow):
@@ -1486,6 +1506,26 @@ def build_fundamentals_blocks(ticker_obj, fundamentals_history, as_of_date):
         # cash_flow_basis_value's one-time-item/persistent-distortion
         # screen (CHTR class), see that function's own comment.
         pe_trailing_for_valuation = price / eps_trailing if (eps_trailing and eps_trailing > 0) else None
+        # Feeds the EARNINGS_SURPRISE_ONE_TIME_ITEM_THRESHOLD screen
+        # (GOOG class) - reuses the SAME as-of-date-filtered "most
+        # recently reported prior quarter" logic as the earnings block
+        # below (not just the latest row in the full earnings_dates
+        # table), so a historical training example can't see a surprise
+        # from a quarter that, as of its own as_of_date, hasn't been
+        # reported yet.
+        recent_eps_surprise = None
+        earnings_dates_for_surprise = fundamentals_history["earnings_dates"]
+        if earnings_dates_for_surprise is not None and not earnings_dates_for_surprise.empty:
+            reported_for_surprise = earnings_dates_for_surprise.dropna(subset=["Reported EPS"]) \
+                if "Reported EPS" in earnings_dates_for_surprise.columns else earnings_dates_for_surprise.iloc[0:0]
+            surprise_as_of_ts = _as_of_timestamp(reported_for_surprise.index, as_of_date)
+            prior_reports_for_surprise = reported_for_surprise[reported_for_surprise.index < surprise_as_of_ts]
+            if not prior_reports_for_surprise.empty:
+                surprise_row = prior_reports_for_surprise.sort_index(ascending=False).iloc[0]
+                surprise_actual = surprise_row.get("Reported EPS")
+                surprise_est = surprise_row.get("EPS Estimate")
+                if surprise_actual is not None and surprise_est:
+                    recent_eps_surprise = (surprise_actual - surprise_est) / abs(surprise_est)
         basis = classify_valuation_basis(
             classify_eps, fundamentals_history["payout_ratio"],
             fundamentals_history["sector"], fundamentals_history["free_cash_flow"],
@@ -1503,6 +1543,7 @@ def build_fundamentals_blocks(ticker_obj, fundamentals_history, as_of_date):
             "pe_forward": fundamentals_history["pe_forward"],
             "currency": fundamentals_history["currency"],
             "financial_currency": fundamentals_history["financial_currency"],
+            "recent_eps_surprise": recent_eps_surprise,
             "dividend_rate": fundamentals_history["dividend_rate"],
             "market_cap": market_cap,
             "price": price,
@@ -1525,6 +1566,19 @@ def build_fundamentals_blocks(ticker_obj, fundamentals_history, as_of_date):
             "book_value_per_share": fundamentals_history["book_value_per_share"],
             "payout_ratio": fundamentals_history["payout_ratio"],
         }
+
+        # Short-circuits the whole compute/blend/fallback pipeline below
+        # when the eps basis's trailing EPS looks one-time-item-distorted
+        # - ported from valuation.py's identically-structured check (see
+        # that module's own comment on EARNINGS_SURPRISE_ONE_TIME_ITEM_
+        # THRESHOLD and why this renders "Not applicable" rather than
+        # falling back to another basis).
+        eps_distorted = (
+            not is_curated and basis == "eps"
+            and recent_eps_surprise is not None
+            and recent_eps_surprise > EARNINGS_SURPRISE_ONE_TIME_ITEM_THRESHOLD
+        )
+
         def compute(b, include_dividend_pv):
             cf0_ = cash_flow_basis_value(b, valuation_fnd)
             scenarios_ = build_scenarios(ticker_obj.ticker, valuation_fnd, b)
@@ -1532,40 +1586,43 @@ def build_fundamentals_blocks(ticker_obj, fundamentals_history, as_of_date):
             intrinsic_ = intrinsic_value(cf0_, b, scenarios_, dividend_rate_)
             return cf0_, scenarios_, intrinsic_
 
-        # Payout-threshold cliff smoothing - ported from valuation.py's
-        # identically-structured block. See that module's own comment.
-        blend_t = None
-        if not is_curated and basis != "revenue" and valuation_fnd.get("sector") not in REIT_SECTORS:
-            blend_t = _payout_blend_fraction(valuation_fnd.get("payout_ratio"))
-
-        if blend_t is not None:
-            alt_basis = _classify_alternate_basis(valuation_fnd.get("sector"), valuation_fnd.get("free_cash_flow"))
-            div_cf0, div_scenarios, div_iv = compute("dividends", False)
-            alt_cf0, alt_scenarios, alt_iv = compute(alt_basis, False)
-            if div_iv is not None and alt_iv is not None:
-                intrinsic = blend_t * div_iv + (1 - blend_t) * alt_iv
-                basis, cf0, scenarios = (
-                    ("dividends", div_cf0, div_scenarios) if blend_t >= 0.5 else (alt_basis, alt_cf0, alt_scenarios)
-                )
-            elif div_iv is not None:
-                basis, cf0, scenarios, intrinsic = "dividends", div_cf0, div_scenarios, div_iv
-            else:
-                basis, cf0, scenarios, intrinsic = alt_basis, alt_cf0, alt_scenarios, alt_iv
+        if eps_distorted:
+            intrinsic = None
         else:
-            cf0, scenarios, intrinsic = compute(basis, not is_curated)
+            # Payout-threshold cliff smoothing - ported from valuation.py's
+            # identically-structured block. See that module's own comment.
+            blend_t = None
+            if not is_curated and basis != "revenue" and valuation_fnd.get("sector") not in REIT_SECTORS:
+                blend_t = _payout_blend_fraction(valuation_fnd.get("payout_ratio"))
 
-        if intrinsic is None:
-            # Basis-fallback chain - ported from valuation.py's
-            # identically-structured block (a curated/REIT override with
-            # no usable cf0 retries other bases instead of a permanent
-            # "Not applicable").
-            for fallback_basis in FALLBACK_BASIS_ORDER:
-                if fallback_basis == basis:
-                    continue
-                fb_cf0, fb_scenarios, fb_intrinsic = compute(fallback_basis, True)
-                if fb_intrinsic is not None:
-                    basis, cf0, scenarios, intrinsic = fallback_basis, fb_cf0, fb_scenarios, fb_intrinsic
-                    break
+            if blend_t is not None:
+                alt_basis = _classify_alternate_basis(valuation_fnd.get("sector"), valuation_fnd.get("free_cash_flow"))
+                div_cf0, div_scenarios, div_iv = compute("dividends", False)
+                alt_cf0, alt_scenarios, alt_iv = compute(alt_basis, False)
+                if div_iv is not None and alt_iv is not None:
+                    intrinsic = blend_t * div_iv + (1 - blend_t) * alt_iv
+                    basis, cf0, scenarios = (
+                        ("dividends", div_cf0, div_scenarios) if blend_t >= 0.5 else (alt_basis, alt_cf0, alt_scenarios)
+                    )
+                elif div_iv is not None:
+                    basis, cf0, scenarios, intrinsic = "dividends", div_cf0, div_scenarios, div_iv
+                else:
+                    basis, cf0, scenarios, intrinsic = alt_basis, alt_cf0, alt_scenarios, alt_iv
+            else:
+                cf0, scenarios, intrinsic = compute(basis, not is_curated)
+
+            if intrinsic is None:
+                # Basis-fallback chain - ported from valuation.py's
+                # identically-structured block (a curated/REIT override
+                # with no usable cf0 retries other bases instead of a
+                # permanent "Not applicable").
+                for fallback_basis in FALLBACK_BASIS_ORDER:
+                    if fallback_basis == basis:
+                        continue
+                    fb_cf0, fb_scenarios, fb_intrinsic = compute(fallback_basis, True)
+                    if fb_intrinsic is not None:
+                        basis, cf0, scenarios, intrinsic = fallback_basis, fb_cf0, fb_scenarios, fb_intrinsic
+                        break
 
         valuation_block_text = valuation_block(price, intrinsic, basis)
     else:
