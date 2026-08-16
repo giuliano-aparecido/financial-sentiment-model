@@ -440,11 +440,13 @@ G1_FALLBACK = {"normal": 0.08, "best": 0.10, "worst": 0.04}
 # Ceiling on DERIVED g1 (real per-ticker consensus growth, not
 # CURATED_SCENARIOS) - ported from valuation.py's G1_CAP after a confirmed
 # live DCF blowup (this exact formula, run at scale via this generator,
-# showed a 90th-percentile gap of 91%, 99th of 354%, max 760%). See that
-# module's G1_CAP comment for the full rationale - set above NVDA's own
-# curated "best" g1 (0.30), CURATED_SCENARIOS tickers bypass this
-# entirely.
-G1_CAP = 0.40
+# showed a 90th-percentile gap of 91%, 99th of 354%, max 760%). Tightened
+# 0.40 -> 0.30 after the 19-ticker analyst comparison: 0.40 let a
+# derived/unverified g1 run MORE aggressive than NVDA's own curated "best"
+# g1 (0.30, the single most aggressive number a human has actually
+# vetted) - see valuation.py's own comment for the full rationale.
+# CURATED_SCENARIOS tickers bypass this entirely.
+G1_CAP = 0.30
 # Floor on DERIVED g1 - ported from valuation.py's G1_FLOOR after the same
 # QCOM investigation that motivated G2_DIVIDENDS_FLOOR above (see that
 # module's own comment): confirmed live this is a symmetric problem, not
@@ -452,6 +454,13 @@ G1_CAP = 0.40
 # (+0.03, real analyst-vetted numbers), same "don't disagree with actually
 # -vetted data" reasoning as G1_CAP.
 G1_FLOOR = -0.10
+
+# Rejects a consensus growth pair as "reliable" when EITHER year's
+# magnitude is this extreme, even same-direction - ported from
+# valuation.py's CONSENSUS_GROWTH_MAGNITUDE_CAP (GOOG's 90.4%
+# same-direction-but-implausible rebound-off-a-depressed-base case). See
+# that module's own comment.
+CONSENSUS_GROWTH_MAGNITUDE_CAP = 0.60
 
 # Sustainable growth rate (ROE x retention ratio) as a middle tier in g1's
 # derivation - ported from valuation.py's _sustainable_growth_rate/
@@ -466,6 +475,17 @@ G1_FLOOR = -0.10
 SUSTAINABLE_GROWTH_BEST_SPREAD = 0.02
 SUSTAINABLE_GROWTH_WORST_SPREAD = -0.04
 
+# Caps/floors the ROE input to the sustainable-growth-rate formula -
+# ported from valuation.py's SUSTAINABLE_GROWTH_ROE_CAP/_FLOOR after a
+# confirmed live 19-ticker analyst comparison: buyback-heavy companies'
+# eps_trailing/book_value_per_share ratio can explode well above 100%
+# (META/AMZN/TSLA/ADBE/BABA's actual overshoot mechanism), while a
+# dual-class-share book-value data artifact can push it to near-zero
+# (BRK-B). See that module's own comments for the full rationale -
+# 0.25/0.02 ported verbatim.
+SUSTAINABLE_GROWTH_ROE_CAP = 0.25
+SUSTAINABLE_GROWTH_ROE_FLOOR = 0.02
+
 
 def _sustainable_growth_rate(fnd):
     """ROE x (1 - payout_ratio). None (not a fetch failure) when
@@ -476,7 +496,10 @@ def _sustainable_growth_rate(fnd):
     book_value_per_share = fnd.get("book_value_per_share")
     if not eps_trailing or eps_trailing <= 0 or not book_value_per_share or book_value_per_share <= 0:
         return None
-    roe = eps_trailing / book_value_per_share
+    raw_roe = eps_trailing / book_value_per_share
+    if raw_roe < SUSTAINABLE_GROWTH_ROE_FLOOR:
+        return None
+    roe = min(raw_roe, SUSTAINABLE_GROWTH_ROE_CAP)
     payout_ratio = fnd.get("payout_ratio") or 0.0
     return roe * (1 - payout_ratio)
 
@@ -677,17 +700,54 @@ def _shares_outstanding_approx(market_cap, price):
     return market_cap / price
 
 
+# A trailing P/E below this fraction of forward P/E flags a likely
+# one-off EPS distortion that reverts by next year - ported from
+# valuation.py's ONE_TIME_ITEM_PE_RATIO_THRESHOLD (CHTR: pe_trailing~4.0
+# against a normal forward P/E). See that module's own comment.
+ONE_TIME_ITEM_PE_RATIO_THRESHOLD = 0.5
+# Absolute trailing P/E floor, checked only when pe_forward is ALSO below
+# it - ported from valuation.py's PERSISTENTLY_LOW_PE_THRESHOLD (CHTR
+# actually failed this way: pe_forward~3.5, ALSO abnormally low, so the
+# "reverts by next year" signal above never fires - a persistent, not
+# one-off, EPS distortion). See that module's own comment.
+PERSISTENTLY_LOW_PE_THRESHOLD = 6.0
+
+
 def cash_flow_basis_value(basis, fnd):
     """Extracts the per-share cash-flow figure for the classified basis -
     ported from valuation.py's identically-named function, adapted to this
     generator's fnd dict field names."""
     if basis == "eps":
-        return fnd.get("eps_trailing")
+        eps_trailing = fnd.get("eps_trailing")
+        pe_trailing = fnd.get("pe_trailing")
+        pe_forward = fnd.get("pe_forward")
+        price = fnd.get("price")
+        if (
+            eps_trailing and pe_trailing and pe_forward and price
+            and pe_trailing > 0 and pe_forward > 0
+            and pe_trailing < pe_forward * ONE_TIME_ITEM_PE_RATIO_THRESHOLD
+        ):
+            return price / pe_forward
+        if (
+            eps_trailing and pe_trailing and pe_trailing > 0 and pe_trailing < PERSISTENTLY_LOW_PE_THRESHOLD
+            and (pe_forward is None or (pe_forward > 0 and pe_forward < PERSISTENTLY_LOW_PE_THRESHOLD))
+        ):
+            return None
+        return eps_trailing
     if basis == "dividends":
         return fnd.get("dividend_rate")
 
     shares = _shares_outstanding_approx(fnd.get("market_cap"), fnd.get("price"))
     if not shares:
+        return None
+    # currency/financial_currency mismatch guard - ported from
+    # valuation.py's identically-named check; this generator's fnd dict
+    # has no such fields (synthetic data has no real cross-listing
+    # currency concept), so this is a structural no-op here, kept only to
+    # stay byte-for-byte in step with valuation.py per the 4-way sync rule.
+    currency = fnd.get("currency")
+    financial_currency = fnd.get("financial_currency")
+    if currency and financial_currency and currency != financial_currency:
         return None
     if basis == "revenue":
         revenue = fnd.get("total_revenue")
@@ -719,7 +779,12 @@ def build_scenarios(ticker, fnd, basis):
 
     growth_0y = fnd.get("growth_0y")
     growth_1y = fnd.get("growth_1y")
-    consensus_reliable = growth_0y is not None and growth_1y is not None and (growth_0y >= 0) == (growth_1y >= 0)
+    consensus_reliable = (
+        growth_0y is not None and growth_1y is not None
+        and (growth_0y >= 0) == (growth_1y >= 0)
+        and abs(growth_0y) <= CONSENSUS_GROWTH_MAGNITUDE_CAP
+        and abs(growth_1y) <= CONSENSUS_GROWTH_MAGNITUDE_CAP
+    )
     if consensus_reliable:
         # best/worst are OFFSETS from the same 2-year blend "normal" uses,
         # not growth_0y_high/low directly - ported from valuation.py's
@@ -727,14 +792,24 @@ def build_scenarios(ticker, fnd, basis):
         # G1_FLOOR's comment): the old direct-substitution version let
         # "best" end up WORSE than "normal" whenever growth_1y diverged a
         # lot from growth_0y, since best/worst never saw growth_1y at all.
+        # A missing bound mirrors the OTHER bound's offset (or, if
+        # NEITHER exists, the generic SUSTAINABLE_GROWTH_*_SPREAD) rather
+        # than leaving a stale prior-tier value in place - ported after a
+        # second confirmed live bug (see valuation.py's own comment).
         blended_normal = (growth_0y + growth_1y) / 2
-        g1_values["normal"] = blended_normal
         growth_0y_high = fnd.get("growth_0y_high")
         growth_0y_low = fnd.get("growth_0y_low")
-        if growth_0y_high is not None:
-            g1_values["best"] = blended_normal + (growth_0y_high - growth_0y)
-        if growth_0y_low is not None:
-            g1_values["worst"] = blended_normal - (growth_0y - growth_0y_low)
+        raw_high_offset = (growth_0y_high - growth_0y) if growth_0y_high is not None else None
+        raw_low_offset = (growth_0y - growth_0y_low) if growth_0y_low is not None else None
+        high_offset = raw_high_offset if raw_high_offset is not None else (
+            raw_low_offset if raw_low_offset is not None else SUSTAINABLE_GROWTH_BEST_SPREAD
+        )
+        low_offset = raw_low_offset if raw_low_offset is not None else (
+            raw_high_offset if raw_high_offset is not None else -SUSTAINABLE_GROWTH_WORST_SPREAD
+        )
+        g1_values["normal"] = blended_normal
+        g1_values["best"] = blended_normal + high_offset
+        g1_values["worst"] = blended_normal - low_offset
 
     # see G1_CAP's/G1_FLOOR's comments
     g1_values = {name: max(min(value, G1_CAP), G1_FLOOR) for name, value in g1_values.items()}
@@ -744,6 +819,11 @@ def build_scenarios(ticker, fnd, basis):
         g2_values = {name: max(value, G2_DIVIDENDS_FLOOR) for name, value in g1_values.items()}
     else:
         g2_values = dict(GROWTH_BASIS_G2)
+        # Worst-case g2 can now go negative (min with worst-case g1) -
+        # ported from valuation.py after a confirmed live gap: a fixed
+        # +4% worst-case g2 made a structural value trap mathematically
+        # unrepresentable. See that module's own comment.
+        g2_values["worst"] = min(g2_values["worst"], g1_values["worst"])
 
     if basis == "revenue":
         exit_multiples = {
@@ -751,12 +831,33 @@ def build_scenarios(ticker, fnd, basis):
             "best": REVENUE_BEST_EXIT_MULTIPLE,
             "worst": REVENUE_WORST_EXIT_MULTIPLE,
         }
-    else:
+    elif basis == "dividends":
+        # Shares eps/fcf's flat normal/best defaults; worst still varies
+        # by ASSET_HEAVY_SECTORS - ported from valuation.py after a
+        # separate, higher dividends-specific exit-multiple set was tried
+        # and reverted there (live QSR data showed it made the gap WORSE,
+        # not better - see that module's own comment for the full story).
         worst_exit_multiple = (
             WORST_EXIT_MULTIPLE_ASSET_HEAVY if fnd.get("sector") in ASSET_HEAVY_SECTORS
             else WORST_EXIT_MULTIPLE_DEFAULT
         )
         exit_multiples = {"normal": NORMAL_EXIT_MULTIPLE, "best": BEST_EXIT_MULTIPLE, "worst": worst_exit_multiple}
+    else:
+        # Sector-anchored ceiling on the normal/best exit multiple - ported
+        # from valuation.py's identically-structured block (min(flat
+        # default, this sector's SECTOR_MEDIAN_PE), preserving Technology's
+        # existing curated calibration while pulling down genuinely
+        # lower-multiple sectors like Energy/Financial Services). See that
+        # module's own comment for the full rationale.
+        sector = fnd.get("sector")
+        sector_median = SECTOR_MEDIAN_PE.get(sector)
+        normal_exit_multiple = min(NORMAL_EXIT_MULTIPLE, sector_median) if sector_median is not None else NORMAL_EXIT_MULTIPLE
+        best_exit_multiple = normal_exit_multiple + (BEST_EXIT_MULTIPLE - NORMAL_EXIT_MULTIPLE)
+        worst_exit_multiple = (
+            WORST_EXIT_MULTIPLE_ASSET_HEAVY if sector in ASSET_HEAVY_SECTORS
+            else WORST_EXIT_MULTIPLE_DEFAULT
+        )
+        exit_multiples = {"normal": normal_exit_multiple, "best": best_exit_multiple, "worst": worst_exit_multiple}
 
     return {
         name: {
@@ -793,25 +894,44 @@ def scenario_terminal_value(cf0, g1, g2, exit_multiple, discount_rate):
     return terminal_value / (1 + discount_rate) ** (STAGE_1_YEARS + STAGE_2_YEARS)
 
 
-def _scenario_pv(basis, cf0, g1, g2, exit_multiple, discount_rate):
+def _dividend_stream_pv(dividend_rate, g2, discount_rate):
+    """PV of a full 10-year dividend stream growing at g2 - ported from
+    valuation.py's identically-named function (added to the terminal-only
+    result for eps/fcf companies that pay SOME dividend below the
+    dividends-basis threshold - previously discarded entirely for a full
+    decade). See that module's own comment."""
+    pv = 0.0
+    dividend = dividend_rate
+    for year in range(1, STAGE_1_YEARS + STAGE_2_YEARS + 1):
+        dividend *= 1 + g2
+        pv += dividend / (1 + discount_rate) ** year
+    return pv
+
+
+def _scenario_pv(basis, cf0, g1, g2, exit_multiple, discount_rate, dividend_rate=None):
     if basis == "dividends":
         return scenario_dcf_value(cf0, g1, g2, exit_multiple, discount_rate)
-    return scenario_terminal_value(cf0, g1, g2, exit_multiple, discount_rate)
+    pv = scenario_terminal_value(cf0, g1, g2, exit_multiple, discount_rate)
+    if dividend_rate:
+        pv += _dividend_stream_pv(dividend_rate, g2, discount_rate)
+    return pv
 
 
-def scenario_present_values(cf0, basis, scenarios):
+def scenario_present_values(cf0, basis, scenarios, dividend_rate=None):
     return {
-        name: _scenario_pv(basis, cf0, scenario["g1"], scenario["g2"], scenario["exit_multiple"], DISCOUNT_RATE)
+        name: _scenario_pv(
+            basis, cf0, scenario["g1"], scenario["g2"], scenario["exit_multiple"], DISCOUNT_RATE, dividend_rate,
+        )
         for name, scenario in scenarios.items()
     }
 
 
-def intrinsic_value(cf0, basis, scenarios):
+def intrinsic_value(cf0, basis, scenarios, dividend_rate=None):
     """None (not a fetch failure) when cf0 is missing or non-positive -
     ported verbatim from valuation.py."""
     if cf0 is None or cf0 <= 0:
         return None
-    pvs = scenario_present_values(cf0, basis, scenarios)
+    pvs = scenario_present_values(cf0, basis, scenarios, dividend_rate)
     return sum(scenario["probability"] * pvs[name] for name, scenario in scenarios.items())
 
 
@@ -826,11 +946,22 @@ def valuation_block(price, intrinsic, basis):
         return "Data unavailable."
 
     pct = (price - intrinsic) / intrinsic * 100
+    raw_abs_pct = abs(pct)
+    # Below 1%, neither "overvalued" nor "undervalued" is a claim the
+    # number actually supports - ported from valuation.py (price==
+    # intrinsic used to render "overvalued by ~0%").
+    if raw_abs_pct < 1.0:
+        return f"Intrinsic Value ({label}): ${intrinsic:.2f}\nvs Current Price: trading near fair value"
+
     verdict = "overvalued" if pct >= 0 else "undervalued"
-    displayed_pct = min(abs(pct), VALUATION_PCT_DISPLAY_CAP)  # backstop, see valuation.py's own comment
+    # ">" once actually capped, not "~" - ported from valuation.py (see
+    # that module's own comment on why silently understating a genuinely
+    # extreme gap is worse than an honestly-flagged floor).
+    if raw_abs_pct > VALUATION_PCT_DISPLAY_CAP:
+        return f"Intrinsic Value ({label}): ${intrinsic:.2f}\nvs Current Price: {verdict} by >{VALUATION_PCT_DISPLAY_CAP:.0f}%"
     return (
         f"Intrinsic Value ({label}): ${intrinsic:.2f}\n"
-        f"vs Current Price: {verdict} by ~{displayed_pct:.0f}%"
+        f"vs Current Price: {verdict} by ~{raw_abs_pct:.0f}%"
     )
 
 PUBLISHERS = [
@@ -1710,6 +1841,30 @@ def render_market_data(fnd):
     )
 
 
+DIVIDEND_PAYOUT_BLEND_HALF_WIDTH = 0.05
+FALLBACK_BASIS_ORDER = ["dividends", "fcf", "eps", "revenue"]
+
+
+def _classify_alternate_basis(sector, free_cash_flow):
+    """Ported from valuation.py's identically-named function - the basis a
+    ticker would get if its payout_ratio fell just outside the dividends
+    band."""
+    if sector in ASSET_HEAVY_SECTORS and free_cash_flow is not None and free_cash_flow > 0:
+        return "fcf"
+    return "eps"
+
+
+def _payout_blend_fraction(payout_ratio):
+    """Ported from valuation.py's identically-named function."""
+    if payout_ratio is None:
+        return None
+    low = DIVIDEND_PAYOUT_THRESHOLD - DIVIDEND_PAYOUT_BLEND_HALF_WIDTH
+    high = DIVIDEND_PAYOUT_THRESHOLD + DIVIDEND_PAYOUT_BLEND_HALF_WIDTH
+    if not (low <= payout_ratio <= high):
+        return None
+    return (payout_ratio - low) / (high - low)
+
+
 def render_valuation(fnd, ticker=None):
     """Classifies the valuation basis and runs the scenario-DCF math ported
     above - same pipeline as valuation.py's valuation_block_for, adapted to
@@ -1727,11 +1882,51 @@ def render_valuation(fnd, ticker=None):
     # comment for why (a curated ticker's basis was hand-verified against
     # real analyst work, so it shouldn't be silently dropped as a side
     # effect of a threshold/constant change elsewhere).
-    if ticker and ticker in CURATED_SCENARIOS_BASIS:
+    is_curated = bool(ticker and ticker in CURATED_SCENARIOS_BASIS)
+    if is_curated:
         basis = CURATED_SCENARIOS_BASIS[ticker]
-    cf0 = cash_flow_basis_value(basis, fnd)
-    scenarios = build_scenarios(ticker, fnd, basis)
-    intrinsic = intrinsic_value(cf0, basis, scenarios)
+
+    def compute(b, include_dividend_pv):
+        cf0_ = cash_flow_basis_value(b, fnd)
+        scenarios_ = build_scenarios(ticker, fnd, b)
+        dividend_rate_ = fnd.get("dividend_rate") if include_dividend_pv else None
+        intrinsic_ = intrinsic_value(cf0_, b, scenarios_, dividend_rate_)
+        return cf0_, scenarios_, intrinsic_
+
+    # Payout-threshold cliff smoothing - ported from valuation.py's
+    # identically-structured block. See that module's own comment.
+    blend_t = None
+    if not is_curated and basis != "revenue" and fnd.get("sector") not in REIT_SECTORS:
+        blend_t = _payout_blend_fraction(fnd.get("payout_ratio"))
+
+    if blend_t is not None:
+        alt_basis = _classify_alternate_basis(fnd.get("sector"), fnd.get("free_cash_flow"))
+        div_cf0, div_scenarios, div_iv = compute("dividends", False)
+        alt_cf0, alt_scenarios, alt_iv = compute(alt_basis, False)
+        if div_iv is not None and alt_iv is not None:
+            intrinsic = blend_t * div_iv + (1 - blend_t) * alt_iv
+            basis, cf0, scenarios = (
+                ("dividends", div_cf0, div_scenarios) if blend_t >= 0.5 else (alt_basis, alt_cf0, alt_scenarios)
+            )
+        elif div_iv is not None:
+            basis, cf0, scenarios, intrinsic = "dividends", div_cf0, div_scenarios, div_iv
+        else:
+            basis, cf0, scenarios, intrinsic = alt_basis, alt_cf0, alt_scenarios, alt_iv
+    else:
+        cf0, scenarios, intrinsic = compute(basis, not is_curated)
+
+    if intrinsic is None:
+        # Basis-fallback chain - ported from valuation.py's identically-
+        # structured block (a curated/REIT override with no usable cf0
+        # retries other bases instead of a permanent "Not applicable").
+        for fallback_basis in FALLBACK_BASIS_ORDER:
+            if fallback_basis == basis:
+                continue
+            fb_cf0, fb_scenarios, fb_intrinsic = compute(fallback_basis, True)
+            if fb_intrinsic is not None:
+                basis, cf0, scenarios, intrinsic = fallback_basis, fb_cf0, fb_scenarios, fb_intrinsic
+                break
+
     return valuation_block(fnd["price"], intrinsic, basis)
 
 
