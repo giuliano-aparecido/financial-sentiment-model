@@ -149,7 +149,14 @@ NUM_EXAMPLES = 2000  # up from 1000 - more scenario categories need more rows
 # instead of 62/38.
 NUM_EXAMPLES = 1600
                       # to keep per-scenario-per-ticker counts reasonable
-VAL_HOLDOUT_TICKERS = {"META", "BA", "QRNL", "HRZN"}          # never seen in training
+# Doubled from {"META", "BA", "QRNL", "HRZN"} - confirmed live those 4
+# tickers accounted for 54.8% of ALL val rows (a company's full row
+# count lands in val unconditionally via VAL_HOLDOUT_TICKERS, on top of
+# whatever template-holdout rows other tickers also contribute), making
+# the val split's per-category accuracy largely a read on 4 specific
+# companies rather than a representative sample. 2 more real + 2 more
+# invented tickers, matching the original 2-real/2-invented mix.
+VAL_HOLDOUT_TICKERS = {"META", "BA", "QRNL", "HRZN", "NFLX", "JPM", "ZVEX", "VLTR"}  # never seen in training
 VAL_HOLDOUT_TEMPLATE_INDEX_FRACTION = 0.2                       # ~20% of each
                                                                   # category's templates
                                                                   # are validation-only
@@ -1282,39 +1289,86 @@ BEARISH_SCENARIOS = [
      "A credible insider's characterization of underlying weakness, even anecdotal, tilts the outlook for {ticker} negative.", "subtle"),
 ]
 
+# Reasoning is a LIST of 2-3 phrasing variants per entry (one picked at
+# random per row, same pattern as QUALITY_*_PHRASINGS/VALUATION_CONFLICT_
+# PHRASINGS above) rather than one fixed sentence - confirmed live these
+# 16 templates were the actual source of the dataset's template-
+# concentration problem: NEUTRAL's 28% category weight spread across
+# just 16 equally-likely templates means each one appears ~20+ times in
+# train by chance alone, and with only ONE fixed sentence each, that's
+# 20+ byte-identical reasoning strings apiece - the single largest
+# contributor to the top-20-templates-cover-40%-of-rows finding (see
+# docs/valuation-dataset-prompt-audit.md's D2). NEUTRAL's own scenarios
+# have less real narrative variety to work with than a news-driven
+# category (there are only so many ways to say "nothing happened"), so
+# unlike QUALITY_*_PHRASINGS this doesn't eliminate the risk, but it
+# meaningfully dilutes it - the SAME underlying judgment (this event
+# type is immaterial) no longer maps to one memorizable string.
 NEUTRAL_SCENARIOS = [
     (["{name} ({ticker}) held its annual shareholder meeting, re-electing current board members and approving standard compensation packages"],
-     "Routine governance updates and board re-elections do not materially alter {ticker}'s financial outlook."),
+     ["Routine governance updates and board re-elections do not materially alter {ticker}'s financial outlook.",
+      "Standard board re-elections and routine governance matters carry no real signal for {ticker}'s fundamentals.",
+      "Nothing about a routine annual meeting changes the financial picture for {ticker}."]),
     (["{name} ({ticker}) announced a minor realignment of internal operational segments to streamline corporate reporting"],
-     "Internal restructuring without reported workforce reductions or segment sales is financially neutral for {ticker}."),
+     ["Internal restructuring without reported workforce reductions or segment sales is financially neutral for {ticker}.",
+      "A reporting-line realignment with no layoffs or divestitures attached doesn't move the needle on {ticker}'s fundamentals.",
+      "Absent any workforce cuts or asset sales, this kind of internal reshuffling is financially inconsequential for {ticker}."]),
     (["{name} ({ticker}) reported Q{q} revenue of ${rev}B, in line with analyst expectations"],
-     "In-line results confirm the existing outlook for {ticker} without introducing new directional information."),
+     ["In-line results confirm the existing outlook for {ticker} without introducing new directional information.",
+      "Results landing right at expectations don't shift {ticker}'s outlook in either direction.",
+      "Matching consensus, rather than beating or missing it, gives no new signal on {ticker}."]),
     (["Analysts maintained their 'Hold' rating on {ticker} ({name}), citing balanced risk/reward at current levels"],
-     "A maintained Hold rating reflects no material change in the balance of risks for {ticker}."),
+     ["A maintained Hold rating reflects no material change in the balance of risks for {ticker}.",
+      "Analysts holding their rating steady signals the risk/reward on {ticker} hasn't meaningfully shifted.",
+      "An unchanged Hold call is a non-event for {ticker} - the analyst's view simply hasn't moved."]),
     (["{name} ({ticker}) unveiled its next-generation {product} at an industry event, with pricing and availability details expected later this year"],
-     "Without pricing, availability, or financial guidance attached, a product preview carries no near-term earnings implication."),
+     ["Without pricing, availability, or financial guidance attached, a product preview carries no near-term earnings implication.",
+      "A preview with no pricing or shipping details attached says nothing about near-term earnings for {ticker}.",
+      "Until pricing and availability are announced, this kind of product reveal has no financial signal to extract."]),
     (["{name} ({ticker}) filed its routine quarterly report with no material changes to previously issued guidance"],
-     "A routine filing that reaffirms existing guidance introduces no new information."),
+     ["A routine filing that reaffirms existing guidance introduces no new information.",
+      "Reaffirming prior guidance in a routine filing tells the market nothing it didn't already know.",
+      "This filing changes nothing - guidance is exactly where it already stood."]),
     (["{name} ({ticker}) named a new {role} to its leadership team, effective next quarter"],
-     "A leadership appointment outside the CEO/CFO level is not typically financially material on its own."),
+     ["A leadership appointment outside the CEO/CFO level is not typically financially material on its own.",
+      "A new hire below the C-suite's top two roles rarely moves the financial needle by itself.",
+      "Sub-CEO/CFO leadership changes are routine and don't carry standalone financial weight for {ticker}."]),
     (["{name} ({ticker}) made a small minority investment in a {product} startup, with terms not disclosed"],
-     "An undisclosed minority stake is too small and uncertain in scope to be directionally meaningful for {ticker}."),
+     ["An undisclosed minority stake is too small and uncertain in scope to be directionally meaningful for {ticker}.",
+      "With neither size nor terms disclosed, a minority investment like this is too vague to read as a signal for {ticker}.",
+      "A stake this small and this undisclosed doesn't tell us anything directional about {ticker}."]),
     (["An analyst initiated coverage on {ticker} ({name}) with a 'Neutral' rating and no strong directional view"],
-     "A neutral initiation with no strong view either way introduces no new directional information for {ticker}."),
+     ["A neutral initiation with no strong view either way introduces no new directional information for {ticker}.",
+      "An analyst starting coverage with an explicitly neutral stance isn't taking a side on {ticker}.",
+      "A 'Neutral' initiation is, by design, not a directional call on {ticker}."]),
     (["{name} ({ticker}) declined to comment on market speculation regarding a potential acquisition"],
-     "An unconfirmed rumor with no company statement carries no verifiable financial information for {ticker}."),
+     ["An unconfirmed rumor with no company statement carries no verifiable financial information for {ticker}.",
+      "Speculation the company won't confirm or deny isn't something to trade {ticker} on.",
+      "Without company confirmation, this remains market chatter, not verifiable information about {ticker}."]),
     (["An executive at {name} ({ticker}) sold shares under a pre-scheduled 10b5-1 trading plan"],
-     "Pre-scheduled sales under a 10b5-1 plan are routine and don't reflect a discretionary view on {ticker}'s prospects."),
+     ["Pre-scheduled sales under a 10b5-1 plan are routine and don't reflect a discretionary view on {ticker}'s prospects.",
+      "10b5-1 sales are set up in advance precisely so they don't signal anything about the executive's current view of {ticker}.",
+      "Because these sales were scheduled ahead of time, they say nothing about how the executive feels about {ticker} today."]),
     (["{name} ({ticker}) presented at an industry conference, reiterating previously disclosed strategic priorities"],
-     "Reiterating existing strategy at a conference introduces no new financial information for {ticker}."),
+     ["Reiterating existing strategy at a conference introduces no new financial information for {ticker}.",
+      "Repeating an already-disclosed strategy at a conference doesn't add anything new about {ticker}.",
+      "There's no new financial information here - just a restatement of {ticker}'s known priorities."]),
     (["{name} ({ticker}) settled a legal claim for an amount consistent with previously reserved funds"],
-     "A settlement within already-reserved amounts has no incremental impact on {ticker}'s financial position."),
+     ["A settlement within already-reserved amounts has no incremental impact on {ticker}'s financial position.",
+      "Since the funds were already set aside, this settlement doesn't change {ticker}'s financial position at all.",
+      "A settlement that matches existing reserves is a balance-sheet non-event for {ticker}."]),
     (["{name} ({ticker}) rebranded its {product} line with a new name and visual identity"],
-     "A branding update with no pricing or product changes is not typically financially material for {ticker}."),
+     ["A branding update with no pricing or product changes is not typically financially material for {ticker}.",
+      "A cosmetic rebrand, with pricing and the product itself unchanged, has no real financial weight for {ticker}.",
+      "Visual identity changes alone don't move the financial story for {ticker}."]),
     (["{name} ({ticker}) confirmed capital expenditure plans for {product} in line with previous guidance"],
-     "Spending in line with prior guidance confirms, rather than changes, the existing outlook for {ticker}."),
+     ["Spending in line with prior guidance confirms, rather than changes, the existing outlook for {ticker}.",
+      "Capex tracking exactly to prior guidance is confirmation, not new information, for {ticker}.",
+      "Nothing here updates {ticker}'s outlook - spending is right where it was already expected to be."]),
     (["Analysts left their price target on {ticker} ({name}) unchanged following a routine quarterly review"],
-     "An unchanged price target after a routine review reflects no material shift in analysts' view of {ticker}."),
+     ["An unchanged price target after a routine review reflects no material shift in analysts' view of {ticker}.",
+      "Analysts holding their target steady after a routine look tells us their view of {ticker} hasn't changed.",
+      "A price target left untouched after a routine review is itself the signal: no material shift in view."]),
 ]
 
 # Each entry needs TWO headline templates (a positive element and a negative
@@ -2275,7 +2329,8 @@ def make_example(company, category):
         conf_low, conf_high = CONFIDENCE_RANGES["MIXED"]["clear"]
     elif category == "NEUTRAL":
         idx = random.randrange(len(NEUTRAL_SCENARIOS))
-        headline_templates, reasoning_template = NEUTRAL_SCENARIOS[idx]
+        headline_templates, reasoning_variants = NEUTRAL_SCENARIOS[idx]
+        reasoning_template = random.choice(reasoning_variants)
         direction = "NEUTRAL"
         is_holdout_template = idx in NEUTRAL_HOLDOUT_IDX
         conf_low, conf_high = CONFIDENCE_RANGES["NEUTRAL"]["clear"]
