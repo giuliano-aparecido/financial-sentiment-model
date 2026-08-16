@@ -260,11 +260,77 @@ property of a 2-stage terminal-value DCF applied mechanically to
 real-world consensus data, and matches this module's own documented
 history of iterative, evidence-driven (not theoretical) calibration.
 
+## G. Follow-up investigation, triggered by user spot-checks after phase 1
+
+Two further real bugs surfaced from the user directly questioning specific
+post-fix numbers rather than accepting the aggregate improvement - a good
+example of why per-ticker spot-checks matter even after a "net positive"
+verification pass.
+
+30. **g2's g1-ceiling generalized from worst-only to all three tiers**
+    (triggered by: "QCOM still shows overvalued ~74%, is that right?").
+    Investigation confirmed the classification bug (dividends->eps) was
+    genuinely fixed, but surfaced that normal/best g2 were still flat
+    `GROWTH_BASIS_G2` defaults (0.10/0.12) regardless of g1, while only
+    worst-case g2 was capped at g1 (finding #11's fix). Re-examined all
+    18 curated g1/g2 pairs (6 tickers x 3 tiers): **g2 <= g1 in every
+    single case**, several (AAPL/XOM/PEP) even showing g2 == g1. The
+    flat defaults only ever matched cases where g1 was already positive
+    and above them (real fades DOWN); applying them when g1 is small or
+    negative was an unevidenced extrapolation in the untested direction
+    - QCOM's "normal" scenario projected years 1-5 at -7.8% (its own
+    real consensus) then flipped to +10% GROWTH for years 6-10 with no
+    basis for that reversal. Fixed: `g2 = min(GROWTH_BASIS_G2[tier],
+    g1_values[tier])` for all three tiers. Re-verified against the
+    19-ticker table: ACN (a phase-1 regression) improved substantially
+    (+43.9% -> +27.3%); BRK-B/BABA moved from excellent matches to
+    still-good ones (-8.7% -> -15.1%, -8.3% -> -15.2%, both under 20%).
+31. **Trailing-EPS distortion from one-time earnings surprises** (GOOG/
+    AMZN) (triggered by: "I see Google completely different [from the
+    analyst]"). The user supplied the analyst's real GOOG assumptions
+    (12%/12%/20x, 15%/15%/25x, 8%/6%/15x normal/best/worst, EPS $8.62).
+    Verified live: those assumptions reproduce the analyst's $200.14
+    target within +6.7% using EPS $8.62 - but our live-fetched trailing
+    EPS is $19.93, a 2.3x mismatch that alone explains almost the entire
+    error. Root cause: GOOG's last two reported quarters beat consensus
+    EPS by +94% and +213% - almost certainly mark-to-market gains on
+    Alphabet's equity investment stakes, not organic operating growth.
+    This is the mirror image of findings #4/#4b (which catch a distorted
+    EPS via an anomalously LOW P/E) - GOOG's P/E looks completely normal
+    (17.2x) precisely because the inflated EPS denominator masks it, so
+    neither existing screen fires. Added `EARNINGS_SURPRISE_ONE_TIME_
+    ITEM_THRESHOLD` (0.75) comparing the most recent reported quarter's
+    actual EPS against consensus. **Iteration required**: the first
+    version let this fall through to the basis-fallback chain like the
+    other one-time-item screens - but live testing showed AMZN (same
+    94%/214%-class distortion) has an ALSO-distorted fcf fallback the
+    same quarter, for an unrelated reason (a heavy AI-infrastructure
+    capex cycle crushing free cash flow). The fallback didn't produce a
+    correct number, just a differently wrong one (AMZN's diff flipped
+    from +156.9% overvalued-looking to -93.8% undervalued-looking).
+    Fixed by short-circuiting to "Not applicable" BEFORE the compute/
+    blend/fallback pipeline runs, rather than cascading through it - the
+    "some other basis is probably clean" assumption the fallback chain
+    relies on doesn't hold when a company has two simultaneous, unrelated
+    reporting anomalies. Not applied to curated tickers. Also reordered
+    `FALLBACK_BASIS_ORDER` (fcf before dividends) after finding an
+    independent bug: "dividends" ranked first succeeds for ANY company
+    with a nonzero dividend_rate, no payout-ratio gate at all - GOOG's
+    fallback (before the short-circuit fix) landed on its token $0.88
+    dividend instead of a more meaningful cash-flow measure. GOOG and
+    AMZN now render "Not applicable" instead of confidently wrong
+    numbers (+227.2% and +156.9% respectively, pre-fix). **GOOG is not
+    yet curated** - the user's real assumptions are verified and ready,
+    but curating it needs a $8.62 cf0 override (not just growth/exit
+    numbers), architecturally different from how the other 6 curated
+    tickers work (their cf0 is always live-fetched and happened to
+    already match). Follow-up work, not done in this round.
+
 ## Verification
 
-- financial-sentiment-api: full pytest suite green (215/215) after every
-  commit; live re-verification of the 19-ticker analyst comparison after
-  each round of DCF changes.
+- financial-sentiment-api: full pytest suite green (215/215, 219/219 after
+  the follow-up round) after every commit; live re-verification of the
+  19-ticker analyst comparison after each round of DCF changes.
 - financial-sentiment-model-colab: `generate_synthetic_dataset.py`'s
   `generate()` produces 1600 examples with no errors after all fixes;
   `generate_real_dataset.py`'s `build_fundamentals_blocks` produces
