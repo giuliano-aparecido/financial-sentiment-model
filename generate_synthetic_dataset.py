@@ -1797,14 +1797,51 @@ def _ticker_trait_roll(ticker, salt):
 # Fraction of tickers treated as genuine dividend payers (a STABLE
 # per-ticker trait - see _ticker_trait_roll) - roughly matches the real
 # mix of large/mid-cap payers vs non-payers (growth-tech-heavy universes
-# skew lower than the broader market's ~70-80% payer rate).
+# skew lower than the broader market's ~70-80% payer rate). Applies ONLY
+# to INVENTED_COMPANIES (no real answer to get wrong) - see
+# REAL_DIVIDEND_PAYERS/REAL_NON_DIVIDEND_PAYERS below for why COMPANIES'
+# real tickers use actual knowledge instead of a hash.
 DIVIDEND_PAYER_FRACTION = 0.45
 # Fraction of tickers treated as richly-valued growth/momentum names -
 # confirmed live the flat pe_trailing range (6.0-28.0, capped at
 # Technology's own SECTOR_MEDIAN_PE) meant the model never saw an
 # expensive stock, a real gap for a value-investing model whose job
-# includes recognizing them.
+# includes recognizing them. Same real-tickers-use-real-knowledge caveat
+# as DIVIDEND_PAYER_FRACTION - see REAL_HIGH_MULTIPLE_TICKERS/
+# REAL_LOW_MULTIPLE_TICKERS below.
 HIGH_MULTIPLE_FRACTION = 0.12
+
+# Real dividend-payer status for the actual companies in COMPANIES (not
+# INVENTED_COMPANIES, which have no real answer to get wrong) - confirmed
+# live the hash-based _ticker_trait_roll approach, while correctly fixing
+# the original row-to-row flip-flopping bug, produced a DIFFERENT, still
+# real error: a hash has no relationship to actual corporate policy, so
+# AMZN (famous for NEVER paying a dividend) landed in the "payer" bucket
+# by chance, and TSLA/COIN similarly, while AAPL/GOOGL/META/MSFT (real,
+# if sometimes modest, payers) landed in "non-payer". NVDA pays a real
+# but negligible (~0.03%) dividend - treated as a non-payer here since
+# even this generator's SMALLEST yield draw (0.1%) would still overstate
+# it 3x+. INTC/BA are real companies that suspended their dividends
+# (2024/2020 respectively) and hadn't confirmed resumption as of this
+# generator's last real-world check - treated as non-payers rather than
+# assuming an unconfirmed resumption.
+REAL_DIVIDEND_PAYERS = {"AAPL", "MSFT", "GOOGL", "META", "JPM", "DIS", "CRM", "SBUX", "XOM", "PEP"}
+REAL_NON_DIVIDEND_PAYERS = {
+    "TSLA", "NVDA", "AMZN", "AMD", "NFLX", "INTC", "BA", "PYPL", "SHOP", "UBER", "COIN", "PLTR",
+}
+
+# Real, well-known high/low trading-multiple status for the actual
+# companies in COMPANIES - same "real tickers deserve real knowledge, not
+# a hash" reasoning as REAL_DIVIDEND_PAYERS above. Confirmed live the
+# hash-based version marked JPM (a low-multiple bank, real P/E typically
+# 10-14x) as a high-multiple name while leaving TSLA/NVDA/PLTR (genuinely,
+# famously high-multiple growth names) in the normal range. Deliberately
+# NOT an exhaustive classification of all 22 real tickers - only the ones
+# unambiguous enough in either direction to be worth hand-verifying; the
+# rest keep the existing hash-based/random behavior, which is a reasonable
+# approximation for names whose real multiple is more genuinely variable.
+REAL_HIGH_MULTIPLE_TICKERS = {"NVDA", "TSLA", "PLTR", "SHOP"}
+REAL_LOW_MULTIPLE_TICKERS = {"JPM", "XOM", "PEP", "INTC"}
 
 
 def make_fundamentals(company, fields):
@@ -1817,7 +1854,12 @@ def make_fundamentals(company, fields):
     price_low, price_high = PRICE_RANGES[ticker]
     price = round(random.uniform(price_low, price_high), 2)
 
-    is_high_multiple = _ticker_trait_roll(ticker, "high_pe") < HIGH_MULTIPLE_FRACTION
+    if ticker in REAL_HIGH_MULTIPLE_TICKERS:
+        is_high_multiple = True
+    elif ticker in REAL_LOW_MULTIPLE_TICKERS:
+        is_high_multiple = False
+    else:
+        is_high_multiple = _ticker_trait_roll(ticker, "high_pe") < HIGH_MULTIPLE_FRACTION
     if is_high_multiple:
         pe_trailing = round(random.uniform(30.0, 90.0), 1)
     else:
@@ -1827,7 +1869,12 @@ def make_fundamentals(company, fields):
         eps_trailing = -abs(round(random.uniform(0.10, 3.0), 2))
     pe_forward = round(pe_trailing * random.uniform(0.82, 1.05), 1)
 
-    is_dividend_payer = _ticker_trait_roll(ticker, "dividend") < DIVIDEND_PAYER_FRACTION
+    if ticker in REAL_DIVIDEND_PAYERS:
+        is_dividend_payer = True
+    elif ticker in REAL_NON_DIVIDEND_PAYERS:
+        is_dividend_payer = False
+    else:
+        is_dividend_payer = _ticker_trait_roll(ticker, "dividend") < DIVIDEND_PAYER_FRACTION
     div_yield = round(random.uniform(0.1, 3.2), 2) if is_dividend_payer else 0.0
 
     year_low = round(price * random.uniform(0.72, 0.93), 2)
