@@ -380,21 +380,21 @@ CONTRADICTS_MAX_FRACTION = 0.20
 FORWARD_WINDOW_TRADING_DAYS = 3   # how many trading days after the headline
                                    # to measure the price move over
 
-# Threshold experiment: this is a genuine label-quality knob. The default
-# (+/-2%) is loose enough that ambiguous, low-conviction moves get labeled
-# with full confidence. Worth generating a second dataset variant at a
-# stricter +/-3% or +/-4% and comparing eval results - fewer real examples,
-# but each one a cleaner signal. To run that comparison without overwriting
-# the default output:
-#
-#   BULLISH_THRESHOLD, BEARISH_THRESHOLD = 0.03, -0.03
-#   OUTPUT_TRAIN_FILE = "dataset_train_real_strict.jsonl"
-#   OUTPUT_VAL_FILE = "dataset_val_real_strict.jsonl"
-#
-# then point the training script's data_files at whichever variant (or
-# both) you want to compare.
-BULLISH_THRESHOLD = 0.02          # forward return >= +2% -> BULLISH
-BEARISH_THRESHOLD = -0.02         # forward return <= -2% -> BEARISH
+# Tightened from +/-2% - a real, confirmed-live label-quality problem, not
+# just theoretical: a v16 eval run scored 32% direction accuracy on real
+# val (below the 33% random baseline for 3-way classification), with the
+# model heavily avoiding NEUTRAL even though real val's true label was
+# NEUTRAL ~49% of the time. +/-2% over a 3-trading-day window is well
+# within normal daily noise for plenty of tickers, so a meaningful chunk
+# of "real" BULLISH/BEARISH training labels were likely just capturing
+# unrelated price wiggle, not a genuine headline-driven move - training
+# the model that confident directional calls are normal even without a
+# real catalyst. +/-3% doesn't fully solve this (some noise still clears
+# any fixed threshold) but is a meaningfully cleaner signal at a real,
+# accepted cost: fewer kept examples per ticker/window, since more
+# borderline moves now fall into NEUTRAL instead.
+BULLISH_THRESHOLD = 0.03          # forward return >= +3% -> BULLISH
+BEARISH_THRESHOLD = -0.03         # forward return <= -3% -> BEARISH
                                    # (between the two -> NEUTRAL)
 OUTPUT_TRAIN_FILE = "dataset_train_real.jsonl"
 OUTPUT_VAL_FILE = "dataset_val_real.jsonl"
