@@ -298,21 +298,38 @@ def run_eval(label):
 # Pass 1: the fine-tuned model (adapter active) - the number that matters.
 tuned = run_eval("FINE-TUNED model")
 
-# The GPU script clears the CUDA cache here between passes to avoid an
-# OOM partway through pass 2 (this happened live during development on a
-# free T4). XLA's memory allocator has no direct manual-release equivalent
-# to CUDA's caching allocator, so there's nothing to call here - if pass 2
-# runs short on TPU memory, that's a real capacity issue to address (e.g.
-# smaller EVAL_SAMPLE_PER_SOURCE), not a cache to clear.
+# Pass 2 (base model) roughly doubles total eval time - worth it the FIRST
+# time you eval a given prompt/schema shape, since without it there's no
+# baseline to tell "65% accuracy" apart from "would have scored 65% doing
+# nothing" (see docs/training-results-analysis.md's "No baseline" section
+# - this pass exists specifically to fix that gap for direction accuracy,
+# not just loss). Once you've established that baseline once, it doesn't
+# need re-confirming on every subsequent quick-iteration eval - set
+# SKIP_BASE_MODEL_EVAL (Colab/Kaggle Secret or env var, same mechanism as
+# MODEL_CHOICE/MODEL_VERSION) to "1"/"true"/"yes" to skip straight to just
+# the tuned-model number.
+SKIP_BASE_MODEL_EVAL = (get_secret("SKIP_BASE_MODEL_EVAL") or "").strip().lower() in ("1", "true", "yes")
 
-# Pass 2: the base model, by temporarily disabling the LoRA adapter on the
-# same loaded model - no second download, no extra memory. This is the
-# baseline that tells us whether training added value at all. Guarded so a
-# surprise here can't erase the tuned results already printed above.
-try:
-    with model.disable_adapter():
-        base = run_eval("BASE model (adapter disabled)")
-except Exception as e:
-    print(f"Base-model pass failed ({e!r}) - tuned results above still stand. "
-          "Fallback: reload the base model fresh in a new cell and rerun "
-          "run_eval, or share this error.")
+if SKIP_BASE_MODEL_EVAL:
+    print("SKIP_BASE_MODEL_EVAL set - skipping the base-model comparison pass.")
+else:
+    # The GPU script clears the CUDA cache here between passes to avoid an
+    # OOM partway through pass 2 (this happened live during development on
+    # a free T4). XLA's memory allocator has no direct manual-release
+    # equivalent to CUDA's caching allocator, so there's nothing to call
+    # here - if pass 2 runs short on TPU memory, that's a real capacity
+    # issue to address (e.g. smaller EVAL_SAMPLE_PER_SOURCE), not a cache
+    # to clear.
+
+    # Pass 2: the base model, by temporarily disabling the LoRA adapter on
+    # the same loaded model - no second download, no extra memory. This is
+    # the baseline that tells us whether training added value at all.
+    # Guarded so a surprise here can't erase the tuned results already
+    # printed above.
+    try:
+        with model.disable_adapter():
+            base = run_eval("BASE model (adapter disabled)")
+    except Exception as e:
+        print(f"Base-model pass failed ({e!r}) - tuned results above still stand. "
+              "Fallback: reload the base model fresh in a new cell and rerun "
+              "run_eval, or share this error.")
