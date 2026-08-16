@@ -24,7 +24,10 @@ doesn't (see docs/training-results-analysis.md):
   - JSON validity rate of the model's raw output
   - the same numbers for the BASE model (LoRA adapter temporarily
     disabled) as the missing baseline - the base-vs-tuned delta is the
-    true value of the whole training pipeline.
+    true value of the whole training pipeline. Set SKIP_BASE_MODEL_EVAL=1
+    to skip this pass once you've already established that baseline once
+    (see its own comment near Pass 2 below) - roughly halves runtime and,
+    on RunPod, the GPU-billing cost of a routine eval run.
 
 Runtime expectation: ~160 rows x 2 passes, one generation each - roughly
 15-30 minutes on a T4-class GPU. Progress prints every 20 rows. The TUNED
@@ -37,6 +40,7 @@ left over in memory):
 
     export HF_TOKEN=...
     export HF_USER=...
+    # export SKIP_BASE_MODEL_EVAL=1   # optional, see above
     # upload dataset_val.jsonl and dataset_val_real.jsonl into this same
     # working directory (train files aren't needed for eval)
     pip install "unsloth[colab-new] @ git+https://github.com/unslothai/unsloth.git"
@@ -268,65 +272,80 @@ def run_eval(label):
 # Pass 1: the fine-tuned model (adapter active) - the number that matters.
 tuned = run_eval("FINE-TUNED model")
 
-# Two full generation passes (320 generations total) back-to-back without
-# clearing cache in between is a real way to run a GPU out of memory
-# partway through pass 2 - this happened live during development on a
-# free Colab T4. Free whatever's reclaimable before starting the second
-# pass.
-torch.cuda.empty_cache()
+# Pass 2 (base model) roughly doubles total eval time (320 generations
+# instead of 160) - worth it the FIRST time you eval a given prompt/schema
+# shape, since without it there's no baseline to tell "65% accuracy" apart
+# from "would have scored 65% doing nothing" (see
+# docs/training-results-analysis.md's "No baseline" section - this pass
+# exists specifically to fix that gap for direction accuracy, not just
+# loss). On RunPod that extra time is real, direct GPU-billing cost
+# (unlike free Colab), so once you've established the baseline once, set
+# SKIP_BASE_MODEL_EVAL=1 (or "true"/"yes") to skip straight to just the
+# tuned-model number on later quick-iteration runs.
+SKIP_BASE_MODEL_EVAL = (get_secret("SKIP_BASE_MODEL_EVAL") or "").strip().lower() in ("1", "true", "yes")
 
-# Base repos for the fallback path below - mirrors
-# ../colab/train/gpu/train_model.py's MODEL_REGISTRY "repo" field per
-# MODEL_CHOICE (see CONTRIBUTING.md's sync rule; keep in sync with that
-# file, not just the alpaca_prompt).
-BASE_MODEL_REPO_BY_CHOICE = {
-    "llama-3.2-3b": "unsloth/Llama-3.2-3B-Instruct-bnb-4bit",
-    "apertus-8b": "swiss-ai/Apertus-8B-Instruct-2509",
-    "apertus-0.5b": "swiss-ai/Apertus-v1.1-0.5B-Instruct",
-    "qwen-2.5-7b": "unsloth/Qwen2.5-7B-Instruct-bnb-4bit",
-    "mistral-7b": "unsloth/mistral-7b-instruct-v0.3-bnb-4bit",
-}
+if SKIP_BASE_MODEL_EVAL:
+    print("SKIP_BASE_MODEL_EVAL set - skipping the base-model comparison pass.")
+else:
+    # Two full generation passes (320 generations total) back-to-back
+    # without clearing cache in between is a real way to run a GPU out of
+    # memory partway through pass 2 - this happened live during
+    # development on a free Colab T4. Free whatever's reclaimable before
+    # starting the second pass.
+    torch.cuda.empty_cache()
 
-# Pass 2: the base model. Prefers temporarily disabling the LoRA adapter on
-# the already-loaded model (no second download, no extra memory) - works
-# when `model` is a plain peft-wrapped object with disable_adapter()
-# available. Confirmed live (on the Colab version of this script): this
-# can fail with "'LlamaForCausalLM' object has no attribute
-# 'disable_adapter'" - some unsloth code path can return/transform the
-# model into something that no longer exposes peft's disable_adapter()
-# context manager. Falls back to loading a genuinely separate,
-# adapter-free base model instance when disable_adapter() isn't
-# available - costs a second download/load, but doesn't depend on
-# guessing which unsloth-internal transformation caused the first
-# approach to fail.
-try:
-    with model.disable_adapter():
-        base = run_eval("BASE model (adapter disabled)")
-except Exception as e:
-    print(f"model.disable_adapter() unavailable/failed ({e!r}) - loading a "
-          f"separate, genuinely adapter-free base model instance instead...")
+    # Base repos for the fallback path below - mirrors
+    # ../colab/train/gpu/train_model.py's MODEL_REGISTRY "repo" field per
+    # MODEL_CHOICE (see CONTRIBUTING.md's sync rule; keep in sync with
+    # that file, not just the alpaca_prompt).
+    BASE_MODEL_REPO_BY_CHOICE = {
+        "llama-3.2-3b": "unsloth/Llama-3.2-3B-Instruct-bnb-4bit",
+        "apertus-8b": "swiss-ai/Apertus-8B-Instruct-2509",
+        "apertus-0.5b": "swiss-ai/Apertus-v1.1-0.5B-Instruct",
+        "qwen-2.5-7b": "unsloth/Qwen2.5-7B-Instruct-bnb-4bit",
+        "mistral-7b": "unsloth/mistral-7b-instruct-v0.3-bnb-4bit",
+    }
+
+    # Pass 2: the base model. Prefers temporarily disabling the LoRA
+    # adapter on the already-loaded model (no second download, no extra
+    # memory) - works when `model` is a plain peft-wrapped object with
+    # disable_adapter() available. Confirmed live (on the Colab version of
+    # this script): this can fail with "'LlamaForCausalLM' object has no
+    # attribute 'disable_adapter'" - some unsloth code path can
+    # return/transform the model into something that no longer exposes
+    # peft's disable_adapter() context manager. Falls back to loading a
+    # genuinely separate, adapter-free base model instance when
+    # disable_adapter() isn't available - costs a second download/load,
+    # but doesn't depend on guessing which unsloth-internal transformation
+    # caused the first approach to fail.
     try:
-        _base_repo = BASE_MODEL_REPO_BY_CHOICE[MODEL_CHOICE]
-
-        base_model, base_tokenizer = FastLanguageModel.from_pretrained(
-            model_name=_base_repo,
-            max_seq_length=MAX_SEQ_LENGTH,
-            dtype=None,
-            load_in_4bit=True,
-        )
-        FastLanguageModel.for_inference(base_model)
-
-        # run_eval()/generate_response() close over the module-level
-        # `model`/`tokenizer` names, looked up at call time - swap them to
-        # the base model for this pass, then restore, so nothing below
-        # silently ends up with the base model instead of the fine-tuned
-        # one.
-        _tuned_model, _tuned_tokenizer = model, tokenizer
-        model, tokenizer = base_model, base_tokenizer
+        with model.disable_adapter():
+            base = run_eval("BASE model (adapter disabled)")
+    except Exception as e:
+        print(f"model.disable_adapter() unavailable/failed ({e!r}) - loading a "
+              f"separate, genuinely adapter-free base model instance instead...")
         try:
-            base = run_eval("BASE model (separately loaded, no adapter)")
-        finally:
-            model, tokenizer = _tuned_model, _tuned_tokenizer
-    except Exception as e2:
-        print(f"Base-model fallback load also failed ({e2!r}) - tuned results "
-              "above still stand. Fallback: rerun this script, or share this error.")
+            _base_repo = BASE_MODEL_REPO_BY_CHOICE[MODEL_CHOICE]
+
+            base_model, base_tokenizer = FastLanguageModel.from_pretrained(
+                model_name=_base_repo,
+                max_seq_length=MAX_SEQ_LENGTH,
+                dtype=None,
+                load_in_4bit=True,
+            )
+            FastLanguageModel.for_inference(base_model)
+
+            # run_eval()/generate_response() close over the module-level
+            # `model`/`tokenizer` names, looked up at call time - swap them
+            # to the base model for this pass, then restore, so nothing
+            # below silently ends up with the base model instead of the
+            # fine-tuned one.
+            _tuned_model, _tuned_tokenizer = model, tokenizer
+            model, tokenizer = base_model, base_tokenizer
+            try:
+                base = run_eval("BASE model (separately loaded, no adapter)")
+            finally:
+                model, tokenizer = _tuned_model, _tuned_tokenizer
+        except Exception as e2:
+            print(f"Base-model fallback load also failed ({e2!r}) - tuned results "
+                  "above still stand. Fallback: rerun this script, or share this error.")
