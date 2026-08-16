@@ -126,26 +126,60 @@ import random
 random.seed(42)  # reproducible across Colab runs
 
 NUM_EXAMPLES = 2000  # up from 1000 - more scenario categories need more rows
+# Trimmed to 1600 for the training-mix rebalance below - see that
+# reassignment's own comment (kept as a separate line, not folded into
+# the constant above, so this file's own edit history stays legible: the
+# "more categories need more rows" reasoning above is still why the
+# BASELINE is 2000, this is a deliberate reduction from that baseline for
+# an unrelated, later reason).
+#
+# generate_real_dataset.py's BULLISH_THRESHOLD/BEARISH_THRESHOLD tightened
+# 2% -> 3% (see that file's own comment) shrank real's rebalanced train
+# count from 1152 to 849 - real data's SHARE of the combined training set
+# (train_model.py concatenates both files) would otherwise drop from
+# ~45% to ~38% just from that change, working against the actual reason
+# for tightening it (better real-world calibration needs MORE relative
+# real-data influence, not less). Undersampling synthetic back down
+# (not duplicating real rows up - see rebalance_by_direction/
+# downsample_contradicts_in_place in generate_real_dataset.py for why
+# duplication specifically risks re-memorization) brings the ratio back
+# toward parity: ~1100 synthetic vs 849 real train rows, close to 56/44
+# instead of 62/38.
+NUM_EXAMPLES = 1600
                       # to keep per-scenario-per-ticker counts reasonable
 VAL_HOLDOUT_TICKERS = {"META", "BA", "QRNL", "HRZN"}          # never seen in training
 VAL_HOLDOUT_TEMPLATE_INDEX_FRACTION = 0.2                       # ~20% of each
                                                                   # category's templates
                                                                   # are validation-only
 
-# VALUATION_SIGNAL is now the DOMINANT category by design, not a minority
-# one - explicit product direction: fundamentals (valuation, P/E, earnings
+# VALUATION_SIGNAL is the dominant category by design, not a minority one -
+# explicit product direction: fundamentals (valuation, P/E, earnings
 # quality) should be the model's primary, default driver most of the time,
 # with news as a secondary signal that reinforces or occasionally overrides
-# it, not the other way around. Previously 8%, same as MIXED - too small to
-# be a "usually" for anything. BULLISH/BEARISH (pure news-driven, no
-# valuation influence on the resolved label) roughly halved to make room -
-# still large enough to keep "sometimes a concrete company event is the
-# whole story" a real, well-represented lesson, just no longer the default.
-# NEUTRAL/MIXED left untouched: NEUTRAL's weight is deliberately protected
-# (see NEUTRAL_VALUATION_GAP_RANGE's own history - it was the direct victim
-# of an earlier synthetic-data collision, not something to risk starving
-# again), and MIXED's signal-weighing lesson is orthogonal to this change.
-SENTIMENT_WEIGHTS = {"BULLISH": 0.16, "BEARISH": 0.16, "NEUTRAL": 0.20, "MIXED": 0.08, "VALUATION_SIGNAL": 0.40}
+# it, not the other way around. BULLISH/BEARISH (pure news-driven, no
+# valuation influence on the resolved label) roughly halved from their
+# pre-pivot weight to make room - still large enough to keep "sometimes a
+# concrete company event is the whole story" a real, well-represented
+# lesson, just no longer the default.
+#
+# VALUATION_SIGNAL trimmed 0.40 -> 0.32 (that 8 points moved to NEUTRAL, not
+# dropped) after a v16 eval: 32% direction accuracy on real val (below the
+# 33% random baseline), with the model predicting NEUTRAL only 17% of the
+# time on real data despite it being the true label ~49% of the time.
+# VALUATION_SIGNAL_SCENARIOS never resolves to NEUTRAL at all (every tier -
+# _alone/_reinforced/news_wins/sector-reinforced - picks undervalued->
+# BULLISH or overvalued->BEARISH), so at 40% weight, 40% of the synthetic
+# dataset was structurally incapable of teaching "sometimes the right call
+# is no strong signal either way." This still keeps fundamentals as the
+# dominant signal (32% is still the single largest category, comfortably
+# ahead of BULLISH/BEARISH at 16% each) - tempering the earlier pivot
+# slightly, not reversing it. NEUTRAL's weight was ALREADY being protected
+# even before this change (see NEUTRAL_VALUATION_GAP_RANGE's own history -
+# it was the direct victim of an earlier synthetic-data collision), so
+# growing it further to fix a newly-confirmed real-world gap is consistent
+# with that existing priority, not a new one. MIXED left untouched - its
+# signal-weighing lesson is orthogonal to this change.
+SENTIMENT_WEIGHTS = {"BULLISH": 0.16, "BEARISH": 0.16, "NEUTRAL": 0.28, "MIXED": 0.08, "VALUATION_SIGNAL": 0.32}
 
 # ---------------------------------------------------------------------------
 # Companies - (ticker, name, sector, (quarterly revenue low, high in $B))
@@ -493,6 +527,65 @@ PEG_CHEAP = 1.0
 PEG_RICH = 2.0
 
 
+# Multiple phrasings per tier, randomly picked - NOT just style variety.
+# This project already hit the exact failure mode a single fixed sentence
+# per case produces: generate_real_dataset.py's history item 7 documents a
+# near-identical bug (CONTRADICTS handling) where one canned sentence
+# shape, repeated across hundreds of rows, got memorized by the model as a
+# literal string to reproduce rather than a judgment to make - and applied
+# indiscriminately to unrelated examples, since it's the same model
+# weights either way. A v16 eval reproduced the same signature here: the
+# model recited this exact "Operating margins and ROE both point to..."
+# sentence on a REAL headline it had never been trained on, verbatim,
+# rather than reasoning about that headline's actual content. Randomizing
+# the surface form across several equivalent phrasings per tier means
+# there's no single string to memorize - only the underlying judgment
+# (which tier the metrics fall into) can actually be learned.
+QUALITY_STRONG_PHRASINGS = [
+    "Operating margins and ROE both point to a genuinely high-quality underlying business",
+    "Strong operating margins paired with a high ROE suggest real competitive advantage here",
+    "Both margins and returns on equity look like hallmarks of a well-run, capital-efficient business",
+]
+QUALITY_WEAK_PHRASINGS = [
+    "Thin operating margins and weak ROE argue for caution regardless of the valuation gap",
+    "Weak profitability metrics here are a real yellow flag, independent of what the valuation gap suggests",
+    "Margins and capital efficiency both look shaky, which tempers how much confidence the valuation gap deserves",
+]
+QUALITY_ADEQUATE_PHRASINGS = [
+    "Operating margins and ROE are unremarkable here - adequate, not standout",
+    "Nothing special about the underlying profitability here - solid enough, not a standout",
+    "Margins and ROE sit in an unremarkable middle ground - no particular red flag, no particular strength",
+]
+GROWTH_UNKNOWN_PHRASINGS = [
+    "growth looks too uncertain to gauge against the price",
+    "there isn't a reliable growth estimate to weigh the price against",
+    "growth expectations are too unclear here to say whether the price is justified",
+]
+GROWTH_CHEAP_PHRASINGS = [
+    "the price looks reasonable relative to expected growth (PEG under 1)",
+    "relative to its growth outlook, the price doesn't look demanding (PEG under 1)",
+    "growth-adjusted, this isn't an expensive price to pay (PEG under 1)",
+]
+GROWTH_RICH_PHRASINGS = [
+    "the price looks rich relative to expected growth (PEG over 2)",
+    "growth-adjusted, this price is a stretch (PEG over 2)",
+    "relative to its growth outlook, this is a demanding price to pay (PEG over 2)",
+]
+GROWTH_FAIR_PHRASINGS = [
+    "the price is roughly in line with expected growth",
+    "growth-adjusted, the price looks fair, neither cheap nor expensive",
+    "relative to its growth outlook, the price doesn't stand out either way",
+]
+# Varies the connective structure too, not just the two clauses' wording -
+# same memorization concern applies to the joining phrase as much as the
+# content either side of it.
+COMMENTARY_CONNECTORS = [
+    "{quality}, and {growth_note}.",
+    "{quality}. Separately, {growth_note}.",
+    "{quality} - {growth_note}.",
+]
+
+
 def describe_value_screen(fnd):
     """Translates operating margin/ROE/PEG (see value_screen_metrics above)
     into 1-2 sentences of graded value-checklist commentary - teaches the
@@ -504,6 +597,12 @@ def describe_value_screen(fnd):
     placeholder sentence) when operating_margin/ROE aren't usable, so the
     caller can skip appending anything - same "don't guess" convention as
     the rest of this module's rendering.
+
+    Each call randomly picks ONE phrasing per clause (see the
+    QUALITY_*_PHRASINGS/GROWTH_*_PHRASINGS lists and their shared comment
+    above) rather than a single fixed sentence per tier - deliberately, to
+    avoid the exact memorizable-canned-text failure this project already
+    diagnosed once in generate_real_dataset.py's CONTRADICTS handling.
     """
     screen = value_screen_metrics(fnd)
     op_margin = screen["operating_margin"]
@@ -513,22 +612,23 @@ def describe_value_screen(fnd):
         return None
 
     if op_margin > OPERATING_MARGIN_STRONG and roe > ROE_STRONG:
-        quality = "Operating margins and ROE both point to a genuinely high-quality underlying business"
+        quality = random.choice(QUALITY_STRONG_PHRASINGS)
     elif op_margin < OPERATING_MARGIN_WEAK or roe < ROE_WEAK:
-        quality = "Thin operating margins and weak ROE argue for caution regardless of the valuation gap"
+        quality = random.choice(QUALITY_WEAK_PHRASINGS)
     else:
-        quality = "Operating margins and ROE are unremarkable here - adequate, not standout"
+        quality = random.choice(QUALITY_ADEQUATE_PHRASINGS)
 
     if peg is None:
-        growth_note = "growth looks too uncertain to gauge against the price"
+        growth_note = random.choice(GROWTH_UNKNOWN_PHRASINGS)
     elif peg < PEG_CHEAP:
-        growth_note = "the price looks reasonable relative to expected growth (PEG under 1)"
+        growth_note = random.choice(GROWTH_CHEAP_PHRASINGS)
     elif peg > PEG_RICH:
-        growth_note = "the price looks rich relative to expected growth (PEG over 2)"
+        growth_note = random.choice(GROWTH_RICH_PHRASINGS)
     else:
-        growth_note = "the price is roughly in line with expected growth"
+        growth_note = random.choice(GROWTH_FAIR_PHRASINGS)
 
-    return f"{quality}, and {growth_note}."
+    connector = random.choice(COMMENTARY_CONNECTORS)
+    return connector.format(quality=quality, growth_note=growth_note)
 
 
 def classify_valuation_basis(eps_trailing, payout_ratio, sector, free_cash_flow):
@@ -1275,7 +1375,17 @@ SECTOR_REINFORCED_PROB = 0.40
 # doesn't collapse into "always ends the same way" - the model should
 # learn this vocabulary as ONE input among several it reasons over, not a
 # rigid suffix every valuation-driven example carries.
-VALUE_SCREEN_COMMENTARY_PROB = 0.50
+#
+# Lowered 0.50 -> 0.25 after a v16 eval showed the model reciting this
+# commentary's phrasing near-verbatim on a REAL headline it had never
+# trained on - at 40% VALUATION_SIGNAL weight x 50% commentary, roughly
+# 1 in 5 of ALL training rows carried this exact pattern, frequent enough
+# to memorize as a string rather than learn as a judgment. Combined with
+# describe_value_screen's own phrasing randomization (see
+# QUALITY_*_PHRASINGS/GROWTH_*_PHRASINGS), this should meaningfully cut
+# the "single reproducible string" risk from both directions - seen less
+# often, and no longer identical even when it is seen.
+VALUE_SCREEN_COMMENTARY_PROB = 0.25
 
 # Reported live (twice): a controlled gap this large is implausible for
 # real companies, especially the large, liquid, heavily-covered names in
