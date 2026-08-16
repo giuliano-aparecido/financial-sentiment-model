@@ -868,13 +868,29 @@ REVENUE_NORMAL_EXIT_MULTIPLE = 3.0
 REVENUE_BEST_EXIT_MULTIPLE = 6.0
 
 GROWTH_BASIS_G2 = {"normal": 0.10, "best": 0.12, "worst": 0.04}
+# Floor on g2 for the "dividends" basis specifically - ported from
+# valuation.py's G2_DIVIDENDS_FLOOR after a confirmed live case (QCOM: g1
+# ~-8% from one bad consensus year, copied uncapped into g2 for the
+# dividends basis, compounding to an intrinsic value of $22.90 against a
+# $165.79 price - see that module's own comment for the full rationale).
+# -0.05, not less negative - PEP's own real CURATED_SCENARIOS worst-case
+# g2, the most negative g2 any analyst-vetted mature-payer number on file
+# actually reaches.
+G2_DIVIDENDS_FLOOR = -0.05
 G1_FALLBACK = {"normal": 0.08, "best": 0.10, "worst": 0.04}
 # Ceiling on DERIVED g1 (real per-ticker consensus growth, not
 # CURATED_SCENARIOS) - ported from valuation.py's G1_CAP after a confirmed
 # live DCF blowup. See that module's G1_CAP comment for the full
-# rationale - upper bound only, set above NVDA's own curated "best" g1
-# (0.30), CURATED_SCENARIOS tickers bypass this entirely.
+# rationale - set above NVDA's own curated "best" g1 (0.30),
+# CURATED_SCENARIOS tickers bypass this entirely.
 G1_CAP = 0.40
+# Floor on DERIVED g1 - ported from valuation.py's G1_FLOOR after the same
+# QCOM investigation that motivated G2_DIVIDENDS_FLOOR above (see that
+# module's own comment): confirmed live this is a symmetric problem, not
+# an upside-only one. Set below PEP's/XOM's own curated worst-case g1
+# (+0.03, real analyst-vetted numbers), same "don't disagree with actually
+# -vetted data" reasoning as G1_CAP.
+G1_FLOOR = -0.10
 
 # Sustainable growth rate (ROE x retention ratio) as a middle tier in g1's
 # derivation - ported from valuation.py's _sustainable_growth_rate/
@@ -1013,17 +1029,29 @@ def build_scenarios(ticker, fnd, basis):
     growth_1y = fnd.get("growth_1y")
     consensus_reliable = growth_0y is not None and growth_1y is not None and (growth_0y >= 0) == (growth_1y >= 0)
     if consensus_reliable:
-        g1_values["normal"] = (growth_0y + growth_1y) / 2
+        # best/worst are OFFSETS from the same 2-year blend "normal" uses,
+        # not growth_0y_high/low directly - ported from valuation.py's
+        # build_scenarios after a confirmed live ordering bug (see
+        # G1_FLOOR's comment): the old direct-substitution version let
+        # "best" end up WORSE than "normal" whenever growth_1y diverged a
+        # lot from growth_0y, since best/worst never saw growth_1y at all.
+        blended_normal = (growth_0y + growth_1y) / 2
+        g1_values["normal"] = blended_normal
         growth_0y_high = fnd.get("growth_0y_high")
         growth_0y_low = fnd.get("growth_0y_low")
         if growth_0y_high is not None:
-            g1_values["best"] = growth_0y_high
+            g1_values["best"] = blended_normal + (growth_0y_high - growth_0y)
         if growth_0y_low is not None:
-            g1_values["worst"] = growth_0y_low
+            g1_values["worst"] = blended_normal - (growth_0y - growth_0y_low)
 
-    g1_values = {name: min(value, G1_CAP) for name, value in g1_values.items()}  # see G1_CAP's comment
+    # see G1_CAP's/G1_FLOOR's comments
+    g1_values = {name: max(min(value, G1_CAP), G1_FLOOR) for name, value in g1_values.items()}
 
-    g2_values = dict(g1_values) if basis == "dividends" else dict(GROWTH_BASIS_G2)
+    if basis == "dividends":
+        # see G2_DIVIDENDS_FLOOR's comment
+        g2_values = {name: max(value, G2_DIVIDENDS_FLOOR) for name, value in g1_values.items()}
+    else:
+        g2_values = dict(GROWTH_BASIS_G2)
 
     if basis == "revenue":
         exit_multiples = {
