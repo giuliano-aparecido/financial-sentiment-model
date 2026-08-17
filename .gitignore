@@ -11,3 +11,16 @@ venv/
 # not meant to be committed (some runs are multi-hundred-MB of checkpoints).
 *.jsonl
 outputs/
+
+# Generated review/report artifacts (generate_valuation_report.py,
+# build_review_list.py) - same reasoning as *.jsonl above, just not that
+# extension. The scripts that produce them are committed; their output
+# isn't.
+valuation_report.md
+review_real_dataset_by_ticker.txt
+review_synthetic_dataset_by_ticker.txt
+
+# Timestamped snapshots taken before destructive real-dataset regens
+# (dataset_train_real.jsonl/dataset_val_real.jsonl are gitignored above
+# with no git history backstop) - local safety copies, not repo content.
+.backup_pre_*/

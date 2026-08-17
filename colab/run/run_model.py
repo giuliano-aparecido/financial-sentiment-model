@@ -47,7 +47,7 @@ HF_USER = get_secret("HF_USER")
 # family ad-hoc, without editing this file - must match whatever
 # MODEL_CHOICE the target repo was actually trained/pushed under (e.g.
 # "apertus-0.5b" instead of the default "llama-3.2-3b").
-MODEL_CHOICE_DEFAULT = "llama-3.2-3b"
+MODEL_CHOICE_DEFAULT = "llama-3.1-8b"
 try:
     MODEL_CHOICE = get_secret("MODEL_CHOICE") or MODEL_CHOICE_DEFAULT
 except Exception:
@@ -58,7 +58,7 @@ except Exception:
 # Colab/Kaggle Secret to serve a different push ad-hoc, without editing
 # this file - useful for a quick rollback if a newly-trained version turns
 # out worse than the one it replaced.
-MODEL_VERSION_DEFAULT = "v16"
+MODEL_VERSION_DEFAULT = "v1"
 try:
     MODEL_VERSION = get_secret("MODEL_VERSION") or MODEL_VERSION_DEFAULT
 except Exception:
