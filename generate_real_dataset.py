@@ -4,7 +4,7 @@ Financial sentiment training dataset generator - REAL DATA variant
 Companion to generate_synthetic_dataset.py (fully synthetic, offline,
 deterministic). This version pulls REAL historical news headlines from
 Google News RSS and REAL subsequent price movement from yfinance for each
-ticker, and derives the BULLISH/BEARISH/NEUTRAL label from what the stock
+ticker, and derives the BUY/SELL/HOLD label from what the stock
 actually did in the days after the headline - not from a hand-authored,
 causally-verified judgment the way the synthetic dataset's labels are
 written.
@@ -33,7 +33,7 @@ got on synthetic val):
    referenced headline content at all, so the real portion of training
    taught the model to recall a memorized per-ticker (%, direction) pair
    instead of reading the news - confirmed live: a TPU-trained model's
-   misclassified real rows showed the identical "+3.4% -> BULLISH" text
+   misclassified real rows showed the identical "+3.4% -> BUY" text
    for the same ticker across three unrelated headlines. direction and
    confidence are still derived purely from the price-move proxy below,
    unchanged - only the reasoning TEXT is regenerated to actually discuss
@@ -73,7 +73,7 @@ got on synthetic val):
 2. LOOKBACK_WEEKS 8 -> 18 and MAX_HEADLINES_PER_TICKER 30 -> 50, for the
    same reason - more historical windows scanned per ticker, more raw
    headlines available to become the post-rebalance train set.
-3. BULLISH_THRESHOLD/BEARISH_THRESHOLD are now more visibly a label-quality
+3. BUY_THRESHOLD/SELL_THRESHOLD are now more visibly a label-quality
    knob, with OUTPUT_TRAIN_FILE/OUTPUT_VAL_FILE broken out as their own
    constants specifically so a stricter-threshold comparison run (e.g.
    +/-0.03 or +/-0.04 instead of the default +/-0.02) can write to
@@ -192,14 +192,14 @@ news fetch already accepts. Day-level granularity only (no time-of-day),
 and any single query is capped at ~100 results, which is why this scans
 multiple narrow weekly windows per ticker rather than one big range.
 
-The train split is rebalanced to equal BULLISH/BEARISH/NEUTRAL counts by
+The train split is rebalanced to equal BUY/SELL/HOLD counts by
 undersampling (see rebalance_by_direction) before being written - real
 market data over any specific historical window is rarely naturally
 balanced. The val split is deliberately left at its natural/unbalanced
 distribution - eval numbers should reflect real-world performance, not a
 distribution forced to look nicer than reality. (This natural imbalance -
-the val set skews BEARISH-heavy - is itself part of why a model with a
-"default to NEUTRAL when unsure" habit scored so poorly on it; see
+the val set skews SELL-heavy - is itself part of why a model with a
+"default to HOLD when unsure" habit scored so poorly on it; see
 docs/training-results-analysis.md.)
 
 Output schema, ### Input: field structure, and user_query phrasing all
@@ -210,7 +210,7 @@ and can be concatenated/mixed for training:
 
     data_files={"train": ["dataset_train.jsonl", "dataset_train_real.jsonl"], ...}
 
-Requirements: `pip install yfinance httpx feedparser google-genai pandas`
+Requirements: `pip install yfinance httpx feedparser google-genai pandas beautifulsoup4`
 (pandas is also a transitive yfinance dependency, so usually already
 present), network access, and a Gemini API key (GEMINI_API_KEY) - see
 generate_grounded_reasoning for where that's read from and why the model
@@ -260,11 +260,12 @@ try:
     import httpx
     import pandas as pd
     import yfinance as yf
+    from bs4 import BeautifulSoup
     from google import genai
 except ImportError as e:
     raise SystemExit(
         f"This script needs a package that isn't installed ({e.name}). "
-        "Run: pip install yfinance httpx feedparser google-genai pandas"
+        "Run: pip install yfinance httpx feedparser google-genai pandas beautifulsoup4"
     )
 
 # get_secret() works on both Colab (Secrets, key icon in the left sidebar)
@@ -377,33 +378,102 @@ VAL_HOLDOUT_TICKERS = {"META", "BA", "JPM", "XOM", "KO", "NFLX"}
 # instead of common enough to memorize as a default strategy.
 CONTRADICTS_MAX_FRACTION = 0.20
 
-FORWARD_WINDOW_TRADING_DAYS = 3   # how many trading days after the headline
-                                   # to measure the price move over
+FORWARD_WINDOW_TRADING_DAYS = 63   # how many trading days after the headline
+                                    # to measure the price move over, AT MOST
+# History: raised from 3 to 30 (2026-08-17) - a 3-day window measures
+# momentum, not value; a stock can be genuinely, meaningfully undervalued
+# with strong fundamentals and still sit flat for days before the market
+# re-rates it. But 30 didn't actually help: re-measured after that change,
+# the fraction of HOLD rows sitting on a 30%+ valuation gap barely moved
+# (30.3% -> 33.2% of all rows, i.e. slightly worse) while the ~3-week gap
+# to the old +/-3% threshold (rescaled to +/-8% for the longer window,
+# see that constant's own comment) likely absorbed most of the intended
+# gain.
+#
+# Raised again to 63 (~1 calendar quarter, since most companies report
+# earnings quarterly) for a different reason than the trading-day COUNT
+# itself: this is now effectively an upper bound, not the real per-row
+# window. label_from_forward_return's earnings-truncation logic (see its
+# own comment) almost always finds a real earnings date inside a
+# quarter-long span and cuts the window there - so in practice this
+# measures "from this headline until just before the company's next
+# earnings report," a clean, economically meaningful period instead of an
+# arbitrary fixed count. That's a materially different value proposition
+# than just "30 was too short, try a bigger number": the window length is
+# now driven by the company's own reporting calendar per row, not one
+# global constant, and a stock that STILL hasn't converged by its next
+# earnings report is a more informative HOLD than one that merely didn't
+# move in an arbitrarily short slice of time.
+#
+# Deliberately NOT touching BUY_THRESHOLD/SELL_THRESHOLD again alongside
+# this - confirmed live the fraction of real BUY-worthy setups is
+# genuinely low right now (a legitimate value-investing read: few stocks
+# screen as a strong buy in an expensive market, not a labeling bug), so
+# a low BUY rate isn't itself evidence the threshold needs loosening. Per-
+# row window length is also no longer fixed (earnings-truncation varies
+# it), so a single global percentage threshold is an even rougher fit than
+# before - worth an actual empirical pass over this dataset's real 63-
+# trading-day return distribution before touching that number again,
+# rather than another single-guess adjustment.
 
-# Tightened from +/-2% - a real, confirmed-live label-quality problem, not
-# just theoretical: a v16 eval run scored 32% direction accuracy on real
-# val (below the 33% random baseline for 3-way classification), with the
-# model heavily avoiding NEUTRAL even though real val's true label was
-# NEUTRAL ~49% of the time. +/-2% over a 3-trading-day window is well
-# within normal daily noise for plenty of tickers, so a meaningful chunk
-# of "real" BULLISH/BEARISH training labels were likely just capturing
-# unrelated price wiggle, not a genuine headline-driven move - training
-# the model that confident directional calls are normal even without a
-# real catalyst. +/-3% doesn't fully solve this (some noise still clears
-# any fixed threshold) but is a meaningfully cleaner signal at a real,
-# accepted cost: fewer kept examples per ticker/window, since more
-# borderline moves now fall into NEUTRAL instead.
-BULLISH_THRESHOLD = 0.03          # forward return >= +3% -> BULLISH
-BEARISH_THRESHOLD = -0.03         # forward return <= -3% -> BEARISH
-                                   # (between the two -> NEUTRAL)
+# Calendar-day span FORWARD_WINDOW_TRADING_DAYS actually needs: trading
+# days -> calendar days (5 trading days/week) plus a flat 10-day cushion
+# for holidays/gaps. Shared by label_from_forward_return's own history
+# fetch AND SAFETY_BUFFER_DAYS below (a single source of truth - these two
+# used to be sized independently, 3-trading-day-window numbers baked into
+# both, and silently drifted out of sync with FORWARD_WINDOW_TRADING_DAYS
+# when it was raised to 30: SAFETY_BUFFER_DAYS stayed at a flat 14, which
+# is enough runway for a 3-day window but not a 30-day one - the most
+# recently queried headlines would have silently gotten a truncated,
+# shorter-than-intended window instead of the full 30 days, since that
+# much future price history wouldn't exist yet at fetch time).
+FORWARD_WINDOW_CALENDAR_BUFFER_DAYS = FORWARD_WINDOW_TRADING_DAYS * 7 // 5 + 10
+
+# Trading days of margin label_from_forward_return's earnings-truncation
+# cuts before the next earnings date, not just excluding that day itself -
+# see that function's own comment on why (pre-earnings anticipation
+# trading can move a stock before the report lands).
+EARNINGS_TRUNCATION_BUFFER_DAYS = 2
+
+# History (2026-08-17, same day): +/-2% -> +/-3% for the old 3-trading-day
+# window (a real, confirmed-live label-quality problem: a v16 eval scored
+# 32% direction accuracy on real val, below the 33% random baseline, with
+# the model avoiding HOLD even though real val's true label was HOLD ~49%
+# of the time). Then +/-3% -> +/-8% via a generic sqrt(time) volatility
+# estimate when the window went 3 -> 30 trading days - re-measured after
+# that change and it didn't help (HOLD-despite-large-valuation-gap rows
+# went from 30.3% to 33.2% of the dataset). Then +/-8% -> +/-5% reasoned
+# from a "normal good value stock returns 10-15%/year" argument when the
+# window became 63 trading days (~1 quarter) - but that reasoning
+# conflated average return with volatility, two different things: a
+# stock's quarter-to-quarter SPREAD is much larger than its average
+# quarterly gain even when the average itself is modest.
+#
+# Settled by actually measuring it (diagnose_return_distribution.py, zero
+# Gemini cost - reuses this file's own label_from_forward_return against
+# real yfinance price history across all 40 tickers, 720 samples): 63-day
+# forward returns for this ticker set have mean +3.9%, median +1.6%, but
+# stdev 15.3% - confirming the volatility lens, not the average-return
+# lens, is what a noise-filtering threshold needs to be built on. Measured
+# HOLD/BUY/SELL split at +/-8%: 58.8%/27.1%/14.2% - a real majority-HOLD
+# distribution (matching the historical ~49-50% HOLD figures cited above)
+# while both BUY and SELL keep meaningful representation, unlike +/-10-12%
+# where they nearly disappear. BUY consistently exceeds SELL at every
+# threshold tested - the return distribution is right-skewed (occasional
+# large rallies), which is normal for stocks, not a labeling artifact.
+BUY_THRESHOLD = 0.08          # forward return >= +8% -> BUY
+SELL_THRESHOLD = -0.08         # forward return <= -8% -> SELL
+                                   # (between the two -> HOLD)
 OUTPUT_TRAIN_FILE = "dataset_train_real.jsonl"
 OUTPUT_VAL_FILE = "dataset_val_real.jsonl"
 
 # How far back, and how close to "now", to search. The gap between
 # SAFETY_BUFFER_DAYS and today guarantees every queried window already has
-# a complete forward price window by the time we look it up.
+# a complete forward price window by the time we look it up - derived from
+# FORWARD_WINDOW_CALENDAR_BUFFER_DAYS (see that constant's own comment) so
+# the two can't silently drift out of sync again.
 LOOKBACK_WEEKS = 18
-SAFETY_BUFFER_DAYS = 14
+SAFETY_BUFFER_DAYS = FORWARD_WINDOW_CALENDAR_BUFFER_DAYS
 MAX_HEADLINES_PER_TICKER = 50
 
 # Caps how many KEPT examples any single week's window can contribute to a
@@ -466,54 +536,54 @@ QUESTION_TYPES = [
 
 ANSWER_TEMPLATES = {
     "direction": {
-        "BULLISH": "The recent news points to upward momentum for {ticker}, so the near-term bias leans higher.",
-        "BEARISH": "The recent news points to downward pressure on {ticker}, so the near-term bias leans lower.",
-        "NEUTRAL": "The recent news doesn't point clearly in either direction for {ticker}, so a flat near-term move is the more likely outcome.",
+        "BUY": "The recent news points to upward momentum for {ticker}, so the near-term bias leans higher.",
+        "SELL": "The recent news points to downward pressure on {ticker}, so the near-term bias leans lower.",
+        "HOLD": "The recent news doesn't point clearly in either direction for {ticker}, so a flat near-term move is the more likely outcome.",
     },
     "buy": {
-        "BULLISH": "Yes, the current signals lean favorably enough that {ticker} looks like a reasonable buy here.",
-        "BEARISH": "No, the current signals are negative enough that {ticker} doesn't look like a buy right now.",
-        "NEUTRAL": "It's a close call - nothing here strongly argues for or against buying {ticker} at current levels.",
+        "BUY": "Yes, the current signals lean favorably enough that {ticker} looks like a reasonable buy here.",
+        "SELL": "No, the current signals are negative enough that {ticker} doesn't look like a buy right now.",
+        "HOLD": "It's a close call - nothing here strongly argues for or against buying {ticker} at current levels.",
     },
     "outlook": {
-        "BULLISH": "The outlook for {ticker} this quarter looks positive based on the latest developments.",
-        "BEARISH": "The outlook for {ticker} this quarter looks challenged based on the latest developments.",
-        "NEUTRAL": "The outlook for {ticker} this quarter looks steady, without a clear positive or negative catalyst.",
+        "BUY": "The outlook for {ticker} this quarter looks positive based on the latest developments.",
+        "SELL": "The outlook for {ticker} this quarter looks challenged based on the latest developments.",
+        "HOLD": "The outlook for {ticker} this quarter looks steady, without a clear positive or negative catalyst.",
     },
     "worry": {
-        "BULLISH": "No significant cause for concern - the latest news on {ticker} is constructive.",
-        "BEARISH": "Some caution is warranted - the latest news on {ticker} raises real concerns.",
-        "NEUTRAL": "Not particularly - nothing in the latest news materially changes the risk picture for {ticker}.",
+        "BUY": "No significant cause for concern - the latest news on {ticker} is constructive.",
+        "SELL": "Some caution is warranted - the latest news on {ticker} raises real concerns.",
+        "HOLD": "Not particularly - nothing in the latest news materially changes the risk picture for {ticker}.",
     },
     "impact": {
-        "BULLISH": "The latest news should be a net positive for {ticker}.",
-        "BEARISH": "The latest news should weigh on {ticker}.",
-        "NEUTRAL": "The latest news is unlikely to move {ticker} much either way.",
+        "BUY": "The latest news should be a net positive for {ticker}.",
+        "SELL": "The latest news should weigh on {ticker}.",
+        "HOLD": "The latest news is unlikely to move {ticker} much either way.",
     },
     "sell": {
-        "BULLISH": "Not really - the current signals argue for holding rather than selling {ticker}.",
-        "BEARISH": "It's a reasonable moment to consider trimming {ticker}, given the negative signals.",
-        "NEUTRAL": "There's no strong signal here to justify selling {ticker} now versus holding.",
+        "BUY": "Not really - the current signals argue for holding rather than selling {ticker}.",
+        "SELL": "It's a reasonable moment to consider trimming {ticker}, given the negative signals.",
+        "HOLD": "There's no strong signal here to justify selling {ticker} now versus holding.",
     },
     "sentiment": {
-        "BULLISH": "Sentiment on {ticker} is bullish today.",
-        "BEARISH": "Sentiment on {ticker} is bearish today.",
-        "NEUTRAL": "Sentiment on {ticker} is neutral today.",
+        "BUY": "Sentiment on {ticker} is bullish today.",
+        "SELL": "Sentiment on {ticker} is bearish today.",
+        "HOLD": "Sentiment on {ticker} is neutral today.",
     },
     "earnings": {
-        "BULLISH": "The signals point toward {ticker} beating expectations.",
-        "BEARISH": "The signals point toward {ticker} falling short of expectations.",
-        "NEUTRAL": "There's no strong signal either way on whether {ticker} beats expectations.",
+        "BUY": "The signals point toward {ticker} beating expectations.",
+        "SELL": "The signals point toward {ticker} falling short of expectations.",
+        "HOLD": "There's no strong signal either way on whether {ticker} beats expectations.",
     },
     "read": {
-        "BULLISH": "Overall, {ticker} looks bullish based on the current data and news.",
-        "BEARISH": "Overall, {ticker} looks bearish based on the current data and news.",
-        "NEUTRAL": "Overall, {ticker} looks balanced - no strong read either way right now.",
+        "BUY": "Overall, {ticker} looks bullish based on the current data and news.",
+        "SELL": "Overall, {ticker} looks bearish based on the current data and news.",
+        "HOLD": "Overall, {ticker} looks balanced - no strong read either way right now.",
     },
     "none": {
-        "BULLISH": "{ticker} is showing a bullish setup based on current data and news.",
-        "BEARISH": "{ticker} is showing a bearish setup based on current data and news.",
-        "NEUTRAL": "{ticker} looks neutral right now, without a clear directional catalyst.",
+        "BUY": "{ticker} is showing a bullish setup based on current data and news.",
+        "SELL": "{ticker} is showing a bearish setup based on current data and news.",
+        "HOLD": "{ticker} looks neutral right now, without a clear directional catalyst.",
     },
 }
 
@@ -602,7 +672,7 @@ def fetch_headlines_for_window(ticker, name, after_date, before_date):
     return results
 
 
-def label_from_forward_return(ticker_obj, published_at):
+def label_from_forward_return(ticker_obj, published_at, earnings_dates=None):
     """Returns (direction, pct_change, actual_window_days, skip_reason).
     skip_reason is None on success, otherwise "no_date",
     "history_fetch_failed", or "insufficient_history".
@@ -612,17 +682,65 @@ def label_from_forward_return(ticker_obj, published_at):
     FORWARD_WINDOW_TRADING_DAYS should be available almost every time. The
     adaptive/floor-of-1-day behavior is kept as a safety net for edge cases
     (market holidays, sparse data), not as the primary mechanism.
+
+    earnings_dates (optional, fundamentals_history["earnings_dates"]): if a
+    real earnings report lands strictly between the headline's date and the
+    end of the window, the window is truncated to stop the trading day
+    before it. Confirmed live (2026-08-17): raising
+    FORWARD_WINDOW_TRADING_DAYS to 30 (see that constant's own comment) was
+    the fix for value convergence needing more than 3 days to show up in
+    price, but a 30-day window is long enough that an unrelated earnings
+    report easily falls inside it - and earnings is the single most
+    reliably strong, scheduled catalyst that could hijack the label,
+    attributing a move to whatever headline anchors this row when the real
+    driver was a totally different, later event. Only earnings gets this
+    treatment (not every possible intervening catalyst - that's
+    unbounded and unknowable in advance); it's the one predictable
+    exception worth guarding against specifically.
     """
     if published_at is None:
         return None, None, None, "no_date"
 
     start_date = published_at.date()
-    end_date = start_date + datetime.timedelta(days=FORWARD_WINDOW_TRADING_DAYS + 4)  # buffer for weekends/holidays
+    # FORWARD_WINDOW_CALENDAR_BUFFER_DAYS (module-level, shared with
+    # SAFETY_BUFFER_DAYS - see that constant's own comment) instead of a
+    # fixed +4 tuned for the old 3-trading-day window.
+    end_date = start_date + datetime.timedelta(days=FORWARD_WINDOW_CALENDAR_BUFFER_DAYS)
     try:
         hist = ticker_obj.history(start=start_date, end=end_date)
     except Exception as e:
         print(f"    Warning: price history fetch failed: {e}", flush=True)
         return None, None, None, "history_fetch_failed"
+
+    if len(hist) < 2:
+        return None, None, None, "insufficient_history"
+
+    if earnings_dates is not None and not earnings_dates.empty:
+        future_as_of_ts = _as_of_timestamp(earnings_dates.index, start_date)
+        future_earnings = earnings_dates[earnings_dates.index > future_as_of_ts]
+        if not future_earnings.empty:
+            next_earnings_date = future_earnings.sort_index().index.min()
+            cutoff_ts = _as_of_timestamp(hist.index, next_earnings_date.date())
+            # EARNINGS_TRUNCATION_BUFFER_DAYS trading days of margin before
+            # the earnings date itself, not just excluding that one day -
+            # pre-earnings anticipation (previews, options positioning,
+            # leaks) can move a stock before the report actually lands, so
+            # stopping exactly at the earnings day still lets some of that
+            # bleed into the label. searchsorted finds the row position the
+            # earnings date would occupy (or does occupy, if it's itself a
+            # trading day) in the ascending-sorted history index; subtract
+            # the buffer in trading-day units (consistent with how the rest
+            # of this window is measured) rather than calendar days.
+            earnings_pos = hist.index.searchsorted(cutoff_ts)
+            truncate_pos = max(0, earnings_pos - EARNINGS_TRUNCATION_BUFFER_DAYS)
+            truncated = hist.iloc[:truncate_pos]
+            # Only truncate if the earnings date actually falls inside the
+            # fetched window and leaves at least one real trading day - an
+            # earnings date on/before start_date, or one so close it would
+            # leave nothing, isn't a truncation case, just insufficient
+            # data (falls through to the check below).
+            if len(truncated) >= 2:
+                hist = truncated
 
     if len(hist) < 2:
         return None, None, None, "insufficient_history"
@@ -635,12 +753,12 @@ def label_from_forward_return(ticker_obj, published_at):
         return None, None, None, "insufficient_history"
 
     pct_change = (end_price - start_price) / start_price
-    if pct_change >= BULLISH_THRESHOLD:
-        direction = "BULLISH"
-    elif pct_change <= BEARISH_THRESHOLD:
-        direction = "BEARISH"
+    if pct_change >= BUY_THRESHOLD:
+        direction = "BUY"
+    elif pct_change <= SELL_THRESHOLD:
+        direction = "SELL"
     else:
-        direction = "NEUTRAL"
+        direction = "HOLD"
     return direction, pct_change, actual_window_days, None
 
 
@@ -666,9 +784,76 @@ def confidence_from_move(direction, pct_change, contradicts=False):
     if contradicts:
         return round(random.uniform(0.50, 0.60), 2)
     magnitude = min(abs(pct_change), 0.15) / 0.15  # normalize, cap at a 15% move
-    if direction == "NEUTRAL":
+    if direction == "HOLD":
         return round(0.55 + 0.15 * (1 - magnitude), 2)
     return round(0.65 + 0.30 * magnitude, 2)
+
+
+FINVIZ_REQUEST_DELAY_SECONDS = 0.3  # once per ticker (40 total), not per
+                                     # headline - light pacing is a courtesy,
+                                     # not a rate-limit workaround like
+                                     # GEMINI_REQUEST_DELAY_SECONDS is.
+
+
+def fetch_finviz_eps_5y_growth(ticker):
+    """Scrapes Finviz's quote snapshot table for "EPS next 5Y" - a directly
+    published Wall Street analyst consensus 5-year EPS growth estimate.
+    Returns a decimal (0.0315 for "3.15%") or None on any failure (network
+    error, ticker not found, field missing/blank) - fails soft, same as
+    every other per-ticker fetch in this file.
+
+    Confirmed live (2026-08-17): this is a real, meaningfully better g1
+    source than yfinance's own growth_estimates ("0y"/"+1y" rows, a single
+    current/next-FY consensus point easily dominated by one soft quarter)
+    or a derived formula (tried and confirmed-live-rejected: ROE-based
+    Sustainable Growth Rate alone, historical FCF CAGR alone, and several
+    Gemini-suggested "blend near-term data" scripts all produced results
+    off by 2-4x from real analyst consensus for QCOM specifically - see
+    this function's caller for the full comparison). Finviz's own PEG
+    figure independently implies almost the same growth rate as this
+    field states directly (internally consistent within one source,
+    unlike yfinance's pegRatio, which implied ~22% against this field's
+    ~3% for QCOM - that inconsistency is why yfinance's pegRatio is not
+    used anywhere in this file).
+
+    Not a substitute for judgment: still passed through the same
+    CONSENSUS_GROWTH_MAGNITUDE_CAP sanity gate as any other growth
+    figure in build_scenarios (confirmed live: INTC at 94.4% and BA at
+    89.5% on this same field are almost certainly the same "rebound off a
+    depressed base" artifact CONSENSUS_GROWTH_MAGNITUDE_CAP already
+    guards against elsewhere, not genuine sustained growth), and still
+    bounded by G1_CAP/G1_FLOOR same as every other g1 source.
+    """
+    try:
+        response = httpx.get(
+            f"https://finviz.com/quote.ashx?t={ticker}",
+            headers={
+                "User-Agent": (
+                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                    "(KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"
+                ),
+            },
+            timeout=15.0,
+            # httpx does NOT follow redirects by default (unlike requests,
+            # which does) - confirmed live: Finviz 301s from this exact
+            # URL, so without this every fetch silently returned None,
+            # indistinguishable from "field genuinely missing."
+            follow_redirects=True,
+        )
+        if response.status_code != 200:
+            return None
+        soup = BeautifulSoup(response.text, "html.parser")
+        cells = [c.get_text(strip=True) for c in soup.select("td")]
+        for i, cell_text in enumerate(cells):
+            if cell_text == "EPS next 5Y" and i + 1 < len(cells):
+                raw = cells[i + 1].rstrip("%")
+                return float(raw) / 100 if raw not in ("", "-") else None
+        return None
+    except Exception as e:
+        print(f"    Warning: Finviz EPS-next-5Y fetch failed for {ticker!r}: {e}", flush=True)
+        return None
+    finally:
+        time.sleep(FINVIZ_REQUEST_DELAY_SECONDS)
 
 
 def fetch_ticker_fundamentals_history(ticker_obj):
@@ -711,7 +896,13 @@ def fetch_ticker_fundamentals_history(ticker_obj):
         "growth_0y": None, "growth_1y": None, "growth_0y_low": None, "growth_0y_high": None,
         "book_value_per_share": None, "operating_margin": None,
         "currency": None, "financial_currency": None, "pe_forward": None,
+        "eps_growth_5y_finviz": None,
     }
+    # See fetch_finviz_eps_5y_growth's own comment for why this is the
+    # primary g1 growth source now (build_scenarios), not just an extra
+    # field - fetched once per ticker here, same as everything else in
+    # this function, not once per headline.
+    result["eps_growth_5y_finviz"] = fetch_finviz_eps_5y_growth(ticker_obj.ticker)
     try:
         result["income"] = ticker_obj.quarterly_income_stmt
     except Exception as e:
@@ -825,60 +1016,21 @@ VALUATION_PCT_DISPLAY_CAP = 150.0
 DISCOUNT_RATE = 0.10
 SCENARIO_PROBABILITY = 1 / 3
 
-CURATED_SCENARIOS = {
-    "AAPL": {
-        # Confirmed live: reproduces the analyst's own $128 target within
-        # 2.6% ($124.65 at trailing EPS $8.26, the analyst's own cf0).
-        "normal": {"g1": 0.07, "g2": 0.07, "exit_multiple": 20.0},
-        "best": {"g1": 0.12, "g2": 0.07, "exit_multiple": 25.0},
-        "worst": {"g1": 0.05, "g2": 0.05, "exit_multiple": 10.0},
-    },
-    "NVDA": {
-        "normal": {"g1": 0.30, "g2": 0.10, "exit_multiple": 20.0},
-        "best": {"g1": 0.30, "g2": 0.15, "exit_multiple": 25.0},
-        "worst": {"g1": 0.05, "g2": 0.05, "exit_multiple": 10.0},
-    },
-    "MSFT": {
-        "normal": {"g1": 0.15, "g2": 0.10, "exit_multiple": 20.0},
-        "best": {"g1": 0.20, "g2": 0.10, "exit_multiple": 25.0},
-        "worst": {"g1": 0.05, "g2": 0.05, "exit_multiple": 12.0},
-    },
-    "PEP": {
-        "normal": {"g1": 0.03, "g2": 0.03, "exit_multiple": 20.0},
-        "best": {"g1": 0.05, "g2": 0.05, "exit_multiple": 25.0},
-        "worst": {"g1": 0.03, "g2": -0.05, "exit_multiple": 15.0},
-    },
-    "NFLX": {
-        "normal": {"g1": 0.12, "g2": 0.10, "exit_multiple": 20.0},
-        "best": {"g1": 0.15, "g2": 0.12, "exit_multiple": 25.0},
-        "worst": {"g1": 0.08, "g2": 0.06, "exit_multiple": 15.0},
-    },
-    "XOM": {
-        "normal": {"g1": 0.04, "g2": 0.04, "exit_multiple": 20.0},
-        "best": {"g1": 0.06, "g2": 0.06, "exit_multiple": 30.0},
-        "worst": {"g1": 0.03, "g2": 0.03, "exit_multiple": 12.0},
-    },
-}
-
-# The basis each CURATED_SCENARIOS ticker's assumptions were actually
-# calibrated against - ported from valuation.py's identically-named
-# constant after a confirmed live bug: a ticker's classify_valuation_basis
-# result can legitimately differ call to call (payout_ratio varies), and
-# applying growth assumptions calibrated for one basis's cash flow to a
-# DIFFERENT basis's cash flow produces a number with no relationship to
-# the analyst's actual target, not just a less accurate one. See that
-# module's own comment for the full rationale, including why the
-# valuation-block construction below now overrides classify_valuation_basis's
-# output with this tag outright for curated tickers rather than merely
-# checking the two agree.
-CURATED_SCENARIOS_BASIS = {
-    "AAPL": "eps",
-    "NVDA": "eps",
-    "MSFT": "eps",
-    "PEP": "dividends",
-    "NFLX": "eps",
-    "XOM": "eps",
-}
+# History (2026-08-17): AAPL/NVDA/MSFT/PEP/NFLX/XOM used to bypass this
+# whole file's DCF math via CURATED_SCENARIOS, a hand-picked, fixed set of
+# g1/g2/exit_multiple assumptions calibrated once against real analyst
+# targets - because at the time, the general formula was untrustworthy
+# (confirmed live: derived g1 blowups like QCOM's -150%/$44.99 or +150%
+# valuations for ordinary-multiple stocks). Removed once the formula
+# itself became reliable (Finviz EPS-next-5Y + SGR blend, see
+# build_scenarios' own comment) - the curated numbers had also gone
+# stale (AAPL's fixed $131.59 vs a then-current $304 price showed
+# "overvalued by 131%", a staleness artifact having nothing to do with
+# the fix that made the general formula trustworthy again). All 40
+# tickers now go through the same dynamic path; some of the constants
+# below (G1_CAP, G2_DIVIDENDS_FLOOR, GROWTH_BASIS_G2_FLOOR) were
+# originally calibrated against those curated numbers and keep that
+# history in their own comments even though the source data is gone.
 
 WORST_EXIT_MULTIPLE_ASSET_HEAVY = 12.0
 WORST_EXIT_MULTIPLE_DEFAULT = 13.0
@@ -899,14 +1051,33 @@ GROWTH_BASIS_G2 = {"normal": 0.10, "best": 0.12, "worst": 0.04}
 # g2, the most negative g2 any analyst-vetted mature-payer number on file
 # actually reaches.
 G2_DIVIDENDS_FLOOR = -0.05
+# Same floor concept as G2_DIVIDENDS_FLOOR above, extended to the eps/fcf/
+# revenue basis - confirmed live (2026-08-17) this exact QCOM pathology
+# (g1 ~-8% from a bad consensus year) was already found and fixed for the
+# dividends basis, but g2_values' min(GROWTH_BASIS_G2[name], g1) for every
+# OTHER basis was never given the same treatment: min() only ever caps g2
+# from ABOVE, so a negative (or, symmetrically, a G1_CAP-pinned) g1 just
+# passes straight through unchanged, defeating the entire two-stage
+# model's purpose - stage 2 is supposed to fade TOWARD a sustainable
+# terminal rate, not extend stage 1's extreme rate for 5 more years.
+# QCOM's own real case: -8% compounded for 10 years (not just 5) produced
+# $44.99 against a $165.79 price backed by an unremarkable 19.2x trailing
+# P/E - not a company genuinely priced for perpetual decline.
+#
+# 0.0, not a small negative like G2_DIVIDENDS_FLOOR - checked every
+# EPS-basis CURATED_SCENARIOS ticker (AAPL/NVDA/MSFT/NFLX/XOM)'s
+# analyst-vetted worst-case g2: none go negative, the lowest is XOM at
+# +3%. Flooring at 0% is already more conservative than every real vetted
+# number on file, while still fixing the collapse-into-g1 pathology.
+GROWTH_BASIS_G2_FLOOR = 0.0
 G1_FALLBACK = {"normal": 0.08, "best": 0.10, "worst": 0.04}
-# Ceiling on DERIVED g1 (real per-ticker consensus growth, not
-# CURATED_SCENARIOS) - ported from valuation.py's G1_CAP after a confirmed
-# live DCF blowup. Tightened 0.40 -> 0.30 after the 19-ticker analyst
-# comparison: 0.40 let a derived/unverified g1 run MORE aggressive than
-# NVDA's own curated "best" g1 (0.30, the single most aggressive number a
-# human has actually vetted) - see that module's own comment for the full
-# rationale. CURATED_SCENARIOS tickers bypass this entirely.
+# Ceiling on derived g1 - ported from valuation.py's G1_CAP after a
+# confirmed live DCF blowup. Tightened 0.40 -> 0.30 after a 19-ticker
+# analyst comparison: 0.40 let a derived/unverified g1 run MORE
+# aggressive than the single most aggressive number a human had actually
+# vetted at the time (0.30, NVDA's old curated "best" g1 - see
+# CURATED_SCENARIOS' removal note above). Applies to every ticker now
+# that curation is gone.
 G1_CAP = 0.30
 # Floor on DERIVED g1 - ported from valuation.py's G1_FLOOR after the same
 # QCOM investigation that motivated G2_DIVIDENDS_FLOOR above (see that
@@ -931,6 +1102,28 @@ CONSENSUS_GROWTH_MAGNITUDE_CAP = 0.60
 # payout_ratio - already fetched for other purposes, no new dependency).
 SUSTAINABLE_GROWTH_BEST_SPREAD = 0.02
 SUSTAINABLE_GROWTH_WORST_SPREAD = -0.04
+
+# Ceiling on the CONSENSUS-derived best/worst offset (growth_0y_high -
+# growth_0y, growth_0y - growth_0y_low - see build_scenarios' own comment
+# on where these feed in). Confirmed live (2026-08-17, GM as of 2026-04-15):
+# growth_0y_high can sit far above growth_0y/growth_1y even when both of
+# those individually pass CONSENSUS_GROWTH_MAGNITUDE_CAP - GM's real
+# offset was 17.6 percentage points (growth_0y_high=43.9% vs
+# growth_0y=26.3%), compounded for 5 full years at G1_CAP with a 24x exit
+# multiple, producing a $578.92/share "best" tier alone that dragged the
+# equal-weighted average to a 75%-undervalued reading nobody would sanity-
+# check as real. The magnitude gate above only ever checked growth_0y/
+# growth_1y - growth_0y_high/low were never checked against anything, so
+# an extreme, uncertain analyst "high" estimate could leak straight into
+# the best-case scenario unbounded. Worse: this made having MORE data
+# (a consensus range) produce a WORSE result than having none at all - the
+# no-consensus-data fallback (SUSTAINABLE_GROWTH_BEST_SPREAD) is only a
+# 2-point spread, so a "reliable" consensus feed could offer an offset 9x
+# wider than what the code uses when it has NO information at all. Capped
+# here at a level still meaningfully more informative than the 2pp/4pp
+# fallback (genuine consensus data should count for more than "no data"),
+# but nowhere near unbounded.
+CONSENSUS_OFFSET_CAP = 0.10
 
 # Caps/floors the ROE input to the sustainable-growth-rate formula -
 # ported from valuation.py's SUSTAINABLE_GROWTH_ROE_CAP/_FLOOR after a
@@ -1100,13 +1293,7 @@ def cash_flow_basis_value(basis, fnd):
     return None
 
 
-def build_scenarios(ticker, fnd, basis):
-    if ticker and ticker in CURATED_SCENARIOS and CURATED_SCENARIOS_BASIS.get(ticker) == basis:
-        return {
-            name: {**scenario, "probability": SCENARIO_PROBABILITY}
-            for name, scenario in CURATED_SCENARIOS[ticker].items()
-        }
-
+def build_scenarios(fnd, basis):
     g1_values = dict(G1_FALLBACK)
 
     sustainable_g1 = _sustainable_growth_rate(fnd)
@@ -1139,8 +1326,11 @@ def build_scenarios(ticker, fnd, basis):
         blended_normal = (growth_0y + growth_1y) / 2
         growth_0y_high = fnd.get("growth_0y_high")
         growth_0y_low = fnd.get("growth_0y_low")
-        raw_high_offset = (growth_0y_high - growth_0y) if growth_0y_high is not None else None
-        raw_low_offset = (growth_0y - growth_0y_low) if growth_0y_low is not None else None
+        # min(..., CONSENSUS_OFFSET_CAP) - see that constant's own comment
+        # for why an unbounded consensus-derived offset is a confirmed,
+        # live problem, not a theoretical one.
+        raw_high_offset = min(growth_0y_high - growth_0y, CONSENSUS_OFFSET_CAP) if growth_0y_high is not None else None
+        raw_low_offset = min(growth_0y - growth_0y_low, CONSENSUS_OFFSET_CAP) if growth_0y_low is not None else None
         high_offset = raw_high_offset if raw_high_offset is not None else (
             raw_low_offset if raw_low_offset is not None else SUSTAINABLE_GROWTH_BEST_SPREAD
         )
@@ -1151,6 +1341,42 @@ def build_scenarios(ticker, fnd, basis):
         g1_values["best"] = blended_normal + high_offset
         g1_values["worst"] = blended_normal - low_offset
 
+    # Finviz's directly-published 5-year EPS growth consensus overrides
+    # everything above when available and sane - see
+    # fetch_finviz_eps_5y_growth's own comment for why this is now part of
+    # the top-priority g1 source: it's a genuine multi-year Wall Street
+    # consensus figure (what g1 is actually supposed to represent), not a
+    # single near-term quarter (growth_0y/growth_1y, provably unreliable -
+    # a soft QCOM quarter alone drove g1 to -8% and an intrinsic value
+    # 60%+ below every real reference point checked). Same magnitude
+    # sanity gate as the consensus check above (not a new, weaker
+    # standard) - confirmed live this field can ALSO show a "rebound off a
+    # depressed base" artifact (INTC 94.4%, BA 89.5%), the same failure
+    # mode CONSENSUS_GROWTH_MAGNITUDE_CAP already exists to catch, so an
+    # extreme reading here falls back to SGR/consensus above rather than
+    # being trusted just because it's a real, published number.
+    #
+    # Averaged with SGR, not used alone - confirmed live (QCOM,
+    # 2026-08-17): Finviz's EPS-next-5Y (3.15%) alone gave $115.93, well
+    # under every real reference point checked (Gemini's own DCF $197.44,
+    # Yahoo's analyst mean target $193.10, Finviz's own target $201.00).
+    # Solved numerically for the g1 our own formula would need to
+    # reproduce a $197 target: 9.51%. Averaging Finviz (3.15%) with SGR
+    # (14.7% for QCOM) lands at 8.9% independently - not fit to the
+    # target, just two different real signals landing close to it on
+    # their own - and reproduces $188.69, inside the real reference
+    # range. The likely reason Finviz alone undershoots: a raw EPS
+    # consensus estimate doesn't fully capture buyback-driven per-share
+    # value growth, which is exactly what SGR (ROE x retention) measures.
+    finviz_g1 = fnd.get("eps_growth_5y_finviz")
+    if finviz_g1 is not None and abs(finviz_g1) <= CONSENSUS_GROWTH_MAGNITUDE_CAP:
+        blended_g1 = (finviz_g1 + sustainable_g1) / 2 if sustainable_g1 is not None else finviz_g1
+        g1_values = {
+            "normal": blended_g1,
+            "best": blended_g1 + SUSTAINABLE_GROWTH_BEST_SPREAD,
+            "worst": blended_g1 + SUSTAINABLE_GROWTH_WORST_SPREAD,
+        }
+
     # see G1_CAP's/G1_FLOOR's comments
     g1_values = {name: max(min(value, G1_CAP), G1_FLOOR) for name, value in g1_values.items()}
 
@@ -1158,16 +1384,21 @@ def build_scenarios(ticker, fnd, basis):
         # see G2_DIVIDENDS_FLOOR's comment
         g2_values = {name: max(value, G2_DIVIDENDS_FLOOR) for name, value in g1_values.items()}
     else:
-        # g2 = min(flat GROWTH_BASIS_G2 default, this SAME tier's own g1)
-        # for ALL three tiers - ported from valuation.py after confirming
-        # g2 <= g1 in every single one of CURATED_SCENARIOS' 18 g1/g2
-        # pairs (all 6 tickers, all 3 tiers). The flat 0.10/0.12 defaults
-        # only ever matched cases where g1 was already positive and above
-        # them (real fades DOWN); applying the same flat values when g1
-        # is small or negative was an unevidenced extrapolation (QCOM:
-        # -7.8% for 5 years then an unexplained flip to +10% growth). See
-        # that module's own comment for the full rationale.
-        g2_values = {name: min(GROWTH_BASIS_G2[name], g1_values[name]) for name in GROWTH_BASIS_G2}
+        # g2 = clamp(this tier's own g1, GROWTH_BASIS_G2_FLOOR, flat
+        # GROWTH_BASIS_G2 default) for all three tiers - ported from
+        # valuation.py after confirming g2 <= g1 in every single one of
+        # CURATED_SCENARIOS' 18 g1/g2 pairs (all 6 tickers, all 3 tiers),
+        # so the flat 0.10/0.12/0.04 defaults are kept as a ceiling. The
+        # floor is the newer half (see GROWTH_BASIS_G2_FLOOR's own
+        # comment): a plain min() only caps from above, so an extreme g1
+        # BELOW the ceiling - most consequentially negative, but also a
+        # G1_CAP-pinned tier - passed straight through unchanged, letting
+        # stage 1's extreme rate silently extend across the stage 2 "fade"
+        # period too instead of actually fading toward anything.
+        g2_values = {
+            name: max(GROWTH_BASIS_G2_FLOOR, min(GROWTH_BASIS_G2[name], g1_values[name]))
+            for name in GROWTH_BASIS_G2
+        }
 
     if basis == "revenue":
         exit_multiples = {
@@ -1193,9 +1424,26 @@ def build_scenarios(ticker, fnd, basis):
         # existing curated calibration while pulling down genuinely
         # lower-multiple sectors like Energy/Financial Services). See that
         # module's own comment for the full rationale.
+        #
+        # Floored at the company's OWN current trailing P/E - a real bug
+        # found investigating XOM right after CURATED_SCENARIOS was
+        # dropped: a flat Energy sector median (12.0) capped XOM's exit
+        # multiple below its own real trailing P/E (20.6x), i.e. assuming
+        # the market will value it MORE cheaply in 10 years than it
+        # already does today. XOM used to be exempt from this entirely
+        # (curated tickers bypass build_scenarios), so this path was never
+        # actually validated against a company whose real multiple sits
+        # above its sector median - only ever tested on non-curated names
+        # where sector median already exceeded or matched their own P/E.
+        # max(sector_median, own_pe) keeps the sector floor for names
+        # genuinely trading at/below it, without dragging a
+        # premium-multiple name down to the sector's generic level.
         sector = fnd.get("sector")
         sector_median = SECTOR_MEDIAN_PE.get(sector)
-        normal_exit_multiple = min(NORMAL_EXIT_MULTIPLE, sector_median) if sector_median is not None else NORMAL_EXIT_MULTIPLE
+        own_pe = fnd.get("pe_trailing")
+        effective_median_candidates = [v for v in (sector_median, own_pe) if v is not None]
+        effective_median = max(effective_median_candidates) if effective_median_candidates else None
+        normal_exit_multiple = min(NORMAL_EXIT_MULTIPLE, effective_median) if effective_median is not None else NORMAL_EXIT_MULTIPLE
         best_exit_multiple = normal_exit_multiple + (BEST_EXIT_MULTIPLE - NORMAL_EXIT_MULTIPLE)
         worst_exit_multiple = (
             WORST_EXIT_MULTIPLE_ASSET_HEAVY if sector in ASSET_HEAVY_SECTORS
@@ -1530,13 +1778,6 @@ def build_fundamentals_blocks(ticker_obj, fundamentals_history, as_of_date):
             classify_eps, fundamentals_history["payout_ratio"],
             fundamentals_history["sector"], fundamentals_history["free_cash_flow"],
         )
-        # Ported from valuation.py's valuation_block_for: curated tickers
-        # override the generic classifier's output outright rather than
-        # only being used when it happens to agree - see
-        # CURATED_SCENARIOS_BASIS's comment for why.
-        is_curated = ticker_obj.ticker in CURATED_SCENARIOS_BASIS
-        if is_curated:
-            basis = CURATED_SCENARIOS_BASIS[ticker_obj.ticker]
         valuation_fnd = {
             "eps_trailing": classify_eps,
             "pe_trailing": pe_trailing_for_valuation,
@@ -1563,6 +1804,7 @@ def build_fundamentals_blocks(ticker_obj, fundamentals_history, as_of_date):
             "growth_1y": fundamentals_history["growth_1y"],
             "growth_0y_low": fundamentals_history["growth_0y_low"],
             "growth_0y_high": fundamentals_history["growth_0y_high"],
+            "eps_growth_5y_finviz": fundamentals_history["eps_growth_5y_finviz"],
             "book_value_per_share": fundamentals_history["book_value_per_share"],
             "payout_ratio": fundamentals_history["payout_ratio"],
         }
@@ -1574,14 +1816,14 @@ def build_fundamentals_blocks(ticker_obj, fundamentals_history, as_of_date):
         # THRESHOLD and why this renders "Not applicable" rather than
         # falling back to another basis).
         eps_distorted = (
-            not is_curated and basis == "eps"
+            basis == "eps"
             and recent_eps_surprise is not None
             and recent_eps_surprise > EARNINGS_SURPRISE_ONE_TIME_ITEM_THRESHOLD
         )
 
         def compute(b, include_dividend_pv):
             cf0_ = cash_flow_basis_value(b, valuation_fnd)
-            scenarios_ = build_scenarios(ticker_obj.ticker, valuation_fnd, b)
+            scenarios_ = build_scenarios(valuation_fnd, b)
             dividend_rate_ = valuation_fnd.get("dividend_rate") if include_dividend_pv else None
             intrinsic_ = intrinsic_value(cf0_, b, scenarios_, dividend_rate_)
             return cf0_, scenarios_, intrinsic_
@@ -1592,7 +1834,7 @@ def build_fundamentals_blocks(ticker_obj, fundamentals_history, as_of_date):
             # Payout-threshold cliff smoothing - ported from valuation.py's
             # identically-structured block. See that module's own comment.
             blend_t = None
-            if not is_curated and basis != "revenue" and valuation_fnd.get("sector") not in REIT_SECTORS:
+            if basis != "revenue" and valuation_fnd.get("sector") not in REIT_SECTORS:
                 blend_t = _payout_blend_fraction(valuation_fnd.get("payout_ratio"))
 
             if blend_t is not None:
@@ -1609,7 +1851,7 @@ def build_fundamentals_blocks(ticker_obj, fundamentals_history, as_of_date):
                 else:
                     basis, cf0, scenarios, intrinsic = alt_basis, alt_cf0, alt_scenarios, alt_iv
             else:
-                cf0, scenarios, intrinsic = compute(basis, not is_curated)
+                cf0, scenarios, intrinsic = compute(basis, True)
 
             if intrinsic is None:
                 # Basis-fallback chain - ported from valuation.py's
@@ -1692,7 +1934,7 @@ def build_news_block(primary_headline_line):
     return "\n".join(lines)
 
 
-def _template_reasoning(ticker, direction, pct_change, actual_window_days):
+def _template_reasoning(ticker, direction, original_direction, pct_change, actual_window_days):
     # The original mechanism, kept only as generate_grounded_reasoning's
     # fallback for when the Gemini call itself fails - see that function's
     # docstring for why this text alone was the root cause of the model
@@ -1700,6 +1942,21 @@ def _template_reasoning(ticker, direction, pct_change, actual_window_days):
     # the headline. Losing headline-grounding on an occasional row (a
     # transient API hiccup) is an acceptable degradation; losing it on
     # every row (the old default) is what broke real-data generalization.
+    #
+    # direction != original_direction only when make_real_example's
+    # headroom gate downgraded a real BUY/SELL-magnitude move to HOLD - the
+    # plain "moved X%, which resolves as {direction}" phrasing below would
+    # otherwise falsely imply HOLD follows directly from the move itself,
+    # when it's actually the valuation gate overriding what the move alone
+    # would have resolved to.
+    if direction != original_direction:
+        day_word = "trading day" if actual_window_days == 1 else "trading days"
+        return (
+            f"Over the {actual_window_days} {day_word} following this news, "
+            f"{ticker} moved {pct_change * 100:+.1f}%, consistent with {original_direction} - "
+            f"but the valuation estimate was already stretched the same way, leaving no "
+            f"headroom, so this resolves as {direction} instead."
+        )
     day_word = "trading day" if actual_window_days == 1 else "trading days"
     return (
         f"Over the {actual_window_days} {day_word} following this news, "
@@ -1711,7 +1968,7 @@ def _template_reasoning(ticker, direction, pct_change, actual_window_days):
 
 # {valuation_alignment} is computed in Python (see valuation_alignment()
 # below), not left for Gemini to derive - whether "overvalued by ~86%"
-# agrees or disagrees with a BULLISH/BEARISH label is a small, fully-
+# agrees or disagrees with a BUY/SELL label is a small, fully-
 # determined arithmetic/logic step, and there's no reason to trust an LLM
 # to get that right when the answer is already known from data already in
 # hand. Feeding it the precomputed fact keeps Gemini's actual job limited
@@ -1729,14 +1986,14 @@ def _template_reasoning(ticker, direction, pct_change, actual_window_days):
 # something the model was never shown had any bearing on the answer.
 GEMINI_REASONING_PROMPT = """You are labeling training data for a financial-news analyst model.
 
-You are given a stock ticker, its current market data, a valuation estimate, its most recent earnings, a real news headline about it, a user's question, and a directional label (BULLISH, BEARISH, or NEUTRAL). That label was already determined from the stock's ACTUAL subsequent price move over the next few trading days - not from reading anything below. You do not have access to that price-move data, and you must not reference it, invent a percentage move, or write anything implying you know what the stock did afterward.
+You are given a stock ticker, its current market data, a valuation estimate, its most recent earnings, a real news headline about it, a user's question, and a recommendation label (BUY, SELL, or HOLD). That label was already determined from the stock's ACTUAL subsequent price move over the next few trading days - not from reading anything below. You do not have access to that price-move data, and you must not reference it, invent a percentage move, or write anything implying you know what the stock did afterward.
 
 Write THREE things, each as its own labeled line (see OUTPUT FORMAT):
 
 1. REASONING (2-3 sentences): Reads the headline and explains why it's plausibly consistent with a {direction} outlook - the way a financial analyst would talk through the available evidence, not the outcome. Weave in the market data or earnings below ONLY where they genuinely reinforce or complicate the headline's own signal - don't force a mention if a block is irrelevant to this specific headline or says "Data unavailable."/"Not applicable", and never invent facts or numbers that aren't in what you were given.
-   - Valuation alignment (already computed, not your judgment to make): {valuation_alignment}. If "yes", the valuation estimate below points the SAME way as {direction} - actively mention it as one piece of corroborating evidence (still subject to the "never invent numbers" rule - only state what the Valuation block actually says). If "no", the valuation estimate points the OPPOSITE way from {direction} - don't lean on it as support, and don't invent a story explaining why the valuation estimate is wrong either; a brief, honest note that valuation reads the other way is fine, an elaborate defense is not. If "no_data", the Valuation block has no usable reading (NEUTRAL label, "Data unavailable.", or "Not applicable...") - don't mention it at all.
+   - Valuation alignment (already computed, not your judgment to make): {valuation_alignment}. If "yes", the valuation estimate below points the SAME way as {direction} - actively mention it as one piece of corroborating evidence (still subject to the "never invent numbers" rule - only state what the Valuation block actually says). If "no", the price action actually moved consistent with {original_direction}, but the valuation estimate already read the opposite way - meaning that move pushed the price further from a reasonable entry/exit, not closer to one, so there's no headroom left to act on it. That's why the label here is HOLD rather than {original_direction} - write REASONING that explains this tension (the headline may look like a case for {original_direction}, but valuation leaves no room to act on it), still without stating the actual price move or a percentage. If "no_data", the Valuation block has no usable reading (HOLD label, "Data unavailable.", or "Not applicable...") - don't mention it at all.
    - If the headline's content does not obviously support {direction} (this happens often - many price moves in a short window are unrelated to the nearest headline), say so plainly - call it a weak or indirect signal rather than forcing a confident causal claim that isn't there.
-   - If the headline's content clearly points the OPPOSITE way from {direction} (e.g. a headline reporting good news paired with a BEARISH label, or bad news paired with BULLISH - this happens often, since the label reflects the actual subsequent move and headlines don't always predict it), do NOT invent a contrarian story to force a fit - phrases like "already priced in," "overbought/oversold," or "the market sees through this" sound analytical but aren't something you can actually know from a single headline. Acknowledge honestly, in your own words, that this specific headline runs the other way and the labeled move likely came from something not shown here - but vary your phrasing and sentence structure from one headline to the next. This case recurs across many rows in this dataset; if you settle into one stock formulation for it, the model trained on your output will learn to recite that sentence instead of genuinely reasoning about each headline.
+   - If the headline's content clearly points the OPPOSITE way from {direction} (e.g. a headline reporting good news paired with a SELL label, or bad news paired with BUY - this happens often, since the label reflects the actual subsequent move and headlines don't always predict it), do NOT invent a contrarian story to force a fit - phrases like "already priced in," "overbought/oversold," or "the market sees through this" sound analytical but aren't something you can actually know from a single headline. Acknowledge honestly, in your own words, that this specific headline runs the other way and the labeled move likely came from something not shown here - but vary your phrasing and sentence structure from one headline to the next. This case recurs across many rows in this dataset; if you settle into one stock formulation for it, the model trained on your output will learn to recite that sentence instead of genuinely reasoning about each headline.
 2. ANSWER (1-2 sentences): A direct, plain answer to the user's question below, consistent with {direction} and, where relevant, the data above. If the question is empty, give a general one-line read on {ticker} instead.
 3. CONTRADICTS: yes if the headline's own content clearly points the OPPOSITE way from {direction} (the case described in REASONING's second bullet above) - no otherwise, including the "weak/indirect signal" case (first bullet), which is NOT a contradiction, just a lack of strong support. This drives the confidence score a downstream step assigns to this example (low if yes) - answer based on what the headline itself says, not on any hedging language you used in REASONING. This is about the HEADLINE only, not the valuation alignment note above.
 
@@ -1752,7 +2009,7 @@ Recent Earnings:
 
 Headline: {headline}
 User Question: {user_query}
-Direction: {direction}
+Recommendation: {direction}
 
 OUTPUT FORMAT - exactly three lines, nothing else, no preamble or quotes:
 REASONING: <text>
@@ -1764,15 +2021,15 @@ def valuation_alignment(valuation_text, direction):
     """"yes"/"no"/"no_data" - whether the Valuation block's own over/
     undervalued reading points the same way as `direction`. See
     GEMINI_REASONING_PROMPT's own comment for why this is computed here
-    rather than left for Gemini to work out. NEUTRAL always resolves to
-    "no_data" - "does an over/undervalued reading agree with NEUTRAL" isn't
-    a meaningful question the way it is for BULLISH/BEARISH."""
-    if direction == "NEUTRAL":
+    rather than left for Gemini to work out. HOLD always resolves to
+    "no_data" - "does an over/undervalued reading agree with HOLD" isn't
+    a meaningful question the way it is for BUY/SELL."""
+    if direction == "HOLD":
         return "no_data"
     if "undervalued" in valuation_text:
-        implied_direction = "BULLISH"
+        implied_direction = "BUY"
     elif "overvalued" in valuation_text:
-        implied_direction = "BEARISH"
+        implied_direction = "SELL"
     else:
         return "no_data"
     return "yes" if implied_direction == direction else "no"
@@ -1811,7 +2068,8 @@ def _parse_gemini_output(text):
     return reasoning, answer, contradicts
 
 
-def generate_grounded_reasoning(ticker, title, direction, pct_change, actual_window_days,
+def generate_grounded_reasoning(ticker, title, direction, original_direction, alignment,
+                                 pct_change, actual_window_days,
                                  market_data, valuation, earnings, user_query, qtype):
     """Replaces the old fixed template (ticker + price move + direction,
     never the headline itself) with headline-grounded reasoning from
@@ -1857,17 +2115,23 @@ def generate_grounded_reasoning(ticker, title, direction, pct_change, actual_win
     there's nothing to wait out until the quota resets (~24h from first
     use)."""
     global _gemini_daily_quota_exhausted
-    reasoning = _template_reasoning(ticker, direction, pct_change, actual_window_days)
+    reasoning = _template_reasoning(ticker, direction, original_direction, pct_change, actual_window_days)
     answer = ANSWER_TEMPLATES[qtype][direction].format(ticker=ticker)
     contradicts = False
     if _gemini_daily_quota_exhausted:
         return reasoning, answer, contradicts
 
+    # `alignment` is passed in (computed by the caller against
+    # original_direction) rather than recomputed here against `direction` -
+    # recomputing against `direction` would silently lose the "no" signal
+    # for a downgraded row, since valuation_alignment(valuation, "HOLD")
+    # always returns "no_data" (HOLD has no directional pole to compare
+    # against) - see that function's own docstring.
     prompt = GEMINI_REASONING_PROMPT.format(
-        ticker=ticker, headline=title, direction=direction,
+        ticker=ticker, headline=title, direction=direction, original_direction=original_direction,
         market_data=market_data, valuation=valuation, earnings=earnings,
         user_query=user_query or "(none)",
-        valuation_alignment=valuation_alignment(valuation, direction),
+        valuation_alignment=alignment,
     )
     for attempt in range(GEMINI_MAX_RETRIES + 1):
         try:
@@ -1906,7 +2170,9 @@ def generate_grounded_reasoning(ticker, title, direction, pct_change, actual_win
 def make_real_example(ticker, ticker_obj, fundamentals_history, title, publisher, published_at):
     """Returns (example_or_None, skip_reason). skip_reason is None on
     success, otherwise whatever label_from_forward_return reported."""
-    direction, pct_change, actual_window_days, skip_reason = label_from_forward_return(ticker_obj, published_at)
+    direction, pct_change, actual_window_days, skip_reason = label_from_forward_return(
+        ticker_obj, published_at, fundamentals_history.get("earnings_dates"),
+    )
     if direction is None:
         return None, skip_reason
 
@@ -1918,6 +2184,24 @@ def make_real_example(ticker, ticker_obj, fundamentals_history, title, publisher
     as_of_date = published_at.date() if published_at else datetime.date.today()
     market_data, valuation, earnings = build_fundamentals_blocks(ticker_obj, fundamentals_history, as_of_date)
 
+    # Headroom gate, mirroring generate_synthetic_dataset.py's
+    # VALUATION_CONFLICT_DOWNGRADE_THRESHOLD fix: label_from_forward_return
+    # is purely price-based - a stock can rally past BUY_THRESHOLD while
+    # already overvalued (or sell off past SELL_THRESHOLD while already
+    # undervalued), which is exactly "the move had no valuation headroom
+    # behind it," not a genuine buy/sell case. valuation_alignment already
+    # computes this ("no" only ever happens for a BUY/SELL original_direction
+    # - HOLD always resolves alignment to "no_data", never "no" - so every
+    # "no" here is a headroom conflict by construction). original_direction
+    # is kept for generate_grounded_reasoning to explain the tension - the
+    # resolved `direction` becomes HOLD, but Gemini still needs to know what
+    # the price action actually pointed toward to write an honest REASONING.
+    original_direction = direction
+    alignment = valuation_alignment(valuation, original_direction)
+    downgraded = original_direction in ("BUY", "SELL") and alignment == "no"
+    if downgraded:
+        direction = "HOLD"
+
     # Gemini's contradicts judgment has to exist BEFORE confidence is
     # computed - confidence_from_move needs it to override the magnitude-
     # only formula for headline-contradicted rows (see that function's
@@ -1926,7 +2210,7 @@ def make_real_example(ticker, ticker_obj, fundamentals_history, title, publisher
     # "use low confidence when contradicted" instruction never taking
     # effect on the trained model's calibration - only on the prose.
     reasoning, answer, contradicts = generate_grounded_reasoning(
-        ticker, title, direction, pct_change, actual_window_days,
+        ticker, title, direction, original_direction, alignment, pct_change, actual_window_days,
         market_data, valuation, earnings, user_query, qtype,
     )
     confidence = confidence_from_move(direction, pct_change, contradicts)
@@ -1936,7 +2220,7 @@ def make_real_example(ticker, ticker_obj, fundamentals_history, title, publisher
             {
                 "ticker": ticker,
                 "reasoning": reasoning,
-                "direction": direction,
+                "recommendation": direction,
                 "confidence": confidence,
                 "answer": answer,
             }
@@ -2177,7 +2461,7 @@ def generate_and_write():
 
 
 def direction_of(example):
-    return json.loads(example["output"])["impacted_stocks"][0]["direction"]
+    return json.loads(example["output"])["impacted_stocks"][0]["recommendation"]
 
 
 def downsample_contradicts_in_place(filepath, max_fraction=CONTRADICTS_MAX_FRACTION):
@@ -2239,8 +2523,8 @@ def strip_contradicts_field_in_place(filepath):
 
 
 def rebalance_by_direction(examples):
-    """Undersamples down to the minority class's count, so BULLISH/BEARISH/
-    NEUTRAL are equally represented. Undersampling (not duplicating the
+    """Undersamples down to the minority class's count, so BUY/SELL/
+    HOLD are equally represented. Undersampling (not duplicating the
     minority classes up) is deliberate - this project has already run into
     a real overfitting problem from repeated content once (see the
     synthetic generator's template-count history), and duplicating real

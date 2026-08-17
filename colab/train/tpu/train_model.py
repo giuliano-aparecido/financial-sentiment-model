@@ -94,6 +94,17 @@ MODEL_REGISTRY = {
     # explicit entries with repo=None so picking one fails with a clear
     # message below instead of a confusing bitsandbytes import error deep
     # inside from_pretrained.
+    #
+    # llama-3.1-8b is the GPU/RunPod paths' default as of v1 (see
+    # ../gpu/train_model.py's identically-named entry) - deliberately NOT
+    # mirrored here as this file's default for the same reason apertus-8b
+    # below is blocked, not just deprioritized: no quantization on this
+    # path means the FULL bf16 8B footprint, not the ~4x-smaller bnb-4bit
+    # one GPU/RunPod actually use.
+    "llama-3.1-8b": {
+        "repo": None,
+        "blocked_reason": "bf16 8B params is a tight/unsafe fit on a single v5e-1's 16GB HBM alongside LoRA optimizer state and activations - not validated here.",
+    },
     "apertus-8b": {
         "repo": None,
         "blocked_reason": "bf16 8B params is a tight/unsafe fit on a single v5e-1's 16GB HBM alongside LoRA optimizer state and activations - not validated here.",
@@ -188,7 +199,7 @@ model.enable_input_require_grads()
 # this is the whole mechanism. Both generators produce the identical
 # {ticker, user_query, market_data, valuation, earnings, news, output}
 # schema (v4) on purpose, specifically so this merge needs no
-# reconciliation. The real dataset is already rebalanced by direction on
+# reconciliation. The real dataset is already rebalanced by recommendation on
 # the train side and left at its natural distribution on the val side (see
 # that generator's docstring) - nothing further to do here.
 # load_dataset("json", ...) handles JSON Lines natively.
@@ -216,15 +227,15 @@ alpaca_prompt = """Below is an instruction that describes a task, paired with an
 
 ### Instruction:
 
-Analyze the following financial data and news and output JSON containing the impacted stock ticker, detailed reasoning, directional sentiment (BULLISH/BEARISH/NEUTRAL), confidence score, and a direct answer to the user's question, in exactly this shape:
-{{"impacted_stocks": [{{"ticker": "...", "reasoning": "...", "direction": "BULLISH|BEARISH|NEUTRAL", "confidence": 0.0-1.0, "answer": "..."}}]}}
+Analyze the following financial data and news and output JSON containing the impacted stock ticker, detailed reasoning, a recommended action (BUY/SELL/HOLD), confidence score, and a direct answer to the user's question, in exactly this shape:
+{{"impacted_stocks": [{{"ticker": "...", "reasoning": "...", "recommendation": "BUY|SELL|HOLD", "confidence": 0.0-1.0, "answer": "..."}}]}}
 
 CRITICAL SENTIMENT RULES:
 
 1. Weigh guidance cuts and revenue misses higher than minor operational wins.
-2. The Valuation block is a real, structural signal, not decoration - a large over/undervaluation gap should meaningfully shape your direction and confidence, not just recent news. Only let concrete, current news override it when the news describes a specific catalyst (an actual event, not a generic "market volatility" statement) the valuation estimate couldn't have priced in.
-3. NEUTRAL means the available signals genuinely conflict or are too weak/routine to support a directional call - not a default for "I'm not sure." Use it when Valuation, Market Data, Earnings, and News don't converge on one direction, or when nothing in the input is materially new.
-4. confidence is a 0.0-1.0 score for how strongly the evidence supports your direction, not how certain you are a direction exists at all - a NEUTRAL call can still carry moderate confidence when "no clear signal" is itself well-supported.
+2. The Valuation block is a real, structural signal, not decoration - a large over/undervaluation gap should meaningfully shape your recommendation and confidence, not just recent news. Only let concrete, current news override it when the news describes a specific catalyst (an actual event, not a generic "market volatility" statement) the valuation estimate couldn't have priced in. Even then, a strong catalyst alone doesn't earn BUY (or SELL): BUY requires the stock isn't already priced beyond what the news justifies - a real catalyst with no valuation headroom, and no stated reason for further upside, is HOLD, not BUY. The same applies symmetrically to SELL and further downside.
+3. HOLD means either the available signals genuinely conflict or are too weak/routine to support a BUY/SELL call, or a real catalyst exists but the stock has no valuation headroom left to act on it - not a default for "I'm not sure." Use it when Valuation, Market Data, Earnings, and News don't converge on one recommendation, when nothing in the input is materially new, or when a strong catalyst is real but the price already exceeds what it justifies.
+4. confidence is a 0.0-1.0 score for how strongly the evidence supports your recommendation, not how certain you are a clear case exists at all - a HOLD call can still carry moderate confidence when "no room to act" is itself well-supported.
 5. "Data unavailable." or "Not applicable (...)" in any block means exactly that - treat it as missing information, never invent numbers or events to fill the gap.
 6. P/E under 20 (sector-adjusted via Sector Median P/E) suggests undervaluation; 20-30 is roughly neutral; over 30 suggests a richer valuation that needs a real growth story to justify. For a Real Estate-sector company specifically, Price/Book below 1.0 is the more meaningful signal - GAAP depreciation makes P/E unreliable for that sector.
 
@@ -314,7 +325,7 @@ trainer = SFTTrainer(
         # num_train_epochs is an upper-bound safety ceiling, not the actual
         # target - early stopping below decides the real stopping point,
         # based on eval_loss rather than a guessed epoch/step count. See
-        # docs/training-results-analysis.md for why direction accuracy
+        # docs/training-results-analysis.md for why recommendation accuracy
         # (evaluate_model.py), not this loss curve, is what should actually
         # decide whether a given run is good.
         num_train_epochs = 5,
@@ -376,7 +387,7 @@ HF_USER = get_secret("HF_USER")
 # here since Colab/Kaggle raise different exception types for "no such
 # secret", and this one specific secret is optional by design, so any
 # failure to read it should silently fall back, never block or crash.
-MODEL_VERSION_DEFAULT = "v16"
+MODEL_VERSION_DEFAULT = "v1"
 try:
     MODEL_VERSION = get_secret("MODEL_VERSION") or MODEL_VERSION_DEFAULT
 except Exception:
