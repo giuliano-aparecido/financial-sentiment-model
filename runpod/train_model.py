@@ -70,6 +70,18 @@ MODEL_REGISTRY = {
         "target_modules": ["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"],
         "max_seq_length": 4096,
     },
+    # Added to try a size step up from the 3B default (see TODO.md in
+    # D:/projects) without changing infra - Unsloth's 4-bit QLoRA
+    # approach is specifically built to make 7-8B models trainable on
+    # the same GPU tier as 3B, unlike a genuine 70B jump. Note this is
+    # Llama 3.1's 8B, not a "7B" - current Llama generations don't have
+    # that size. MODEL_CHOICE_DEFAULT below is deliberately NOT changed
+    # to this - still 3B until a head-to-head eval justifies it.
+    "llama-3.1-8b": {
+        "repo": "unsloth/Meta-Llama-3.1-8B-Instruct-bnb-4bit",
+        "target_modules": ["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"],
+        "max_seq_length": 2048,
+    },
     "apertus-0.5b": {
         "repo": "swiss-ai/Apertus-v1.1-0.5B-Instruct",
         "target_modules": ["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"],

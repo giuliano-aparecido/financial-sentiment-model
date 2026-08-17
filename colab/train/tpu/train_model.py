@@ -109,6 +109,17 @@ MODEL_REGISTRY = {
         "blocked_reason": "unsloth only publishes this as -bnb-4bit (bitsandbytes-only, no TPU support) - no non-quantized mirror confirmed.",
     },
 
+    # Added for registry parity with the GPU/RunPod scripts (see
+    # TODO.md in D:/projects) - blocked here for the SAME reason as
+    # apertus-8b above: bf16 with no quantization available makes an
+    # 8B model a tight/unsafe fit on a single v5e-1's 16GB HBM
+    # alongside LoRA optimizer state and activations, not validated on
+    # this path. Use the GPU or RunPod script instead to try llama-3.1-8b.
+    "llama-3.1-8b": {
+        "repo": None,
+        "blocked_reason": "bf16 8B params is a tight/unsafe fit on a single v5e-1's 16GB HBM alongside LoRA optimizer state and activations - not validated here. Use the GPU or RunPod script instead.",
+    },
+
 }
 
 selected_config = MODEL_REGISTRY[MODEL_CHOICE]
