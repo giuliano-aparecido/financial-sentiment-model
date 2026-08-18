@@ -218,6 +218,16 @@ got on synthetic val):
       Real overreaction representation stays real-but-thin; generate_
       synthetic_dataset.py's REACTION_WEIGHTS carries the actual
       oversampling load for that class.
+11. Low-content headline filter (2026-08-19, user feedback): Google News
+    RSS returns a meaningful fraction (measured ~9% of an early real
+    Task B sample) of bare price-recap wrappers ("Intel (INTC) Stock
+    Trades Up, Here Is Why"), listicle/opinion bait ("Should You Buy
+    Microsoft Stock?"), and fund-flow filing spam as the PRIMARY (signal)
+    headline for a row - see _is_low_content_headline's own comment for
+    why this is worse than the deliberate NOISE_HEADLINES noise (a price-
+    recap headline states the very move the label is derived from, a
+    shortcut-learning risk). Now filtered out of process_ticker's
+    candidate loop entirely before make_real_example ever sees them.
 
 Earlier history: this script originally used yfinance's Ticker.news for
 headlines, which only returns the current "latest ~10" items with no
@@ -494,6 +504,28 @@ PRICE_REQUEST_DELAY_SECONDS = 0.3  # be polite to yfinance between calls
 
 PUBLISHER_FALLBACK = "Google News"
 
+# Confirmed live (2026-08-19, user feedback): surveying live Google News
+# RSS results for ORCL/TSLA/QCOM found a SINGLE publisher (MarketBeat)
+# accounted for 36-40% of ALL 100 results per ticker - almost entirely
+# auto-generated institutional-13F-filing spam ("46,643 Shares in Oracle
+# Corporation $ORCL Purchased by Trust Co. of Vermont") rather than news.
+# Publisher-based filtering catches this kind of homogeneous, high-volume
+# noise far more effectively than a headline-shape regex ever could (see
+# _is_low_content_headline's own comment on that filter's whack-a-mole
+# limits) - these sources are excluded from candidacy entirely, same
+# treatment as _is_low_content_headline gives individual headlines.
+# Deliberately NOT a blanket exclude of every "opinion/commentary"-style
+# outlet (Motley Fool, Benzinga, 24/7 Wall St. are left in) - those are
+# more heterogeneous (real reporting mixed with opinion pieces), and the
+# headline-shape filter already catches their worst individual offenders;
+# this list is reserved for sources that were confirmed near-100% low-
+# content in the live sample.
+LOW_QUALITY_PUBLISHERS = {
+    "MarketBeat", "Stocktwits", "GuruFocus", "Trefis", "Simply Wall St.",
+    "simplywall.st", "Zacks Investment Research", "StockStory",
+    "TIKR.com", "Moomoo", "TradingKey", "Quiver Quantitative",
+}
+
 # Reused verbatim from generate_synthetic_dataset.py so both datasets' news
 # blocks have the same shape - real feeds do mix in unrelated market
 # headlines too, same as the synthetic version simulates.
@@ -512,6 +544,94 @@ NOISE_HEADLINES = [
     "Bond markets rally as recession fears ease",
 ]
 NOISE_PUBLISHERS = ["Reuters", "Bloomberg", "MarketWatch", "CNBC"]
+
+# Headline SHAPES known to carry little/no real information about the
+# company - bare price-recap wrappers ("Intel (INTC) Stock Trades Up,
+# Here Is Why"), listicle/opinion bait ("Should You Buy Microsoft Stock?",
+# "2 Reasons PYPL Is Risky"), and fund-flow filing spam ("338,950 shares
+# added to ... portfolio"). Confirmed live (user feedback, 2026-08-19):
+# Google News RSS returns these often enough that they were ending up as
+# the PRIMARY (signal) headline for a real-dataset row - measured ~9% of
+# rows in an early real Task B sample. This is a different, WORSE problem
+# than generic macro noise (NOISE_HEADLINES above, mixed in deliberately
+# so the model learns to ignore truly irrelevant headlines): a price-
+# recap headline directly states the very move label_news_reaction's
+# price data also encodes, so a row built on one teaches "read the
+# headline's own stated direction back out" rather than genuine news
+# judgment - a shortcut-learning risk, not a source of useful noise.
+# Filtered out entirely in process_ticker (never even considered as a
+# candidate) rather than kept and mislabeled - this dataset ends up
+# smaller as a direct result, an accepted tradeoff for not training on
+# a signal that gives the answer away.
+# Shared by both alternatives below - "Why {Ticker} Stock Dropped Today"
+# and "{Ticker} Stock Is Falling" are the same information-free shape as
+# "Stock Trades Up, Here Is Why", just phrased as a headline instead of a
+# two-clause sentence. Confirmed live (2026-08-19): the first version of
+# this filter (without this pattern) still let "Why Tesla Stock Dropped
+# on Tuesday" / "Why is Amazon stock rallying today?" / "Why Adobe (ADBE)
+# Stock Is Falling Today" / "Why Qualcomm (QCOM) Stock Is Nosediving"
+# straight through - this is a real, ongoing whack-a-mole problem, not a
+# one-time fix; expect to keep extending this pattern as new phrasings
+# turn up, not treat it as solved.
+_MOVE_VERB_RE_FRAGMENT = (
+    r"(?:ris(?:e|es|ing)|fell|fall(?:s|ing)?|dropp?(?:ed|s|ing)?|"
+    r"rall(?:y|ies|ying|ied)|slid(?:e|es|ing)?|climb(?:s|ed|ing)?|"
+    r"surg(?:e|es|ed|ing)?|plung(?:e|es|ed|ing)?|jump(?:s|ed|ing)?|"
+    r"sank|sink(?:s|ing)?|tumbl(?:e|es|ed|ing)|gain(?:s|ed|ing)?|"
+    r"los(?:es|ing)|lost|nosediv(?:e|es|ed|ing)|soar(?:s|ed|ing)?|"
+    r"sag(?:s|ged|ging)?|slump(?:s|ed|ing)?|wilt(?:s|ed|ing)?|"
+    r"slip(?:s|ped|ping)?|retreat(?:s|ed|ing)?|advanc(?:e|es|ed|ing)?|"
+    r"wobbl(?:e|es|ed|ing)|sink|dip(?:s|ped|ping)?|swoon(?:s|ed|ing)?|"
+    r"spik(?:e|es|ed|ing)|skid(?:s|ded|ding)?)"
+)
+
+# Headline SHAPES known to carry little/no real information about the
+# company - bare price-recap wrappers ("Intel (INTC) Stock Trades Up,
+# Here Is Why", "Why Tesla Stock Dropped on Tuesday"), listicle/opinion
+# bait ("Should You Buy Microsoft Stock?", "2 Reasons PYPL Is Risky",
+# "Is Oracle Stock a Buy at $245?"), and fund-flow filing spam ("338,950
+# shares added to ... portfolio"). Confirmed live (user feedback,
+# 2026-08-19): Google News RSS returns these often enough that they were
+# ending up as the PRIMARY (signal) headline for a real-dataset row -
+# measured ~9% of rows in an early real Task B sample, before the "why +
+# move verb" variants above were even accounted for. This is a
+# different, WORSE problem than generic macro noise (NOISE_HEADLINES
+# above, mixed in deliberately so the model learns to ignore truly
+# irrelevant headlines): a price-recap headline directly states the very
+# move label_news_reaction's price data also encodes, so a row built on
+# one teaches "read the headline's own stated direction back out" rather
+# than genuine news judgment - a shortcut-learning risk, not a source of
+# useful noise. Filtered out entirely in process_ticker (never even
+# considered as a candidate) rather than kept and mislabeled - this
+# dataset ends up smaller as a direct result, an accepted tradeoff for
+# not training on a signal that gives the answer away.
+#
+# This is a regex denylist, not a robust classifier - it will keep
+# missing new phrasings (see the history note above) and is not the only
+# fix: financial-sentiment-api's app/services/news.py applies an
+# equivalent filter at INFERENCE time too (a live production quality
+# issue, not just a training-data one - a request whose top 4 raw RSS
+# results are all low-content headlines like these currently gives the
+# model nothing real to reason about).
+_LOW_CONTENT_HEADLINE_RE = re.compile(
+    r"stock (?:is )?trad(?:ing|es) (?:up|down|higher|lower)"
+    r"|shares (?:are|is) (?:up|down|higher|lower) today"
+    r"|here.s why|here.s what (?:investors|we|you) (?:need to know|see)"
+    r"|what you need to know|laps the stock market|what.s going on with"
+    rf"|\bwhy\b.{{0,60}}\b(?:stock|shares?)\b.{{0,30}}\b{_MOVE_VERB_RE_FRAGMENT}\b"
+    rf"|\b(?:stock|shares?)\b.{{0,20}}\b(?:is|are)\b.{{0,10}}\b{_MOVE_VERB_RE_FRAGMENT}(?:ing)?\b"
+    r"|^Is .+ a Good Stock|Stock a (?:Good )?Buy\b|^Should You Buy|Buy,? Hold,? (?:or|and) Sell"
+    r"|^\d+ (?:Reasons?|Stocks?)|Better Buy|Zacks (?:Investment|Rank)|Trending Stock"
+    r"|shares (?:added to|removed from|acquired by|sold by|purchased by)"
+    r"|^[\d,]+\+? Shares (?:in|of)|(?:Buys|Purchases?|Sells) Shares (?:in|of)"
+    r"|(?:Takes|Makes New) .{0,25}(?:Position|Investment) in|Invests? \$[\d,.]+|13F"
+    r"|portfolio.{0,20}(?:quiverquant|according to a)",
+    re.IGNORECASE,
+)
+
+
+def _is_low_content_headline(title: str) -> bool:
+    return bool(_LOW_CONTENT_HEADLINE_RE.search(title))
 
 # Reused verbatim from generate_synthetic_dataset.py.
 USER_QUESTION_TEMPLATES = [
@@ -2351,6 +2471,12 @@ def process_ticker(ticker, name):
             if title in seen_titles:
                 continue
             seen_titles.add(title)
+            if publisher in LOW_QUALITY_PUBLISHERS:
+                ticker_skips["low_quality_publisher"] = ticker_skips.get("low_quality_publisher", 0) + 1
+                continue
+            if _is_low_content_headline(title):
+                ticker_skips["low_content_headline"] = ticker_skips.get("low_content_headline", 0) + 1
+                continue
 
             examples, skip_reason = make_real_example(
                 ticker, ticker_obj, fundamentals_history, title, publisher, published_at)
