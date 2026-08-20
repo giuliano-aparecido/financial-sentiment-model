@@ -13,30 +13,44 @@ practice of doing it properly, not because it needs to scale.
 
 A LoRA-fine-tuned instruction model (Llama 3.2 3B by default; a few other
 open models are supported via `MODEL_REGISTRY` in `colab/train/gpu/train_model.py` /
-`colab/train/tpu/train_model.py`) that reads a stock ticker, an optional user
-question, current market data/valuation/earnings, and a block of recent
-news headlines, and outputs structured JSON that answers the user directly
-rather than just classifying sentiment:
+`colab/train/tpu/train_model.py`), trained on TWO tasks rather than one -
+the two-stage pipeline redesign: the model itself only ever reasons about
+the unpredictable input (the news); a deterministic rule
+(`fusion_rules.py`) decides BUY/SELL/HOLD, never the model.
+
+**Task A** (`task_a_prompt`) reads a ticker, its recent 3-day price move,
+and a block of recent news headlines, and classifies how the market has
+reacted to that news:
+
+```json
+{"news_reaction": "overreaction_down"}
+```
+
+news_reaction is one of `good`/`bad`/`neutral`/`overreaction_down`/
+`overreaction_up` - see `fusion_rules.py`'s own docstring for how this
+combines with a numeric DCF valuation gap to produce a recommendation.
+
+**Task B** (`task_b_prompt`) is given a ticker, an optional user question,
+current market data/valuation/earnings, the news, AND a news_reaction +
+Recommended Action that are ALREADY DECIDED (by `fusion_rules.fuse()`,
+never by the model) - its only job is to explain that given recommendation
+and answer the user's question consistently with it:
 
 ```json
 {
-  "impacted_stocks": [
-    {
-      "ticker": "AAPL",
-      "reasoning": "...",
-      "recommendation": "BUY",
-      "confidence": 0.91,
-      "answer": "Yes, the current signals lean favorably enough that AAPL looks like a reasonable buy here."
-    }
-  ]
+  "reasoning": "...",
+  "answer": "Yes, the current signals lean favorably enough that AAPL looks like a reasonable buy here."
 }
 ```
 
-`financial-sentiment-api`'s `app/services/inference.py` calls the resulting
-model over HTTP (a Colab/ngrok tunnel by default - see "Serving the model"
-below for a Modal alternative) and parses this exact shape — if you change
-the output schema or the prompt structure here, that repo needs a matching
-change (see CONTRIBUTING.md's 4-way sync rule).
+`financial-sentiment-api`'s `app/services/inference.py` calls the model
+over HTTP TWICE per request (a Colab/ngrok tunnel by default - see
+"Serving the model" below for a Modal alternative) - once per task - and
+parses these two exact shapes, then calls the SAME `fuse()` function
+(ported byte-identically as `app/services/fusion.py`) to turn Task A's
+classification into the recommendation Task B is given. If you change
+either output schema or either prompt structure here, that repo needs a
+matching change (see CONTRIBUTING.md's sync rule).
 
 ## Pipeline (run each of these as its own Colab cell, in order)
 
@@ -75,7 +89,7 @@ depending on which free Colab accelerator you're using — pick **one** of
    your Hugging Face account.
 5. **`colab/train/gpu/evaluate_model.py`** or **`colab/train/tpu/evaluate_model.py`** (match
    whichever you used for step 4) — self-contained: reuses
-   `model`/`tokenizer`/`alpaca_prompt` if run immediately after step 4 in
+   `model`/`tokenizer`/`task_a_prompt`/`task_b_prompt` if run immediately after step 4 in
    the same session, or reloads the already-pushed model straight from
    Hugging Face if run in a fresh session (e.g. the previous one expired,
    or this same script crashed partway through on a prior run — training
@@ -239,9 +253,9 @@ the whole point of pulling them from Colab/Kaggle Secrets instead.
   hallucinate one. Any block that couldn't be fetched/computed renders as
   exactly `Data unavailable.` in both training data and production, so the
   model is trained on, not just hoped to handle, partial data gaps. See the
-  canonical prompt template comment above `alpaca_prompt` in
-  `colab/train/gpu/train_model.py` and CONTRIBUTING.md's 4-way sync rule before
-  changing any of this.
+  canonical prompt template comments above `task_a_prompt`/`task_b_prompt`
+  in `colab/train/gpu/train_model.py` and CONTRIBUTING.md's sync rule
+  before changing any of this.
 
 ## docs/
 

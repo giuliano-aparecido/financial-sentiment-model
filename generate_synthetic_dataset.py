@@ -125,6 +125,8 @@ import json
 import random
 import re
 
+import fusion_rules
+
 random.seed(42)  # reproducible across Colab runs
 
 NUM_EXAMPLES = 2000  # up from 1000 - more scenario categories need more rows
@@ -161,34 +163,32 @@ VAL_HOLDOUT_TEMPLATE_INDEX_FRACTION = 0.2                       # ~20% of each
                                                                   # category's templates
                                                                   # are validation-only
 
-# VALUATION_SIGNAL is the dominant category by design, not a minority one -
-# explicit product direction: fundamentals (valuation, P/E, earnings
-# quality) should be the model's primary, default driver most of the time,
-# with news as a secondary signal that reinforces or occasionally overrides
-# it, not the other way around. BUY/SELL (pure news-driven, no
-# valuation influence on the resolved label) roughly halved from their
-# pre-pivot weight to make room - still large enough to keep "sometimes a
-# concrete company event is the whole story" a real, well-represented
-# lesson, just no longer the default.
-#
-# VALUATION_SIGNAL trimmed 0.40 -> 0.32 (that 8 points moved to HOLD, not
-# dropped) after a v16 eval: 32% direction accuracy on real val (below the
-# 33% random baseline), with the model predicting HOLD only 17% of the
-# time on real data despite it being the true label ~49% of the time.
-# VALUATION_SIGNAL_SCENARIOS never resolves to HOLD at all (every tier -
-# _alone/_reinforced/news_wins/sector-reinforced - picks undervalued->
-# BUY or overvalued->SELL), so at 40% weight, 40% of the synthetic
-# dataset was structurally incapable of teaching "sometimes the right call
-# is no strong signal either way." This still keeps fundamentals as the
-# dominant signal (32% is still the single largest category, comfortably
-# ahead of BUY/SELL at 16% each) - tempering the earlier pivot
-# slightly, not reversing it. HOLD's weight was ALREADY being protected
-# even before this change (see HOLD_VALUATION_GAP_RANGE's own history -
-# it was the direct victim of an earlier synthetic-data collision), so
-# growing it further to fix a newly-confirmed real-world gap is consistent
-# with that existing priority, not a new one. MIXED left untouched - its
-# signal-weighing lesson is orthogonal to this change.
-SENTIMENT_WEIGHTS = {"BUY": 0.16, "SELL": 0.16, "HOLD": 0.28, "MIXED": 0.08, "VALUATION_SIGNAL": 0.32}
+# Two-stage pipeline redesign (2026-08-19, see module docstring history
+# item 12): this file no longer generates a BUY/SELL/HOLD label at all -
+# every category above was really teaching one of two entangled skills at
+# once (read the news correctly, AND weigh it against valuation headroom),
+# which is exactly the fragile-to-learn rule fusion_rules.fuse() now
+# computes deterministically instead. SENTIMENT_WEIGHTS -> REACTION_WEIGHTS:
+# the five news_reaction classes Task A actually needs to classify.
+# good/bad/neutral map onto the OLD BUY/SELL/HOLD scenario pools directly
+# (same headline/reasoning content - it was always describing how the news
+# itself reads, valuation was always a separate, independently-rolled
+# field). overreaction_down/up are new. VALUATION_SIGNAL and MIXED are
+# retired as standalone categories - VALUATION_SIGNAL_SCENARIOS'
+# real-news tiers (news_wins/news_wins_no_headroom/_reinforced) and all of
+# MIXED_SIGNAL_SCENARIOS are redistributed into BUY_SCENARIOS/
+# SELL_SCENARIOS by what their headlines actually say (see the
+# redistribution block right after VALUATION_SIGNAL_SCENARIOS below);
+# VALUATION_SIGNAL's no-real-news tiers (_alone/moderate_alone) go to
+# HOLD_SCENARIOS. Weights below deliberately oversample the two rare
+# overreaction classes relative to their measured real-world rate (~5%
+# combined, see calibrate_reaction_thresholds.py) - synthetic data is
+# free to do this; generate_real_dataset.py's own rebalancing (never
+# duplicating rows) can't.
+REACTION_WEIGHTS = {
+    "good": 0.22, "bad": 0.22, "neutral": 0.26,
+    "overreaction_down": 0.15, "overreaction_up": 0.15,
+}
 
 # ---------------------------------------------------------------------------
 # Companies - (ticker, name, sector, (quarterly revenue low, high in $B))
@@ -634,10 +634,10 @@ def describe_value_screen(fnd):
     """Translates operating margin/ROE/PEG (see value_screen_metrics above)
     into 1-2 sentences of graded value-checklist commentary - teaches the
     model this vocabulary explicitly (see
-    VALUE_SCREEN_COMMENTARY_PROB's own comment for why this is spliced
-    into only a fraction of VALUATION_SIGNAL examples) rather than relying
-    purely on the model inferring quality/growth-adjusted-pricing language
-    from raw numbers in market_data on its own. Returns None (not a
+    VALUE_SCREEN_COMMENTARY_PROB_OTHER_CATEGORIES's own comment for why
+    this is spliced into only a fraction of Task B examples) rather than
+    relying purely on the model inferring quality/growth-adjusted-pricing
+    language from raw numbers in market_data on its own. Returns None (not a
     placeholder sentence) when operating_margin/ROE aren't usable, so the
     caller can skip appending anything - same "don't guess" convention as
     the rest of this module's rendering.
@@ -1512,13 +1512,19 @@ assert all(len(s) == 3 for s in MIXED_SIGNAL_SCENARIOS), \
 # news catalyst - while a small/routine gap correctly stays HOLD.
 #
 # Each entry: (headline_templates, reasoning_template, direction,
-# valuation_verdict, gap_tier, confidence_tier). valuation_verdict/gap_tier
-# feed _valuation_block_with_gap (defined below, after the ported valuation
-# functions) to construct a Valuation block with a controlled, specific gap
-# size instead of the normal random draw - the same reason
-# MIXED_SIGNAL_SCENARIOS hand-authors its headline pairs rather than
-# sampling them: this needs a deliberately clean, specific setup to teach a
-# clean lesson.
+# valuation_verdict, gap_tier, confidence_tier). This whole category is
+# RETIRED as of the two-stage pipeline redesign (see REACTION_WEIGHTS' own
+# comment) - valuation_verdict/gap_tier used to feed valuation_block_with_
+# gap (removed) to construct a controlled, specific gap instead of the
+# normal random draw, which is what taught the model to weigh valuation
+# against news at all. fusion_rules.fuse() now does that job
+# deterministically for every category, so this list survives only as
+# SOURCE DATA: the redistribution block right after it sorts each entry's
+# hand-authored headline/reasoning into BUY_SCENARIOS/SELL_SCENARIOS/
+# HOLD_SCENARIOS by what the headline itself says, discarding
+# valuation_verdict/gap_tier (fuse() computes the equivalent from a real
+# gap now) and confidence_tier (Task B carries no confidence - see
+# REACTION_WEIGHTS' own comment).
 VALUATION_SIGNAL_SCENARIOS = [
     # --- extreme gap, no corroborating news: valuation is the only signal ---
     (["{name} ({ticker}) held a routine analyst call with no notable updates to prior commentary"],
@@ -1595,25 +1601,117 @@ VALUATION_SIGNAL_SCENARIOS = [
      "BUY", "overvalued", "extreme", "news_wins"),
 ]
 
+# Redistributes VALUATION_SIGNAL_SCENARIOS' hand-authored content into the
+# news_reaction pools below by what each entry's HEADLINE actually says,
+# not by the old category's resolved BUY/SELL/HOLD label (which used to
+# be entangled with a hand-picked valuation gap that fusion_rules.fuse()
+# now computes independently - see REACTION_WEIGHTS' own comment).
+# - "_alone"/"moderate_alone": the headline explicitly says nothing
+#   happened ("no notable updates," "narrow range... no company-specific
+#   news") - genuinely neutral regardless of what the old valuation-driven
+#   direction used to be.
+# - "_reinforced"/"news_wins"/"news_wins_no_headroom": all describe SOME
+#   real (if sometimes soft) news content, and `direction` here was always
+#   the news-implied lean (BUY==good news, SELL==bad news), never a coin
+#   flip - a safe, direct proxy for news_reaction.
+_VALUATION_SIGNAL_TO_GOOD = []
+_VALUATION_SIGNAL_TO_BAD = []
+_VALUATION_SIGNAL_TO_NEUTRAL = []
+for _headline_templates, _reasoning_template, _direction, _verdict, _gap_tier, _confidence_tier in VALUATION_SIGNAL_SCENARIOS:
+    if _confidence_tier in ("extreme_alone", "moderate_alone"):
+        _VALUATION_SIGNAL_TO_NEUTRAL.append((_headline_templates, [_reasoning_template]))
+    else:
+        _tier = "subtle" if _confidence_tier == "extreme_reinforced" else "clear"
+        _target = _VALUATION_SIGNAL_TO_GOOD if _direction == "BUY" else _VALUATION_SIGNAL_TO_BAD
+        _target.append((_headline_templates, _reasoning_template, _tier))
+
+# MIXED_SIGNAL_SCENARIOS' own conflict-weighing IS a "read the news
+# correctly" skill (which signal should dominate a headline pair), not a
+# valuation-fusion one - it maps directly onto good/bad by its own
+# resolved `direction`, same principle as the VALUATION_SIGNAL
+# redistribution above. "clear" tier since these are decisive,
+# unambiguous-once-weighed cases, not soft/indirect signals.
+_MIXED_TO_GOOD = [(h, r, "clear") for h, r, d in MIXED_SIGNAL_SCENARIOS if d == "BUY"]
+_MIXED_TO_BAD = [(h, r, "clear") for h, r, d in MIXED_SIGNAL_SCENARIOS if d == "SELL"]
+
+BUY_SCENARIOS = BUY_SCENARIOS + _VALUATION_SIGNAL_TO_GOOD + _MIXED_TO_GOOD
+SELL_SCENARIOS = SELL_SCENARIOS + _VALUATION_SIGNAL_TO_BAD + _MIXED_TO_BAD
+HOLD_SCENARIOS = HOLD_SCENARIOS + _VALUATION_SIGNAL_TO_NEUTRAL
+
+# --- overreaction_down/up: NEW as of the two-stage pipeline redesign -
+# modest, routine-register news (deliberately similar to HOLD_SCENARIOS'
+# and the BUY/SELL "subtle" tier's real-headline style) paired with a
+# fabricated price move much larger than the headline alone would justify
+# (see _fabricate_move_pct below) - the actual training signal for this
+# class is the (modest headline, outsized move) MISMATCH, not the
+# headline's content in isolation. Reasoning explicitly names the
+# overdone-ness rather than treating the move as a real catalyst.
+OVERREACTION_DOWN_SCENARIOS = [
+    (["{name} ({ticker}) shares fell sharply this week despite reporting Q{q} results broadly in line with estimates"],
+     "A sharp decline alongside results that were merely in-line, not a genuine miss, looks disproportionate - this reads as an overreaction rather than a fundamentals-driven repricing."),
+    (["{ticker} ({name}) shares dropped following a minor, routine SEC filing update with no new financial disclosures"],
+     "A routine filing update carries essentially no new information, so a meaningful share-price decline around it looks like an overreaction rather than a response to real news."),
+    (["{name} ({ticker}) shares slid after a single analyst trimmed their price target slightly, citing near-term caution"],
+     "One analyst's modest, cautious price-target trim is a small, incremental data point - a sizable share-price drop in response looks larger than the news itself would justify."),
+    (["{ticker} ({name}) shares fell amid broad market volatility, with no company-specific news reported"],
+     "Without any company-specific catalyst, a notable decline in {ticker} tied to broad market volatility looks like it's tracking sentiment rather than anything specific to the business - a plausible overreaction."),
+    (["{name} ({ticker}) shares dropped after a mid-tier executive departure, unrelated to the CEO or CFO roles"],
+     "A departure below the C-suite's top roles is routine and rarely material - a sharp share-price move on this kind of news looks larger than the underlying event warrants."),
+    (["{ticker} ({name}) shares fell after a routine, previously-scheduled regulatory filing generated some negative headlines"],
+     "A routine, expected filing generating outsized negative headlines - and a matching share-price drop - looks like a reaction to the coverage itself rather than to any new substantive information."),
+    (["{name} ({ticker}) shares declined following a competitor's earnings miss, despite no direct read-through disclosed"],
+     "A competitor's miss doesn't automatically apply to {ticker} absent a stated read-through - a meaningful decline on secondhand, unconfirmed contagion looks like an overreaction."),
+    (["{ticker} ({name}) shares slipped after a minor product recall covering a small, discontinued product line"],
+     "A recall confined to a small, already-discontinued line has limited real financial exposure - a sizable share-price drop looks disproportionate to the scope of the issue."),
+    (["{name} ({ticker}) shares fell after a short-seller report that cited mostly previously-disclosed information"],
+     "A short report built mainly on information the company had already disclosed doesn't introduce much new risk - a sharp drop in response looks like an overreaction to the framing rather than to new facts."),
+    (["{ticker} ({name}) shares dropped following a delayed but ultimately routine regulatory approval"],
+     "A delay that still ends in approval is a timing footnote, not a change in outcome - a meaningful share-price decline around it looks larger than the news itself justifies."),
+    (["{name} ({ticker}) shares fell after a minor guidance footnote flagged a small, one-time currency headwind"],
+     "A flagged one-time currency item is a modest, non-recurring factor - a sizable drop in response looks like it's pricing in more than a single footnote actually implies."),
+    (["{ticker} ({name}) shares slid after weaker-than-expected trading volume was reported with no other news"],
+     "Light trading volume on its own isn't a fundamental catalyst - a notable share-price decline attributed to it looks like an overreaction to a data point that says little about the business."),
+]
+
+OVERREACTION_UP_SCENARIOS = [
+    (["{name} ({ticker}) shares rallied sharply this week despite reporting Q{q} results broadly in line with estimates"],
+     "A sharp rally alongside results that were merely in-line, not a genuine beat, looks disproportionate - this reads as an overreaction rather than a fundamentals-driven repricing."),
+    (["{ticker} ({name}) shares jumped following a minor, routine SEC filing update with no new financial disclosures"],
+     "A routine filing update carries essentially no new information, so a meaningful share-price rally around it looks like an overreaction rather than a response to real news."),
+    (["{name} ({ticker}) shares rose after a single analyst raised their price target slightly, citing modest optimism"],
+     "One analyst's modest price-target raise is a small, incremental data point - a sizable share-price rally in response looks larger than the news itself would justify."),
+    (["{ticker} ({name}) shares rallied amid broad market optimism, with no company-specific news reported"],
+     "Without any company-specific catalyst, a notable rally in {ticker} tied to broad market optimism looks like it's tracking sentiment rather than anything specific to the business - a plausible overreaction."),
+    (["{name} ({ticker}) shares rose after a mid-tier executive hire, unrelated to the CEO or CFO roles"],
+     "A hire below the C-suite's top roles is routine and rarely material - a sharp share-price move on this kind of news looks larger than the underlying event warrants."),
+    (["{ticker} ({name}) shares rallied after a routine, previously-scheduled regulatory filing generated some positive headlines"],
+     "A routine, expected filing generating outsized positive headlines - and a matching share-price rally - looks like a reaction to the coverage itself rather than to any new substantive information."),
+    (["{name} ({ticker}) shares rose following a competitor's strong earnings beat, despite no direct read-through disclosed"],
+     "A competitor's beat doesn't automatically apply to {ticker} absent a stated read-through - a meaningful rally on secondhand, unconfirmed optimism looks like an overreaction."),
+    (["{ticker} ({name}) shares climbed after unconfirmed market chatter about a potential partnership, with no company statement"],
+     "Unconfirmed speculation the company hasn't addressed is a thin basis for a real move - a sizable rally on this kind of chatter looks disproportionate until there's an actual confirmation."),
+    (["{name} ({ticker}) shares rose after a bullish note that cited mostly previously-disclosed information"],
+     "A bullish note built mainly on information the company had already disclosed doesn't introduce much new upside case - a sharp rally in response looks like an overreaction to the framing rather than to new facts."),
+    (["{ticker} ({name}) shares jumped following an expedited but otherwise routine regulatory approval"],
+     "An approval arriving a bit early is a timing footnote, not a change in outcome - a meaningful share-price rally around it looks larger than the news itself justifies."),
+    (["{name} ({ticker}) shares rose after a minor guidance footnote flagged a small, one-time currency tailwind"],
+     "A flagged one-time currency tailwind is a modest, non-recurring factor - a sizable rally in response looks like it's pricing in more than a single footnote actually implies."),
+    (["{ticker} ({name}) shares climbed after unusually heavy trading volume was reported with no other news"],
+     "Heavy trading volume on its own isn't a fundamental catalyst - a notable share-price rally attributed to it looks like an overreaction to a data point that says little about the business."),
+]
+
 # Sector-wide macro/geopolitical developments whose fundamental linkage to
 # companies in that sector is direct and well-established - a REAL change
 # to the business's own economics (revenue per unit sold, margin, funding
 # cost, addressable market), not just market sentiment about the sector.
-# Explicit product direction: news should reinforce the valuation-led
-# default most strongly when it's this kind of concrete economic linkage,
-# not a generic "institutional buying ticked up"-style soft signal (see
-# "_reinforced" tier above, which stays for that weaker case). Picked at
-# generation time based on the actual company's own informal sector (see
-# make_example), not a static template - a "moderate" gap tier isn't used
-# here on purpose: a sector-wide economic shift paired with an already-
-# large valuation gap is meant to be the single most confident case in this
-# category, short of a concrete company-specific catalyst ("_wins" tier).
+# Picked at generation time based on the actual company's own informal
+# sector (see make_example's "good"/"bad" branch), not a static template.
 # Only 7 of ~20 informal sectors are covered - covers two of the four
 # held-out tickers (BA -> aerospace, HRZN -> industrials) so this pattern
 # actually gets held-out eval coverage, not just training exposure.
 #
 # Each value: (bullish_headline, bearish_headline, linkage_phrase).
-# linkage_phrase fills SECTOR_REINFORCED_REASONING's own {linkage} slot -
+# linkage_phrase fills SECTOR_LINKAGE_REASONING's own {linkage} slot -
 # names the specific economic channel, not just "this sector is affected."
 SECTOR_MACRO_HEADLINES = {
     # Deliberately NOT "oil price up = bullish, oil price down = bearish" -
@@ -1665,107 +1763,46 @@ SECTOR_MACRO_HEADLINES = {
     ),
 }
 
-SECTOR_REINFORCED_REASONING = (
-    "{ticker} already looks meaningfully {verdict} against its estimated intrinsic value, and this "
-    "sector-wide development is a real reinforcement rather than generic sentiment - {linkage} - so it "
-    "carries more weight than a same-direction signal without a clear fundamental channel, though still "
-    "tempered by the underlying uncertainty in any valuation estimate."
+# Rewritten for the two-stage pipeline redesign: the old version of this
+# template asserted "{ticker} already looks meaningfully {verdict}
+# against its estimated intrinsic value" - a claim that used to be safe
+# because VALUATION_SIGNAL_SCENARIOS controlled the valuation gap directly
+# (valuation_block_with_gap, since removed). Now every category draws a
+# REAL, independent random DCF gap (render_valuation), so this template
+# can no longer presume what that gap says - it describes only the news
+# itself; _fusion_explanation (see make_example) appends the correct
+# valuation-based clause afterward, whatever the random draw turns out to
+# be.
+SECTOR_LINKAGE_REASONING = (
+    "This sector-wide development is a real reinforcement rather than generic sentiment - {linkage} - "
+    "which gives {ticker} a concrete, if indirect, {tone} signal beyond company-specific news alone."
 )
 
-# Higher than generic "_reinforced" (0.68-0.80) - a direct economic linkage
-# is a stronger reinforcement than a soft, indirect signal like an uptick
-# in institutional buying, but still below "news_wins" (a concrete,
-# company-specific catalyst is stronger evidence than a sector-wide one).
-SECTOR_REINFORCED_CONFIDENCE = (0.75, 0.88)
-# Fraction of VALUATION_SIGNAL rows that use this path INSTEAD of the
-# static VALUATION_SIGNAL_SCENARIOS list, when the company's sector is
-# covered above (falls through to the static list otherwise).
+# Fraction of "good"/"bad" rows (company's sector permitting - see
+# SECTOR_MACRO_HEADLINES) that swap in a sector-linked headline instead of
+# drawing from the regular BUY_SCENARIOS/SELL_SCENARIOS pool - was
+# VALUATION_SIGNAL-only before this file's two-stage redesign, now feeds
+# news_reaction directly (see make_example).
 SECTOR_REINFORCED_PROB = 0.40
 
-# Fraction of VALUATION_SIGNAL rows (either path above) that get an
-# appended value-screen commentary sentence (see describe_value_screen) -
-# NOT 1.0, so VALUATION_SIGNAL's existing hand-authored reasoning variety
-# doesn't collapse into "always ends the same way" - the model should
-# learn this vocabulary as ONE input among several it reasons over, not a
-# rigid suffix every valuation-driven example carries.
-#
-# Lowered 0.50 -> 0.25 after a v16 eval showed the model reciting this
-# commentary's phrasing near-verbatim on a REAL headline it had never
-# trained on - at 40% VALUATION_SIGNAL weight x 50% commentary, roughly
-# 1 in 5 of ALL training rows carried this exact pattern, frequent enough
-# to memorize as a string rather than learn as a judgment. Combined with
-# describe_value_screen's own phrasing randomization (see
-# QUALITY_*_PHRASINGS/GROWTH_*_PHRASINGS), this should meaningfully cut
-# the "single reproducible string" risk from both directions - seen less
-# often, and no longer identical even when it is seen.
-VALUE_SCREEN_COMMENTARY_PROB = 0.25
-
-# Extends commentary eligibility to BUY/SELL/MIXED, at a LOWER rate
-# than VALUATION_SIGNAL's own - confirmed live (dataset-quality audit)
+# Fraction of Task B rows that get an appended value-screen commentary
+# sentence (see describe_value_screen) - NOT 1.0, so this vocabulary is
+# learned as ONE input among several the model reasons over, not a rigid
+# suffix every row carries. Applied uniformly across all five news_
+# reaction classes now (previously VALUATION_SIGNAL got a separate,
+# higher 0.25 rate before that category was retired - see this file's
+# history item 12 - and BUY/SELL/MIXED got this same 0.15). Confirmed
+# live (dataset-quality audit, pre-redesign): at the old two-tier setup,
 # checklist vocabulary (quality/growth-adjusted-pricing language) reached
-# reasoning text on only ~8% of ALL rows (VALUATION_SIGNAL's 32% category
-# weight x 25% commentary rate), leaving Price/Book, FCF yield, Price/
-# Sales, and the sector-relative P/E comparison shown in market_data but
-# never used in ANY target output - the model has no training signal to
-# attend to them. This is a COVERAGE fix (more categories), not a
-# repeat of the FREQUENCY mistake VALUE_SCREEN_COMMENTARY_PROB's own
-# comment documents (v16 memorized this phrasing near-verbatim at a
-# higher combined rate than even this addition reaches) - 0.15 here,
-# applied to categories together weighted 0.40, adds ~6 points of
-# coverage (8% -> ~14% of all rows), well under the previously-reverted
-# ~20% that caused memorization.
+# reasoning text on only ~8% of ALL rows even with VALUATION_SIGNAL's own
+# richer 0.25, leaving Price/Book, FCF yield, Price/Sales, and the
+# sector-relative P/E comparison shown in market_data but never used in
+# ANY target output; a still-earlier 0.50 rate on VALUATION_SIGNAL alone
+# had the model reciting this exact phrasing near-verbatim on a REAL
+# headline it had never trained on. 0.15 uniformly keeps well under
+# either previously-confirmed memorization threshold while giving every
+# reaction class the same coverage.
 VALUE_SCREEN_COMMENTARY_PROB_OTHER_CATEGORIES = 0.15
-
-# Reported live (twice): a controlled gap this large is implausible for
-# real companies, especially the large, liquid, heavily-covered names in
-# COMPANIES (AAPL at "92% overvalued" was the specific example) - genuinely
-# mispriced blue-chips rarely show more than roughly 40-60% DCF-implied
-# gaps even in real crisis-level events, and this dataset applies the SAME
-# range regardless of which company gets picked. Capping the display at
-# VALUATION_PCT_DISPLAY_CAP (150%) was a different fix (bounds the
-# uncapped random-DCF pipeline's occasional blowup) and didn't address
-# this - a controlled, INTENTIONAL 70-95% gap is well under that cap, so
-# it was never touched by it. Tightened both tiers down; still clearly
-# differentiated and large enough to teach "this is a real, decisive
-# signal," just no longer cartoonish for a company like AAPL.
-VALUATION_GAP_RANGES = {"extreme": (40.0, 70.0), "moderate": (12.0, 25.0)}
-# HOLD_SCENARIOS' own valuation gap is pinned to this range (see
-# make_example's HOLD branch) instead of the fully random draw every
-# other non-VALUATION_SIGNAL category gets - genuinely insignificant, so it
-# can never collide with VALUATION_SIGNAL_SCENARIOS' "extreme"/"moderate"
-# ranges above by chance. See VALUATION_SIGNAL_SCENARIOS' own comment for
-# why this matters.
-HOLD_VALUATION_GAP_RANGE = (0.0, 8.0)
-
-# BUY/SELL now nested by tier - "subtle" gets a lower range than
-# "clear" (a softer signal genuinely warrants less certainty) but still well
-# above HOLD's range, so low confidence alone doesn't become another
-# implicit way to say "I'm not sure, call it HOLD."
-CONFIDENCE_RANGES = {
-    "BUY": {"clear": (0.85, 0.97), "subtle": (0.66, 0.80)},
-    "SELL": {"clear": (0.83, 0.96), "subtle": (0.66, 0.80)},
-    "HOLD": {"clear": (0.60, 0.82)},
-    "MIXED": {"clear": (0.55, 0.75)},
-    # Deliberately lower ceilings than BUY/SELL "clear" even for the
-    # "extreme" gap tier - a DCF-style estimate is documented, first-hand,
-    # to carry real model risk (see VALUATION_SIGNAL_SCENARIOS' own
-    # comment), so it should never earn the same confidence a concrete news
-    # catalyst does. "news_wins" is the exception: confidence there reflects
-    # the (real, concrete) news catalyst, not the valuation gap it overrides.
-    "VALUATION_SIGNAL": {
-        "extreme_alone": (0.58, 0.70),
-        "moderate_alone": (0.45, 0.56),
-        "extreme_reinforced": (0.68, 0.80),
-        "news_wins": (0.80, 0.93),
-        # A real beat/miss with no stated forward reason (see
-        # VALUATION_SIGNAL_SCENARIOS' comment on the pair using this tier):
-        # confirms the quarter was genuinely strong/weak, which is worth
-        # more than "moderate_alone"'s no-headline-catalyst case, but
-        # doesn't earn "news_wins" confidence since the direction resolves
-        # to HOLD (no headroom claim to be confident about).
-        "news_wins_no_headroom": (0.55, 0.68),
-    },
-}
 
 
 def held_out_template_indices(templates):
@@ -1792,49 +1829,18 @@ def held_out_template_indices(templates):
     return {int((i + 0.5) * stride) for i in range(n_holdout)}
 
 
-def held_out_template_indices_stratified(templates, direction_index):
-    """Like held_out_template_indices, but strides WITHIN each direction
-    group separately before merging - confirmed live the plain
-    evenly-spaced-across-the-whole-list version could land entirely on
-    ONE direction when a list is internally grouped by direction (as
-    VALUATION_SIGNAL_SCENARIOS and MIXED_SIGNAL_SCENARIOS both are):
-    VALUATION_SIGNAL's holdout at {0, 7} was BOTH BUY;
-    MIXED_SIGNAL's at {0, 7} was BOTH SELL. That inverted the val
-    split's direction mix for those two categories relative to train
-    (VALUATION_SIGNAL: 97 BULL/49 BEAR in val vs 120/173 in train; MIXED:
-    6 BULL/32 BEAR in val vs 57/38 in train), so held-out generalization
-    for them was only ever measured in one direction. `direction_index`
-    is each scenario tuple's direction field position (both lists this
-    is used for put it at index 2).
-
-    Same mid-point-offset fix as held_out_template_indices above, for the
-    same reason: at n_holdout=1 (true here for both VALUATION_SIGNAL_SCENARIOS
-    direction groups, 7 entries each), int(0 * stride) always resolves to
-    index 0, so whichever template happened to be listed first in a
-    direction group was ALWAYS the holdout - not evenly spaced, not random,
-    every regeneration. For VALUATION_SIGNAL_SCENARIOS that meant its two
-    "extreme_alone" templates (both listed first in their direction group)
-    were 100% held out and 0% in train, confirmed via dataset_train.jsonl
-    having zero rows with that tier's reasoning phrasing while
-    dataset_val.jsonl had 58 - the model was tested on a lesson it was
-    never shown."""
-    by_direction = {}
-    for idx, template in enumerate(templates):
-        by_direction.setdefault(template[direction_index], []).append(idx)
-    holdout = set()
-    for indices in by_direction.values():
-        n = len(indices)
-        n_holdout = max(1, round(n * VAL_HOLDOUT_TEMPLATE_INDEX_FRACTION))
-        stride = n / n_holdout
-        holdout.update(indices[int((i + 0.5) * stride)] for i in range(n_holdout))
-    return holdout
-
-
+# Computed AFTER the VALUATION_SIGNAL/MIXED redistribution above, so the
+# held-out fraction is drawn from each pool's FULL final content (original
+# + redistributed entries), not just the original BUY_SCENARIOS/
+# SELL_SCENARIOS/HOLD_SCENARIOS lists as first authored. MIXED_SIGNAL_
+# SCENARIOS/VALUATION_SIGNAL_SCENARIOS no longer get their own standalone
+# holdout index - they're not dispatched as separate categories anymore
+# (see REACTION_WEIGHTS' own comment).
 BUY_HOLDOUT_IDX = held_out_template_indices(BUY_SCENARIOS)
 SELL_HOLDOUT_IDX = held_out_template_indices(SELL_SCENARIOS)
 HOLD_HOLDOUT_IDX = held_out_template_indices(HOLD_SCENARIOS)
-MIXED_HOLDOUT_IDX = held_out_template_indices_stratified(MIXED_SIGNAL_SCENARIOS, direction_index=2)
-VALUATION_SIGNAL_HOLDOUT_IDX = held_out_template_indices_stratified(VALUATION_SIGNAL_SCENARIOS, direction_index=2)
+OVERREACTION_DOWN_HOLDOUT_IDX = held_out_template_indices(OVERREACTION_DOWN_SCENARIOS)
+OVERREACTION_UP_HOLDOUT_IDX = held_out_template_indices(OVERREACTION_UP_SCENARIOS)
 
 
 def make_fields(company):
@@ -2185,59 +2191,16 @@ def _payout_blend_fraction(payout_ratio):
     return (payout_ratio - low) / (high - low)
 
 
-# Below this gap %, a contradiction between the real DCF and a news-driven
-# label isn't material enough to call out - matches VALUATION_GAP_RANGES'
-# own "moderate" tier floor, the smallest gap this generator otherwise
-# treats as a real signal worth a dedicated VALUATION_SIGNAL scenario.
-VALUATION_CONFLICT_ACKNOWLEDGMENT_THRESHOLD = 30.0
-
-# Confirmed live (dataset-quality audit): for BUY/SELL/MIXED rows,
-# render_valuation runs the REAL DCF independently of which news-driven
-# label the row's headline/reasoning template resolved to - fnd's random
-# fundamentals draw has no relationship to the scenario picked, so the two
-# are statistically independent. In ~50% of large-gap (>=30%) rows the
-# valuation pointed the OPPOSITE direction from the label, and the
-# reasoning text never mentioned it - training the model to silently
-# ignore the Valuation block whenever news is present, the exact opposite
-# of SENTIMENT_WEIGHTS' own stated goal ("fundamentals should be the
-# model's primary, default driver"). VALUATION_SIGNAL's own "news_wins"
-# tier already teaches "news beats valuation" explicitly, with reasoning
-# that says so - these phrasings extend that same explicit acknowledgment
-# to the 175 rows that were teaching it silently instead. Multiple
-# phrasings (not one fixed sentence) for the same memorization-avoidance
-# reason as QUALITY_*_PHRASINGS above.
-VALUATION_CONFLICT_PHRASINGS = [
-    "A DCF estimate actually points the other way here ({verdict} by ~{pct:.0f}%), but the news above is the more immediate, concrete signal.",
-    "The valuation model reads {verdict} by roughly {pct:.0f}% here, though a specific, current catalyst like this should carry more weight than a static estimate.",
-    "This does screen as {verdict} on a DCF basis (~{pct:.0f}%), but that's a slower-moving signal than what's driving today's read.",
-]
-
-# Above this gap %, the contradiction isn't just worth a footnote (see
-# VALUATION_CONFLICT_ACKNOWLEDGMENT_THRESHOLD above) - it's decisive enough
-# that a BUY/SELL call shouldn't survive it. Matches VALUATION_GAP_RANGES'
-# "extreme" floor, the same threshold the news_wins_no_headroom tier (see
-# VALUATION_SIGNAL_SCENARIOS' own comment) already uses to draw this exact
-# line for VALUATION_SIGNAL rows - this extends the same rule to BUY/SELL/
-# MIXED. Confirmed live (user feedback on a value-investing read of a BA
-# row): a strong catalyst confirms the business is doing well, but doesn't
-# by itself mean there's room left to buy into (or, symmetrically, room
-# left to fall for a SELL call) - only genuine headroom, or a stated reason
-# for more of it, earns the full BUY/SELL call. Between the two thresholds
-# (30-40%) the gap is real but not decisive, so today's acknowledge-but-
-# keep-the-label behavior still applies; at or above this one, the label
-# itself downgrades to HOLD.
-VALUATION_CONFLICT_DOWNGRADE_THRESHOLD = VALUATION_GAP_RANGES["extreme"][0]
-
-# Used when the downgrade above fires - unlike VALUATION_CONFLICT_PHRASINGS
-# (which keeps the original label and just appends a footnote), these
-# phrasings explain why the resolved call is HOLD despite a real catalyst:
-# the catalyst confirms the business is sound, but the valuation gap means
-# there's no room left to act on it. Mirrors news_wins_no_headroom's tone.
-VALUATION_CONFLICT_DOWNGRADE_PHRASINGS = [
-    "That said, {ticker} already screens as {verdict} by roughly {pct:.0f}% on a DCF basis - a real catalyst, but not one with room left to act on, so this lands at HOLD rather than a full directional call.",
-    "Still, the DCF reads {verdict} by about {pct:.0f}% here - the news confirms the business is doing what it says, but at this price there's no headroom left, which caps this at HOLD instead of a stronger call.",
-    "Weighed against a DCF that's {verdict} by ~{pct:.0f}%, though: the catalyst is real, but it doesn't by itself create room to act on - HOLD, not a directional call.",
-]
+# Retired (2026-08-19, two-stage pipeline redesign): BUY/SELL/MIXED used
+# to draw a REAL, independent random DCF gap and then hand-check it
+# against the news-driven label - acknowledging or downgrading to HOLD
+# above a threshold if the two conflicted. fusion_rules.fuse() now does
+# exactly this, deterministically, for every row regardless of category -
+# there's no longer a silent-contradiction risk this needed to patch, so
+# VALUATION_CONFLICT_ACKNOWLEDGMENT_THRESHOLD/_PHRASINGS/_DOWNGRADE_
+# THRESHOLD/_DOWNGRADE_PHRASINGS are gone. make_example's
+# _fusion_explanation (near the bottom of this file) replaces all four -
+# see its own comment.
 
 _VALUATION_GAP_RE = re.compile(r"(overvalued|undervalued) by [~>](\d+)%")
 
@@ -2320,38 +2283,11 @@ def render_valuation(fnd):
     return valuation_block(fnd["price"], intrinsic, basis)
 
 
-def valuation_block_with_gap(fnd, gap_pct, verdict):
-    """Builds a Valuation block with a SPECIFIC, controlled over/undervalued
-    percentage - used only by VALUATION_SIGNAL_SCENARIOS (see that list's
-    own comment), which needs a deliberately clean, specific gap to teach a
-    clean lesson, rather than whatever build_scenarios/intrinsic_value's
-    full random-draw pipeline happens to produce. Still renders through the
-    same valuation_block() formatter as every other row, so the shape
-    (basis label, wording) is identical - only these rows' underlying
-    numbers are directly constructed instead of DCF-derived.
-
-    `basis` used to be `random.choice(list(BASIS_LABELS))` - reported live:
-    that put AAPL (Technology, not asset-heavy) at "Intrinsic Value
-    (FCF-based)", a basis classify_valuation_basis would never actually
-    assign it (FCF requires an asset-heavy sector AND positive free cash
-    flow). Uniform-random label variety was papering over an internal
-    inconsistency: production's real classify_valuation_basis is
-    deterministic per company (sector/profitability/payout ratio), so a
-    training row showing a basis that company could never actually get is
-    a fabricated combination the model has no business learning from. Now
-    classified the same way every other category's valuation gets
-    classified - basis varies across ROWS (different companies, different
-    classifications) rather than being randomized WITHIN a single row
-    independent of the company it's describing."""
-    basis = classify_valuation_basis(
-        fnd["eps_trailing"], fnd["payout_ratio"], fnd["sector"], fnd["free_cash_flow"],
-    )
-    price = fnd["price"]
-    if verdict == "overvalued":
-        intrinsic = price / (1 + gap_pct / 100)
-    else:
-        intrinsic = price / (1 - gap_pct / 100)
-    return valuation_block(price, intrinsic, basis)
+# valuation_block_with_gap (constructed a Valuation block with a
+# controlled, non-DCF-derived gap - used only by the now-retired
+# VALUATION_SIGNAL_SCENARIOS/HOLD's pinned-gap path) removed along with
+# the VALUATION_CONFLICT_* machinery above - every category draws a real,
+# independent render_valuation(fnd) gap now (see make_example).
 
 
 def render_earnings(fnd, direction):
@@ -2386,89 +2322,161 @@ def render_earnings(fnd, direction):
     )
 
 
-def make_example(company, category):
-    ticker = company[0]
-    valuation_signal = None  # set below only for category == "VALUATION_SIGNAL"
-    # render_earnings(fnd, direction) renders a beat/miss matching whatever
-    # direction is passed - fine for every category except VALUATION_SIGNAL's
-    # "_alone"/"_reinforced" tiers, whose headlines explicitly claim no fresh
-    # news ("no other updates," "no notable updates"). Confirmed live: those
-    # rows were getting a real, unmentioned earnings beat/miss that silently
-    # contradicts the headline's own "nothing happened" claim - a second
-    # channel telling the model "there IS a catalyst here" exactly where
-    # HOLD_VALUATION_GAP_RANGE (above) is teaching the opposite. Only
-    # "_wins" describes an actual catalyst worth reflecting in earnings.
-    earnings_direction = None  # None => use `direction`; set explicitly to override
+_NAIVE_LEAN = {
+    "good": "BUY", "overreaction_down": "BUY",
+    "bad": "SELL", "overreaction_up": "SELL",
+    "neutral": None,
+}
 
-    if category == "MIXED":
-        idx = random.randrange(len(MIXED_SIGNAL_SCENARIOS))
-        headline_templates, reasoning_template, direction = MIXED_SIGNAL_SCENARIOS[idx]
-        is_holdout_template = idx in MIXED_HOLDOUT_IDX
-        conf_low, conf_high = CONFIDENCE_RANGES["MIXED"]["clear"]
-    elif category == "HOLD":
+# Replace the old VALUATION_CONFLICT_*/valuation_block_with_gap machinery
+# (see that code's removal note above): rather than hand-checking whether
+# a randomly-drawn gap "contradicts" a category-fixed label past some
+# threshold, every row now gets one short, generic clause naming
+# whichever of three relationships actually holds between the news
+# reaction and fuse()'s valuation bucket - "reinforcing" (valuation backs
+# up the news-implied lean), "capping" (valuation caps a clear reaction
+# down to a weaker call), or "driving" (news is neutral/routine and
+# valuation alone is doing the work) - matching fusion_rules.FUSION_
+# TABLE's own row-by-row rationale. Multiple phrasings per pool for the
+# same memorization-avoidance reason as QUALITY_*_PHRASINGS/VALUATION_
+# CONFLICT_PHRASINGS before it.
+_REINFORCING_CLAUSES = [
+    "{ticker} also screens as {bucket_word} on a DCF basis (~{pct:.0f}%), reinforcing that read.",
+    "That lines up with the DCF, which reads {bucket_word} by roughly {pct:.0f}% here too.",
+    "The valuation picture agrees - {bucket_word} by about {pct:.0f}% on a DCF basis, corroborating the read.",
+]
+_CAPPING_CLAUSES = [
+    "That said, {ticker} already screens as {bucket_word} by roughly {pct:.0f}% on a DCF basis - a real signal, but not one with room left to act on, so this lands at {recommendation} rather than a stronger call.",
+    "Still, the DCF reads {bucket_word} by about {pct:.0f}% here - real evidence, but at this price there's no headroom left, which caps this at {recommendation} instead of a full directional call.",
+    "Weighed against a DCF that's {bucket_word} by ~{pct:.0f}%, though: the signal is real, but it doesn't by itself create room to act on - {recommendation}, not a stronger call.",
+]
+_DRIVING_CLAUSES = [
+    "No strong catalyst either way here, but {ticker} is trading at a level that screens {bucket_word} versus its estimated intrinsic value (~{pct:.0f}%) - a real, if imperfect, signal on its own.",
+    "Nothing in the news itself moves the needle, but the DCF reads {bucket_word} by about {pct:.0f}% - worth weighing even without a fresh catalyst.",
+    "The news is routine, but {ticker}'s valuation - {bucket_word} by roughly {pct:.0f}% on a DCF basis - is doing the real work here.",
+]
+_NEAR_FAIR_CLAUSES = [
+    "{ticker} is trading close to its estimated intrinsic value here, so valuation isn't a strong argument either way.",
+    "No real valuation edge either way for {ticker} right now - it's trading near fair value on a DCF basis.",
+]
+_NO_DATA_CLAUSES = [
+    "No valuation estimate is available here, which tempers this to {recommendation}.",
+    "With no usable valuation read available, there's nothing to confirm extra headroom, so this stays at {recommendation}.",
+]
+
+
+def _fusion_explanation(ticker, reaction, fusion_result, gap_pct):
+    """Appended to every row's base reasoning (which explains the NEWS
+    itself - still accurate regardless of headroom) to make the actual
+    recommendation - always fusion_rules.fuse()'s deterministic output,
+    never something invented here - explicit."""
+    bucket = fusion_result.valuation_bucket
+    if bucket == "no_data":
+        return random.choice(_NO_DATA_CLAUSES).format(recommendation=fusion_result.recommendation)
+    if bucket == "near_fair":
+        return random.choice(_NEAR_FAIR_CLAUSES).format(ticker=ticker)
+
+    bucket_word = "undervalued" if bucket == "undervalued" else "overvalued"
+    naive_lean = _NAIVE_LEAN[reaction]
+    if naive_lean is None:
+        clause_pool = _DRIVING_CLAUSES
+    elif fusion_result.recommendation == naive_lean:
+        clause_pool = _REINFORCING_CLAUSES
+    else:
+        clause_pool = _CAPPING_CLAUSES
+    return random.choice(clause_pool).format(
+        ticker=ticker, bucket_word=bucket_word, pct=abs(gap_pct), recommendation=fusion_result.recommendation,
+    )
+
+
+def price_context_block(ticker, move_pct):
+    """Canonical phrasing shared with generate_real_dataset.py's
+    identically-named function and financial-sentiment-api's planned
+    per-headline date-specific price lookup (ported, not imported - this
+    file's own long-standing "ported, not imported" convention for the
+    DCF math above applies here too). Single-day phrasing since 2026-08-20
+    (see generate_real_dataset.py's module docstring history item 12) -
+    was "over the last 3 trading days.", now the single publish-day close-
+    to-close move, matching what's actually reproducible at inference time
+    for a brand-new headline."""
+    return f"{ticker} moved {move_pct:+.1f}% on the day this was published."
+
+
+def _fabricate_move_pct(reaction):
+    """Fabricated single-day price move consistent with `reaction`'s
+    class - the actual training signal for overreaction_down/up is the
+    (modest headline, outsized move) MISMATCH, so those two ranges are
+    deliberately much larger than good/bad's, and clearly separated from
+    every other class so a given row is never ambiguous about which class
+    it's demonstrating. Rescaled 2026-08-20 for the single-day move
+    redefinition (generate_real_dataset.py history item 12) - single-day
+    return magnitudes are structurally smaller than the old 3-day
+    cumulative window's, per calibrate_reaction_thresholds.py's re-run
+    (717 real samples: p90 +3.2%, p95 +4.8%, stdev 2.4%). Ranges keep the
+    same ordering/separation shape as the old 3-day ranges (3.0-8.0 /
+    -8.0--3.0 / -2.5-2.5 / -15.0--8.0 / 8.0-15.0), scaled down to sit
+    around the new REACTION_GOOD_BAD_THRESHOLD=1%/REACTION_OVERREACTION_
+    MOVE_THRESHOLD=3% boundaries instead of the old 2%/5%."""
+    if reaction == "good":
+        return round(random.uniform(1.2, 2.8), 1)
+    if reaction == "bad":
+        return round(random.uniform(-2.8, -1.2), 1)
+    if reaction == "neutral":
+        return round(random.uniform(-0.8, 0.8), 1)
+    if reaction == "overreaction_down":
+        return round(random.uniform(-9.0, -3.2), 1)
+    if reaction == "overreaction_up":
+        return round(random.uniform(3.2, 9.0), 1)
+    raise ValueError(f"Unknown reaction: {reaction!r}")
+
+
+def make_example(company, reaction):
+    """Returns a list of TWO rows sharing the same headline/price-context/
+    split: a Task A (task="reaction") row - the news_reaction classifier's
+    target, no resolved direction anywhere in it - and a Task B (task=
+    "analysis") row whose `recommendation` is ALWAYS fusion_rules.fuse
+    (reaction, gap_pct)'s output, never hand-picked. See REACTION_WEIGHTS'
+    own comment for the redesign this replaces."""
+    ticker = company[0]
+
+    if reaction == "neutral":
         idx = random.randrange(len(HOLD_SCENARIOS))
         headline_templates, reasoning_variants = HOLD_SCENARIOS[idx]
         reasoning_template = random.choice(reasoning_variants)
-        direction = "HOLD"
         is_holdout_template = idx in HOLD_HOLDOUT_IDX
-        conf_low, conf_high = CONFIDENCE_RANGES["HOLD"]["clear"]
-    elif category == "VALUATION_SIGNAL":
-        sector_key = company[2]  # informal sector label, e.g. "energy"
-        use_sector_reinforced = (
-            sector_key in SECTOR_MACRO_HEADLINES and random.random() < SECTOR_REINFORCED_PROB
-        )
-        if use_sector_reinforced:
-            verdict = random.choice(["undervalued", "overvalued"])
-            direction = "BUY" if verdict == "undervalued" else "SELL"
-            bullish_headline, bearish_headline, linkage = SECTOR_MACRO_HEADLINES[sector_key]
-            headline_templates = [bullish_headline if direction == "BUY" else bearish_headline]
-            # {ticker} is passed through literally (both the outer slot and
-            # the one embedded in `linkage`) so the shared
-            # reasoning_template.format(**fields) call below resolves it
-            # together with every other template in this function - only
-            # `verdict`/`linkage` are real values to fill now.
-            reasoning_template = SECTOR_REINFORCED_REASONING.format(
-                ticker="{ticker}", verdict=verdict, linkage=linkage,
-            )
-            valuation_signal = (verdict, "extreme")
-            # Procedurally generated (keyed off the company's sector, not a
-            # fixed template index) - held-out coverage instead comes from
-            # the sector list itself including aerospace/industrials (BA/
-            # HRZN, both holdout tickers - see SECTOR_MACRO_HEADLINES).
-            is_holdout_template = False
-            conf_low, conf_high = SECTOR_REINFORCED_CONFIDENCE
-            earnings_direction = "HOLD"  # forward-looking macro shift, not a reported quarter - see comment above
-        else:
-            idx = random.randrange(len(VALUATION_SIGNAL_SCENARIOS))
-            (headline_templates, reasoning_template, direction,
-             valuation_verdict, gap_tier, confidence_tier) = VALUATION_SIGNAL_SCENARIOS[idx]
-            valuation_signal = (valuation_verdict, gap_tier)
-            is_holdout_template = idx in VALUATION_SIGNAL_HOLDOUT_IDX
-            conf_low, conf_high = CONFIDENCE_RANGES["VALUATION_SIGNAL"][confidence_tier]
-            if confidence_tier == "news_wins_no_headroom":
-                # Unlike "_alone"/"_reinforced" below, this tier's headline
-                # describes a REAL beat/miss - `direction` is HOLD (no
-                # stated headroom), but the earnings block should still
-                # honestly show that beat/miss, not flatten to "in line" as
-                # if nothing happened. valuation_verdict is set 1:1 with the
-                # real event for this tier's two entries (undervalued <->
-                # the miss case, overvalued <-> the beat case).
-                earnings_direction = "SELL" if valuation_verdict == "undervalued" else "BUY"
-            elif confidence_tier != "news_wins":
-                earnings_direction = "HOLD"  # no real catalyst - keep earnings "in line", see comment above
-    else:
-        scenarios = {"BUY": BUY_SCENARIOS, "SELL": SELL_SCENARIOS}[category]
-        holdout_idx = {"BUY": BUY_HOLDOUT_IDX, "SELL": SELL_HOLDOUT_IDX}[category]
+    elif reaction == "overreaction_down":
+        idx = random.randrange(len(OVERREACTION_DOWN_SCENARIOS))
+        headline_templates, reasoning_template = OVERREACTION_DOWN_SCENARIOS[idx]
+        is_holdout_template = idx in OVERREACTION_DOWN_HOLDOUT_IDX
+    elif reaction == "overreaction_up":
+        idx = random.randrange(len(OVERREACTION_UP_SCENARIOS))
+        headline_templates, reasoning_template = OVERREACTION_UP_SCENARIOS[idx]
+        is_holdout_template = idx in OVERREACTION_UP_HOLDOUT_IDX
+    else:  # "good" / "bad"
+        scenarios = {"good": BUY_SCENARIOS, "bad": SELL_SCENARIOS}[reaction]
+        holdout_idx = {"good": BUY_HOLDOUT_IDX, "bad": SELL_HOLDOUT_IDX}[reaction]
         idx = random.randrange(len(scenarios))
-        headline_templates, reasoning_template, tier = scenarios[idx]
-        direction = category
+        headline_templates, reasoning_template, _tier = scenarios[idx]
         is_holdout_template = idx in holdout_idx
-        conf_low, conf_high = CONFIDENCE_RANGES[category][tier]
+
+        # Sector-macro reinforcement (see SECTOR_MACRO_HEADLINES's own
+        # comment) - swaps in a company-sector-linked headline for extra
+        # "good"/"bad" diversity. Was VALUATION_SIGNAL-only before this
+        # file's two-stage redesign; feeds news_reaction directly now.
+        sector_key = company[2]
+        if sector_key in SECTOR_MACRO_HEADLINES and random.random() < SECTOR_REINFORCED_PROB:
+            bullish_headline, bearish_headline, linkage = SECTOR_MACRO_HEADLINES[sector_key]
+            headline_templates = [bullish_headline if reaction == "good" else bearish_headline]
+            tone = "positive" if reaction == "good" else "negative"
+            reasoning_template = SECTOR_LINKAGE_REASONING.format(ticker="{ticker}", linkage=linkage, tone=tone)
+            is_holdout_template = False
 
     fields = make_fields(company)
     filled_headlines = [t.format(**fields) for t in headline_templates]
     reasoning = reasoning_template.format(**fields)
 
+    move_pct = _fabricate_move_pct(reaction)
+    price_context = price_context_block(ticker, move_pct)
     news_block = build_news_block(filled_headlines)
     user_query, qtype = build_user_query(ticker)
 
@@ -2481,132 +2489,78 @@ def make_example(company, category):
     # simultaneously being shown as unavailable in market_data - a real,
     # confirmed-live contradiction (found via a full generate() run before
     # this fix: 78/2000 rows had exactly this mismatch).
-    if (
-        market_data_text != "Data unavailable."
-        and (
-            (category == "VALUATION_SIGNAL" and random.random() < VALUE_SCREEN_COMMENTARY_PROB)
-            or (
-                category in ("BUY", "SELL", "MIXED")
-                and random.random() < VALUE_SCREEN_COMMENTARY_PROB_OTHER_CATEGORIES
-            )
-        )
-    ):
+    if market_data_text != "Data unavailable." and random.random() < VALUE_SCREEN_COMMENTARY_PROB_OTHER_CATEGORIES:
         commentary = describe_value_screen(fnd)
         if commentary:
             reasoning = f"{reasoning} {commentary}"
-    # Captured before the block below can downgrade `direction` to HOLD on a
-    # decisive valuation conflict (BUY/SELL/MIXED branch) - Earnings must
-    # stay rendered off the real, original catalyst direction regardless of
-    # what the resolved label ends up being.
-    original_direction = direction
-    if valuation_signal is not None:
-        verdict, gap_tier = valuation_signal
-        gap_low, gap_high = VALUATION_GAP_RANGES[gap_tier]
-        gap_pct = round(random.uniform(gap_low, gap_high), 1)
-        valuation_text = valuation_block_with_gap(fnd, gap_pct, verdict)
-    elif category == "HOLD":
-        # Pinned to a small, genuinely insignificant gap instead of the
-        # fully random draw every other category gets - see
-        # VALUATION_SIGNAL_SCENARIOS' own comment and
-        # HOLD_VALUATION_GAP_RANGE for why: a random draw could
-        # occasionally produce a large gap by chance, teaching "routine
-        # headline + large gap = HOLD" in direct conflict with
-        # VALUATION_SIGNAL_SCENARIOS' "_alone"/"_reinforced" tiers, which
-        # teach the same input shape should lean toward the valuation's
-        # direction once the gap is actually large.
-        if random.random() < DATA_UNAVAILABLE_PROB:
-            valuation_text = "Data unavailable."
-        else:
-            verdict = random.choice(["undervalued", "overvalued"])
-            gap_low, gap_high = HOLD_VALUATION_GAP_RANGE
-            gap_pct = round(random.uniform(gap_low, gap_high), 1)
-            valuation_text = valuation_block_with_gap(fnd, gap_pct, verdict)
-    else:
-        # BUY/SELL/MIXED: valuation_text is the REAL DCF, drawn
-        # independently of the label above - see VALUATION_CONFLICT_
-        # PHRASINGS' own comment for why a large, silent contradiction
-        # here needs to become an explicit acknowledgment in `reasoning`.
-        valuation_text = render_valuation(fnd)
-        parsed_gap = _parse_valuation_gap(valuation_text)
-        if parsed_gap is not None:
-            gap_verdict, gap_pct = parsed_gap
-            contradicts_label = (
-                (direction == "BUY" and gap_verdict == "overvalued")
-                or (direction == "SELL" and gap_verdict == "undervalued")
-            )
-            if contradicts_label and gap_pct >= VALUATION_CONFLICT_DOWNGRADE_THRESHOLD:
-                # Decisive gap: a real catalyst doesn't earn a BUY/SELL call
-                # without headroom to back it up - downgrade to HOLD. Earnings
-                # below is rendered off `original_direction`, captured before
-                # this reassignment, so the block still honestly shows the
-                # real catalyst even though the resolved call is now HOLD -
-                # same care as the news_wins_no_headroom fix.
-                acknowledgment = random.choice(VALUATION_CONFLICT_DOWNGRADE_PHRASINGS).format(
-                    ticker=ticker, verdict=gap_verdict, pct=gap_pct,
-                )
-                reasoning = f"{reasoning} {acknowledgment}"
-                direction = "HOLD"
-                conf_low, conf_high = CONFIDENCE_RANGES["HOLD"]["clear"]
-            elif contradicts_label and gap_pct >= VALUATION_CONFLICT_ACKNOWLEDGMENT_THRESHOLD:
-                acknowledgment = random.choice(VALUATION_CONFLICT_PHRASINGS).format(
-                    verdict=gap_verdict, pct=gap_pct,
-                )
-                reasoning = f"{reasoning} {acknowledgment}"
-    earnings_text = render_earnings(fnd, earnings_direction or original_direction)
 
-    answer = ANSWER_TEMPLATES[qtype][direction].format(ticker=ticker)
+    # Every category now draws a REAL, independent random DCF gap - see
+    # this file's removal note above the retired VALUATION_CONFLICT_*
+    # machinery. fuse() is the only place a recommendation is decided.
+    valuation_text = render_valuation(fnd)
+    parsed_gap = _parse_valuation_gap(valuation_text)
+    gap_pct = None
+    if parsed_gap is not None:
+        gap_verdict, gap_magnitude = parsed_gap
+        gap_pct = gap_magnitude if gap_verdict == "overvalued" else -gap_magnitude
 
-    confidence = round(random.uniform(conf_low, conf_high), 2)
+    fusion_result = fusion_rules.fuse(reaction, gap_pct)
+    reasoning = f"{reasoning} {_fusion_explanation(ticker, reaction, fusion_result, gap_pct)}"
 
-    output_payload = {
-        "impacted_stocks": [
-            {
-                "ticker": ticker,
-                "reasoning": reasoning,
-                "recommendation": direction,
-                "confidence": confidence,
-                "answer": answer,
-            }
-        ]
-    }
+    # Earnings is rendered off the NEWS-implied lean (good=beat, bad=miss,
+    # neutral/overreaction_*=in-line - an overreaction is BY DEFINITION
+    # not matched by a proportional fundamentals change), never off
+    # fuse()'s recommendation - same "Earnings must show the real
+    # catalyst, not the resolved call" principle the old earnings_
+    # direction/original_direction split enforced, just derived from
+    # `reaction` now instead of a per-tier hand-picked override.
+    earnings_lean = {"good": "BUY", "bad": "SELL"}.get(reaction, "HOLD")
+    earnings_text = render_earnings(fnd, earnings_lean)
+
+    answer = ANSWER_TEMPLATES[qtype][fusion_result.recommendation].format(ticker=ticker)
 
     is_holdout_ticker = ticker in VAL_HOLDOUT_TICKERS
     split = "val" if (is_holdout_ticker or is_holdout_template) else "train"
 
-    return {
-        "ticker": ticker,  # duplicated from output.impacted_stocks[0].ticker so the
-                           # training script can build "Target Stock: {ticker}" without
-                           # parsing the output JSON string
+    task_a_row = {
+        "task": "reaction",
+        "ticker": ticker,
+        "user_query": "",
+        "price_context": price_context,
+        "market_data": "",
+        "valuation": "",
+        "earnings": "",
+        "news": news_block,
+        "news_reaction": reaction,
+        "recommendation": "",
+        "output": json.dumps({"news_reaction": reaction}),
+        "_split": split,  # stripped before writing - see main()
+    }
+    task_b_row = {
+        "task": "analysis",
+        "ticker": ticker,
         "user_query": user_query,
+        "price_context": price_context,
         "market_data": market_data_text,
         "valuation": valuation_text,
         "earnings": earnings_text,
         "news": news_block,
-        "output": json.dumps(output_payload, indent=2),
-        "_split": split,  # stripped before writing - see main()
+        "news_reaction": reaction,
+        "recommendation": fusion_result.recommendation,
+        "output": json.dumps({"reasoning": reasoning, "answer": answer}, indent=2),
+        "_split": split,
     }
-
-
-# History (2026-08-17): VALUATION_SIGNAL and HOLD both construct a
-# valuation gap via valuation_block_with_gap - a deliberately FABRICATED
-# intrinsic value backward-solved from a target gap percentage, not run
-# through the real DCF. This used to matter for curated tickers
-# specifically (a fabricated gap could contradict a curated ticker's
-# real, hand-verified value) - excluded via NON_CURATED_COMPANIES/
-# GAP_CONSTRUCTED_CATEGORIES. Removed along with CURATED_SCENARIOS (see
-# that constant's own removal note): every company's valuation is
-# synthetic/derived by construction now, so there's no longer a real
-# value for a fabricated gap to contradict.
+    return [task_a_row, task_b_row]
 
 
 def generate(n=NUM_EXAMPLES):
     examples = []
-    categories = list(SENTIMENT_WEIGHTS.keys())
-    weights = list(SENTIMENT_WEIGHTS.values())
+    reactions = list(REACTION_WEIGHTS.keys())
+    weights = list(REACTION_WEIGHTS.values())
     for _ in range(n):
-        category = random.choices(categories, weights=weights)[0]
+        reaction = random.choices(reactions, weights=weights)[0]
         company = random.choice(ALL_COMPANIES)
-        examples.append(make_example(company, category))
+        examples.extend(make_example(company, reaction))
     return examples
 
 

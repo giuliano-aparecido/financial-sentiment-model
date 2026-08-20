@@ -33,29 +33,34 @@ so there's nothing meaningful to mock or run in CI. Instead:
   `generate_grounded_reasoning` actually produces sensible text end to end
   — say so explicitly in the PR description rather than claiming it was
   tested if it wasn't.
-- If you change the prompt template (`alpaca_prompt`) or the output JSON
-  schema, keep FOUR files in sync: `colab/train/gpu/train_model.py`,
+- If you change either prompt template (`task_a_prompt` for news_reaction
+  classification, `task_b_prompt` for reasoning/answer generation - see
+  the two-stage pipeline redesign in `generate_real_dataset.py`'s history)
+  or the output JSON schema, keep NINE files in sync, all carrying BOTH
+  templates byte-identically: `colab/train/gpu/train_model.py`,
   `colab/train/tpu/train_model.py`, their own `evaluate_model.py`/
-  `evaluate_base_model_only.py` copies of the same string (4 more copies,
-  8 total, but only one canonical string), and `financial-sentiment-api`'s
-  `app/services/inference.py` — a mismatch anywhere in that set silently
-  trains or serves a different shape than the others expect. Also keep
-  `runpod/train_model.py` and `runpod/evaluate_model.py` (RunPod-runnable
-  copies of the gpu variants, same string again - 10 total) in sync with
-  the same set. This also
-  covers the `market_data`/`valuation`/`earnings` block FORMATTING (not
-  just the outer template) — the block renderers in
+  `evaluate_base_model_only.py` copies (4 more copies, 8 total),
+  `runpod/train_model.py` and `runpod/evaluate_model.py` (2 more, 10
+  total), and `financial-sentiment-api`'s `app/services/inference.py` (11
+  total) — a mismatch anywhere in that set silently trains or serves a
+  different shape than the others expect. This also covers the
+  `market_data`/`valuation`/`earnings`/`price_context` block FORMATTING
+  (not just the outer templates) — the block renderers in
   `generate_synthetic_dataset.py`, `generate_real_dataset.py`, and
   `financial-sentiment-api`'s `app/services/{fundamentals,valuation,
   earnings}.py` need to produce byte-compatible shapes (e.g. "Data
-  unavailable." exactly, the same "$X.XXT"/"$X.XB" market-cap notation),
-  since the model is trained on one shape and served against whatever
-  these renderers actually produce. The gpu/tpu split (`colab/train/gpu` vs
-  `colab/train/tpu`) introduced the original three-way duplication; the v4
-  "analyst pipeline" expansion
-  (fundamentals + valuation + earnings + an `answer` field) is what pushed
-  it to four files plus the block-format requirement, so this is exactly
-  the kind of drift to check for on any prompt/schema/block-format change.
+  unavailable." exactly, the same "$X.XXT"/"$X.XB" market-cap notation,
+  the same "{ticker} moved {pct:+.1f}% over the last 3 trading days."
+  price-context phrasing), since the model is trained on one shape and
+  served against whatever these renderers actually produce.
+- Separately, `fusion_rules.py` (the deterministic news_reaction +
+  valuation-gap -> BUY/SELL/HOLD table - the only place a recommendation
+  is ever decided, in either training data generation or production) must
+  stay byte-identical between this repo's own `fusion_rules.py` and
+  `financial-sentiment-api`'s `app/services/fusion.py`. A drift here means
+  training data and production compute different recommendations for the
+  same (news_reaction, valuation gap) pair - a correctness bug, not just a
+  formatting one.
 - If you bump the Hugging Face model repo version (the `-financial-
   reasoner-vN` suffix, a different concept from the prompt/schema version
   above), run `python bump_model_version.py vN` instead of hand-editing

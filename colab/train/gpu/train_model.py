@@ -202,52 +202,100 @@ model = FastLanguageModel.get_peft_model(
 # Mixes the synthetic dataset with the real, proxy-labeled one -
 # load_dataset accepts a list of files per split and concatenates them, so
 # this is the whole mechanism. Both generators produce the identical
-# {ticker, user_query, market_data, valuation, earnings, news, output}
-# schema (v4) on purpose, specifically so this merge needs no
-# reconciliation. The real dataset is already rebalanced by recommendation on
-# the train side and left at its natural distribution on the val side (see
-# that generator's docstring) - nothing further to do here.
+# {task, ticker, user_query, price_context, market_data, valuation,
+# earnings, news, news_reaction, recommendation, output} superset schema
+# on purpose (task="reaction" rows leave market_data/valuation/earnings/
+# user_query/recommendation as ""; task="analysis" rows leave nothing
+# empty), specifically so this merge needs no reconciliation and
+# format_prompts below can branch on "task" alone. The real dataset's
+# Task A rows are rebalanced by news_reaction on the train side and left
+# at their natural distribution on the val side (see that generator's
+# docstring) - nothing further to do here.
+#
+# dataset_{train,val}_real_taskb.jsonl (from convert_existing_to_taskb.py,
+# or a fresh GATE-A-approved real-dataset regen with ENABLE_TASK_B_
+# GENERATION=True) supply the real dataset's Task B half - dataset_
+# {train,val}_real.jsonl only ever carries task="reaction" rows going
+# forward (see generate_real_dataset.py's ENABLE_TASK_B_GENERATION, off
+# by default). Optional: upload them if you have them, otherwise real
+# Task B coverage comes from the synthetic dataset alone - checked for
+# existence rather than hard-required, since a notebook run shouldn't
+# fail just because this optional pair wasn't uploaded this time.
 # load_dataset("json", ...) handles JSON Lines natively.
+train_files = ["dataset_train.jsonl", "dataset_train_real.jsonl"]
+val_files = ["dataset_val.jsonl", "dataset_val_real.jsonl"]
+if os.path.exists("dataset_train_real_taskb.jsonl"):
+    train_files.append("dataset_train_real_taskb.jsonl")
+if os.path.exists("dataset_val_real_taskb.jsonl"):
+    val_files.append("dataset_val_real_taskb.jsonl")
+
 dataset_dict = load_dataset(
     "json",
     data_files={
-        "train": ["dataset_train.jsonl", "dataset_train_real.jsonl"],
-        "validation": ["dataset_val.jsonl", "dataset_val_real.jsonl"],
+        "train": train_files,
+        "validation": val_files,
     },
 )
 
-# alpaca_prompt's ### Input: section is built with the exact same structure
-# as the live inference prompt in financial-sentiment-api's
-# app/services/inference.py (Target Stock / User Question / Current Market
-# Data / Valuation / Recent Earnings / Recent News & Results) - the model
-# needs to learn to read all of these, since that's what it's actually
-# given in production. Keep this in sync any time inference.py's prompt
-# changes, and in sync with ../tpu/train_model.py's copy of this same
-# string and the ../{gpu,tpu}/evaluate_*.py scripts' copies (see
-# CONTRIBUTING.md's 4-way sync rule); the "CRITICAL SENTIMENT RULES" block
-# matches inference.py's current state (a rule covering "beat but cut
-# guidance"-style cases is kept here pending mixed-signal examples proving
-# out in eval before also dropping it from inference.py).
-alpaca_prompt = """Below is an instruction that describes a task, paired with an input that provides further context. Write a response that appropriately completes the request.
+# Two-stage pipeline (2026-08-19): a single call is no longer asked to
+# both read the news AND weigh it against valuation headroom to produce a
+# BUY/SELL/HOLD label - that entangled rule is exactly what was fragile
+# to learn (see financial-sentiment-model's CONTRIBUTING.md/plan file for
+# the full redesign). Every training row now carries a "task" field:
+# task="reaction" rows train task_a_prompt (classify news_reaction from
+# the news + a recent price move, no direction anywhere in it);
+# task="analysis" rows train task_b_prompt (write reasoning/answer given
+# an ALREADY-DECIDED news_reaction + Recommended Action - never asked to
+# produce either). Both templates' ### Input: sections mirror financial-
+# sentiment-api's app/services/inference.py exactly (Task A: Target Stock/
+# Recent Price Move/Recent News & Results; Task B: adds News Reaction/
+# Recommended Action alongside the original Target Stock/User Question/
+# Current Market Data/Valuation/Recent Earnings/Recent News & Results).
+# Keep BOTH templates in sync any time inference.py's prompts change, and
+# in sync with ../tpu/train_model.py's copies of these same two strings
+# and the ../{gpu,tpu}/evaluate_*.py and runpod/*.py scripts' copies (see
+# CONTRIBUTING.md's sync rule).
+task_a_prompt = """Below is an instruction that describes a task, paired with an input that provides further context. Write a response that appropriately completes the request.
 
 ### Instruction:
 
-Analyze the following financial data and news and output JSON containing the impacted stock ticker, detailed reasoning, a recommended action (BUY/SELL/HOLD), confidence score, and a direct answer to the user's question, in exactly this shape:
-{{"impacted_stocks": [{{"ticker": "...", "reasoning": "...", "recommendation": "BUY|SELL|HOLD", "confidence": 0.0-1.0, "answer": "..."}}]}}
+Classify how the market has reacted to the following news for this stock, given its recent price move, and output JSON containing your classification, in exactly this shape:
+{{"news_reaction": "good|bad|neutral|overreaction_down|overreaction_up"}}
 
-CRITICAL SENTIMENT RULES:
+news_reaction definitions:
+- good: the news is genuinely positive for the stock.
+- bad: the news is genuinely negative for the stock.
+- neutral: the news is routine/ambiguous, not a real catalyst either way.
+- overreaction_down: the price fell more than this news alone would justify - a plausible overreaction to the downside.
+- overreaction_up: the price rose more than this news alone would justify - a plausible overreaction to the upside.
 
-1. Weigh guidance cuts and revenue misses higher than minor operational wins.
-2. The Valuation block is a real, structural signal, not decoration - a large over/undervaluation gap should meaningfully shape your recommendation and confidence, not just recent news. Only let concrete, current news override it when the news describes a specific catalyst (an actual event, not a generic "market volatility" statement) the valuation estimate couldn't have priced in. Even then, a strong catalyst alone doesn't earn BUY (or SELL): BUY requires the stock isn't already priced beyond what the news justifies - a real catalyst with no valuation headroom, and no stated reason for further upside, is HOLD, not BUY. The same applies symmetrically to SELL and further downside.
-3. HOLD means either the available signals genuinely conflict or are too weak/routine to support a BUY/SELL call, or a real catalyst exists but the stock has no valuation headroom left to act on it - not a default for "I'm not sure." Use it when Valuation, Market Data, Earnings, and News don't converge on one recommendation, when nothing in the input is materially new, or when a strong catalyst is real but the price already exceeds what it justifies.
-4. confidence is a 0.0-1.0 score for how strongly the evidence supports your recommendation, not how certain you are a clear case exists at all - a HOLD call can still carry moderate confidence when "no room to act" is itself well-supported.
-5. "Data unavailable." or "Not applicable (...)" in any block means exactly that - treat it as missing information, never invent numbers or events to fill the gap.
-6. P/E under 20 (sector-adjusted via Sector Median P/E) suggests undervaluation; 20-30 is roughly neutral; over 30 suggests a richer valuation that needs a real growth story to justify. For a Real Estate-sector company specifically, Price/Book below 1.0 is the more meaningful signal - GAAP depreciation makes P/E unreliable for that sector.
+### Input:
+
+Target Stock: {}
+Recent Price Move: {}
+
+Recent News & Results:
+{}
+
+### Response:
+
+{}"""
+
+task_b_prompt = """Below is an instruction that describes a task, paired with an input that provides further context. Write a response that appropriately completes the request.
+
+### Instruction:
+
+You are given a recommended action for this stock, already determined from valuation and news analysis - your job is to explain it, not decide it. Output JSON containing detailed reasoning and a direct answer to the user's question, in exactly this shape:
+{{"reasoning": "...", "answer": "..."}}
+
+Your reasoning and answer must be consistent with the Recommended Action below and must never advise the opposite. Treat News Reaction and Recommended Action as given facts, not conclusions to re-derive.
 
 ### Input:
 
 Target Stock: {}
 User Question: {}
+News Reaction: {}
+Recommended Action: {}
 
 Current Market Data:
 {}
@@ -270,12 +318,18 @@ def format_prompts(examples):
     texts = []
 
     fields = zip(
-        examples["ticker"], examples["user_query"], examples["market_data"],
-        examples["valuation"], examples["earnings"], examples["news"], examples["output"],
+        examples["task"], examples["ticker"], examples["user_query"], examples["price_context"],
+        examples["market_data"], examples["valuation"], examples["earnings"], examples["news"],
+        examples["news_reaction"], examples["recommendation"], examples["output"],
     )
-    for ticker, user_query, market_data, valuation, earnings, news, output in fields:
+    for task, ticker, user_query, price_context, market_data, valuation, earnings, news, news_reaction, recommendation, output in fields:
 
-        text = alpaca_prompt.format(ticker, user_query, market_data, valuation, earnings, news, output) + tokenizer.eos_token
+        if task == "reaction":
+            text = task_a_prompt.format(ticker, price_context, news, output) + tokenizer.eos_token
+        else:
+            text = task_b_prompt.format(
+                ticker, user_query, news_reaction, recommendation, market_data, valuation, earnings, news, output,
+            ) + tokenizer.eos_token
 
         texts.append(text)
 
@@ -353,13 +407,13 @@ trainer = SFTTrainer(
 # substantially just by memorizing it, which inflates the reported loss
 # numbers without reflecting how well it's actually learning to classify
 # sentiment. This masks the loss to only the ### Response: continuation,
-# matching the alpaca_prompt's own instruction/response markers.
+# matching task_a_prompt/task_b_prompt's own instruction/response markers.
 from unsloth.chat_templates import train_on_responses_only
 
 trainer = train_on_responses_only(
     trainer,
     # IMPORTANT: these markers must match the LITERAL text exactly,
-    # including incidental whitespace - alpaca_prompt has a blank line
+    # including incidental whitespace - both prompt templates have a blank line
     # after each header, so the actual text is "### Instruction:\n\n" /
     # "### Response:\n\n" (double newline), not "### Instruction:\n" /
     # "### Response:\n" (single newline). This is not cosmetic to a BPE

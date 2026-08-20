@@ -176,6 +176,104 @@ got on synthetic val):
    CONTRIBUTING.md's guidance on saying so explicitly rather than claiming
    it was tested.
 
+10. Two-stage pipeline redesign (2026-08-19): this file no longer decides
+    BUY/SELL/HOLD at all. The user's own insight, generalized from the
+    "no valuation headroom" fix in items 5-9 above: an LLM should only
+    reason about the genuinely unpredictable input (the news), and a
+    deterministic rule should own the direction decision - trying to
+    teach that rule through training examples (exactly what items 5-9
+    were doing) is fragile to learn and easy to regress. Replaced:
+    - label_from_forward_return (63-trading-day, earnings-truncated,
+      +/-8% BUY/SELL/HOLD) -> label_news_reaction, a 5-class
+      good/bad/neutral/overreaction_down/overreaction_up classification
+      over a much shorter 3-trading-day window (with a 21-trading-day
+      look-forward to detect whether a large 3-day move meaningfully
+      retraces - the actual "overreaction" signal). Thresholds picked by
+      calibrate_reaction_thresholds.py (see that script and REACTION_*
+      constants below for the measured distribution and why).
+    - valuation_alignment + make_real_example's headroom-downgrade gate +
+      confidence_from_move -> fusion_rules.fuse(), a fixed table over
+      (news_reaction, valuation_bucket) shared byte-for-byte with
+      financial-sentiment-api/app/services/fusion.py, so training data and
+      production compute the SAME direction the SAME way. This file now
+      only ever calls fuse() to know what recommendation to show Gemini
+      when writing Task B prose - it's never guessed or learned.
+    - Every row now carries a "task" field: "reaction" rows (this file's
+      default output - free, no Gemini call, just the price-derived
+      label) train the news-reaction classifier; "analysis" rows (task=
+      "analysis" - only generated when ENABLE_TASK_B_GENERATION is True,
+      since each one costs a Gemini call) train the reasoning/answer
+      generator, given news_reaction AND recommendation as INPUT rather
+      than having to produce either. CONTRADICTS and its downsampling
+      (item 7) are retired along with the old single-task prompt they
+      were patching - a Task B row is always built from a reaction/
+      recommendation pair that's true by construction (computed by
+      fuse(), not guessed by Gemini), so there's no "headline points the
+      other way" tension left for Gemini to hedge around.
+    - rebalance_by_direction -> rebalance_task_a: overreaction rows are
+      naturally rare (~5% of real data, see calibrate_reaction_
+      thresholds.py) and are never undersampled; good/bad/neutral are
+      undersampled toward the overreaction count (floored at 30) instead
+      of the strict minority-class equalization the old function did.
+      Real overreaction representation stays real-but-thin; generate_
+      synthetic_dataset.py's REACTION_WEIGHTS carries the actual
+      oversampling load for that class.
+11. Low-content headline filter (2026-08-19, user feedback): Google News
+    RSS returns a meaningful fraction (measured ~9% of an early real
+    Task B sample) of bare price-recap wrappers ("Intel (INTC) Stock
+    Trades Up, Here Is Why"), listicle/opinion bait ("Should You Buy
+    Microsoft Stock?"), and fund-flow filing spam as the PRIMARY (signal)
+    headline for a row - see _is_low_content_headline's own comment for
+    why this is worse than the deliberate NOISE_HEADLINES noise (a price-
+    recap headline states the very move the label is derived from, a
+    shortcut-learning risk). Now filtered out of process_ticker's
+    candidate loop entirely before make_real_example ever sees them.
+12. Single-day move redefinition (2026-08-20, user feedback): the
+    "immediate move" behind news_reaction was a 3-trading-day FORWARD
+    cumulative window from the headline's publish date. Confirmed live
+    (user's own SIGN.SW example: CEO-change headline, >10% drop the SAME
+    day, +4% recovery over the next two days) that this dilutes/nets out
+    exactly the fast-reverting crashes that make the clearest overreaction
+    cases - a >10% same-day crash that mostly reverses within 2 days
+    reads as only ~-6% under a 3-day cumulative window. Also: a 3-day
+    FORWARD window is unreproducible at real inference time for a
+    brand-new headline (no "after" exists yet) - production was papering
+    over this with a 3-day TRAILING approximation instead, a genuine
+    train/inference mismatch. Replaced with move_1d: the single day-0
+    (publish day, or the next trading day if published after close/on a
+    weekend) close vs. the immediately preceding trading day's close -
+    real, already-happened data, computed identically in training and at
+    inference (see financial-sentiment-api's planned per-headline date-
+    specific price lookup). move_21d keeps its role as the retracement
+    check (training-label-only, inherently retrospective, never shown to
+    the model) but is now anchored to the SAME baseline as move_1d (the
+    pre-headline close) instead of day-0's own close, so the retracement
+    fraction stays an apples-to-apples comparison. REACTION_GOOD_BAD_
+    THRESHOLD/REACTION_OVERREACTION_MOVE_THRESHOLD/REACTION_RETRACEMENT_
+    FRACTION were re-calibrated against the new move_1d distribution via
+    calibrate_reaction_thresholds.py (717 samples, 40 tickers): X=1%/
+    Y=3%/Z=0.5, down from the old 3-day-window X=2%/Y=5%/Z=0.5, since
+    single-day volatility is smaller in magnitude than 3-day cumulative -
+    same "measure it, don't guess it" precedent as item 10's original
+    calibration.
+13. Relevance pre-filter (2026-08-20, user feedback): the existing
+    publisher/shape filters (LOW_QUALITY_PUBLISHERS, item 11's
+    _is_low_content_headline) catch bad sources and bad shapes, but not
+    well-sourced, well-shaped headlines that simply aren't about this
+    company - a generic macro roundup or a different company's earnings
+    could still become the PRIMARY headline for a row, especially now that
+    each row is built from a single headline (no other real headline in
+    the window to fall back on). Added _is_relevant_headline: passes if
+    the headline names the company or its ticker, OR matches a sector/
+    industry keyword (SECTOR_KEYWORDS, keyed by the same yfinance .info
+    sector string fetch_ticker_fundamentals_history already fetches -
+    "if the news are related to the market the company is at (oil,
+    technology, AI, space, etc)" per the user's own framing). Wired into
+    process_ticker's per-headline loop alongside the existing filters,
+    same skip-reason-tracking pattern ("not_relevant"). A headline that
+    fails this check is dropped entirely - never reaches make_real_example
+    - not forced into a neutral-labeled row.
+
 Earlier history: this script originally used yfinance's Ticker.news for
 headlines, which only returns the current "latest ~10" items with no
 historical/date-range support - most of what it returned was too recent to
@@ -192,15 +290,14 @@ news fetch already accepts. Day-level granularity only (no time-of-day),
 and any single query is capped at ~100 results, which is why this scans
 multiple narrow weekly windows per ticker rather than one big range.
 
-The train split is rebalanced to equal BUY/SELL/HOLD counts by
-undersampling (see rebalance_by_direction) before being written - real
-market data over any specific historical window is rarely naturally
-balanced. The val split is deliberately left at its natural/unbalanced
-distribution - eval numbers should reflect real-world performance, not a
-distribution forced to look nicer than reality. (This natural imbalance -
-the val set skews SELL-heavy - is itself part of why a model with a
-"default to HOLD when unsure" habit scored so poorly on it; see
-docs/training-results-analysis.md.)
+The train split's Task A (news_reaction) rows are rebalanced by
+undersampling (see rebalance_task_a) before being written - real market
+data over any specific historical window is rarely naturally balanced,
+and overreaction rows in particular are a genuine minority (see the
+REACTION_* constants' own comment). The val split is deliberately left at
+its natural/unbalanced distribution - eval numbers should reflect
+real-world performance, not a distribution forced to look nicer than
+reality.
 
 Output schema, ### Input: field structure, and user_query phrasing all
 match generate_synthetic_dataset.py exactly (down to reusing its
@@ -210,36 +307,44 @@ and can be concatenated/mixed for training:
 
     data_files={"train": ["dataset_train.jsonl", "dataset_train_real.jsonl"], ...}
 
+By default (ENABLE_TASK_B_GENERATION=False) a plain run only ever
+produces free task="reaction" rows - no Gemini call, no cost. Flip that
+flag to True (GATE A in the two-stage-pipeline plan) to also produce
+task="analysis" rows, at the cost of one Gemini call per kept headline.
+
 Requirements: `pip install yfinance httpx feedparser google-genai pandas beautifulsoup4`
 (pandas is also a transitive yfinance dependency, so usually already
-present), network access, and a Gemini API key (GEMINI_API_KEY) - see
-generate_grounded_reasoning for where that's read from and why the model
-choice is gemini-3.5-flash-lite specifically.
+present), network access, and - only if ENABLE_TASK_B_GENERATION is True -
+a Gemini API key (GEMINI_API_KEY, see generate_grounded_reasoning for
+where that's read from and why the model choice is gemini-3.5-flash-lite
+specifically).
 Unlike the synthetic generator, this is NOT reproducible/deterministic -
 querying the same historical window twice can return different results as
 Google's index changes, and Gemini's reasoning text varies run to run even
-for the same headline (direction/confidence do not - those stay purely
-proxy-derived). Both yfinance and Google News RSS are unofficial/
-undocumented access - this script fails soft (skips and logs a warning)
-rather than crashing on a per-ticker or per-window fetch failure; the
-Gemini call fails soft too (falls back to the old template text for that
-one row) rather than aborting a multi-hundred-row unattended run over a
-transient API error.
+for the same headline (news_reaction does not - that stays purely
+price-derived, and recommendation is always fuse()'s deterministic output
+for whatever news_reaction/valuation gap this row has). Both yfinance and
+Google News RSS are unofficial/undocumented access - this script fails
+soft (skips and logs a warning) rather than crashing on a per-ticker or
+per-window fetch failure; the Gemini call (when enabled) fails soft too
+(falls back to template text for that one row) rather than aborting a
+multi-hundred-row unattended run over a transient API error.
 
 Runtime note: with TICKERS x LOOKBACK_WEEKS now 40 x 18 = 720 weekly
 windows, and NEWS_REQUEST_DELAY_SECONDS=1.0 between each, the news-fetch
 phase alone is >=12 minutes of politeness delay before counting actual
 request latency or the price-history calls on top - expect a notably
-longer run than earlier, smaller configurations. On a free-tier
-GEMINI_API_KEY, GEMINI_REQUEST_DELAY_SECONDS (4.5s, sized for the free
-tier's 15-requests/minute cap) would add roughly another 4.5s per kept
-headline on top of that, since a Gemini call happens once per row now -
-with billing enabled and a paid tier's much higher per-minute limit,
-GEMINI_REQUEST_DELAY_SECONDS drops to 0.1s and that cost mostly
-disappears (dominated instead by actual Gemini/yfinance/RSS network
-latency, not artificial pacing). Either way, this is expected, not a
-hang; the per-ticker incremental writes and try/except (see
-generate_and_write) mean a slow run is safe to leave unattended.
+longer run than earlier, smaller configurations. With
+ENABLE_TASK_B_GENERATION=True on a free-tier GEMINI_API_KEY, GEMINI_
+REQUEST_DELAY_SECONDS (4.5s, sized for the free tier's 15-requests/minute
+cap) would add roughly another 4.5s per kept headline on top of that, since
+a Gemini call happens once per row in that mode - with billing enabled and
+a paid tier's much higher per-minute limit, GEMINI_REQUEST_DELAY_SECONDS
+drops to 0.1s and that cost mostly disappears (dominated instead by actual
+Gemini/yfinance/RSS network latency, not artificial pacing). Either way,
+this is expected, not a hang; the per-ticker incremental writes and
+try/except (see generate_and_write) mean a slow run is safe to leave
+unattended.
 
 Output: two JSONL files, named by OUTPUT_TRAIN_FILE/OUTPUT_VAL_FILE below
 (default: dataset_train_real.jsonl and dataset_val_real.jsonl).
@@ -267,6 +372,8 @@ except ImportError as e:
         f"This script needs a package that isn't installed ({e.name}). "
         "Run: pip install yfinance httpx feedparser google-genai pandas beautifulsoup4"
     )
+
+import fusion_rules
 
 # get_secret() works on both Colab (Secrets, key icon in the left sidebar)
 # and Kaggle (Add-ons -> Secrets) - same pattern the colab/run/ serving scripts
@@ -372,108 +479,68 @@ TICKERS = [
 # way META/BA alone could.
 VAL_HOLDOUT_TICKERS = {"META", "BA", "JPM", "XOM", "KO", "NFLX"}
 
-# Cap on what fraction of the TRAIN file can be CONTRADICTS=yes rows (see
-# downsample_contradicts_in_place and history item 7 above) - 0.20 keeps
-# the "headline pointed the other way" pattern a clear minority case
-# instead of common enough to memorize as a default strategy.
-CONTRADICTS_MAX_FRACTION = 0.20
+# news_reaction classification thresholds - recalibrated 2026-08-20 for
+# the single-day move redefinition (see history item 12 below), replacing
+# the OLD 3-trading-day-window calibration (2026-08-19, 653 samples,
+# X=2%/Y=5%/Z=0.5). Re-run of calibrate_reaction_thresholds.py against
+# move_1d (717 samples, 40 tickers) found only 3/75 swept combos meeting
+# the acceptance band (overreaction 5-12%, neutral 25-45% of labelable
+# rows), all sharing X=1%/Y=3% (Z barely moved class counts, same weak-
+# discriminator finding as the original run - Z=0.5 kept as the middle
+# candidate). Single-day moves are smaller-magnitude than the old 3-day
+# cumulative window (measured stdev 2.4%), hence lower absolute
+# thresholds. Same "measure it, don't guess it" precedent as the old
+# BUY_THRESHOLD/SELL_THRESHOLD had - do not hand-tune these without
+# re-running that script.
+REACTION_GOOD_BAD_THRESHOLD = 0.01             # |move_1d| >= this -> good/bad
+REACTION_OVERREACTION_MOVE_THRESHOLD = 0.03    # |move_1d| >= this -> overreaction CANDIDATE
+REACTION_RETRACEMENT_FRACTION = 0.5            # fraction of move_1d retraced by day 21 -> confirmed overreaction
 
-FORWARD_WINDOW_TRADING_DAYS = 63   # how many trading days after the headline
-                                    # to measure the price move over, AT MOST
-# History: raised from 3 to 30 (2026-08-17) - a 3-day window measures
-# momentum, not value; a stock can be genuinely, meaningfully undervalued
-# with strong fundamentals and still sit flat for days before the market
-# re-rates it. But 30 didn't actually help: re-measured after that change,
-# the fraction of HOLD rows sitting on a 30%+ valuation gap barely moved
-# (30.3% -> 33.2% of all rows, i.e. slightly worse) while the ~3-week gap
-# to the old +/-3% threshold (rescaled to +/-8% for the longer window,
-# see that constant's own comment) likely absorbed most of the intended
-# gain.
-#
-# Raised again to 63 (~1 calendar quarter, since most companies report
-# earnings quarterly) for a different reason than the trading-day COUNT
-# itself: this is now effectively an upper bound, not the real per-row
-# window. label_from_forward_return's earnings-truncation logic (see its
-# own comment) almost always finds a real earnings date inside a
-# quarter-long span and cuts the window there - so in practice this
-# measures "from this headline until just before the company's next
-# earnings report," a clean, economically meaningful period instead of an
-# arbitrary fixed count. That's a materially different value proposition
-# than just "30 was too short, try a bigger number": the window length is
-# now driven by the company's own reporting calendar per row, not one
-# global constant, and a stock that STILL hasn't converged by its next
-# earnings report is a more informative HOLD than one that merely didn't
-# move in an arbitrarily short slice of time.
-#
-# Deliberately NOT touching BUY_THRESHOLD/SELL_THRESHOLD again alongside
-# this - confirmed live the fraction of real BUY-worthy setups is
-# genuinely low right now (a legitimate value-investing read: few stocks
-# screen as a strong buy in an expensive market, not a labeling bug), so
-# a low BUY rate isn't itself evidence the threshold needs loosening. Per-
-# row window length is also no longer fixed (earnings-truncation varies
-# it), so a single global percentage threshold is an even rougher fit than
-# before - worth an actual empirical pass over this dataset's real 63-
-# trading-day return distribution before touching that number again,
-# rather than another single-guess adjustment.
+# 21 trading days -> calendar days (5 trading days/week) + a flat 10-day
+# cushion for holidays/gaps - sized for label_news_reaction's 21-trading-
+# day look-forward (the retired label_from_forward_return needed 63
+# trading days; this window is much shorter now that direction/confidence
+# no longer come from this file at all - see history item 10 above).
+REACTION_WINDOW_CALENDAR_BUFFER_DAYS = 21 * 7 // 5 + 10
 
-# Calendar-day span FORWARD_WINDOW_TRADING_DAYS actually needs: trading
-# days -> calendar days (5 trading days/week) plus a flat 10-day cushion
-# for holidays/gaps. Shared by label_from_forward_return's own history
-# fetch AND SAFETY_BUFFER_DAYS below (a single source of truth - these two
-# used to be sized independently, 3-trading-day-window numbers baked into
-# both, and silently drifted out of sync with FORWARD_WINDOW_TRADING_DAYS
-# when it was raised to 30: SAFETY_BUFFER_DAYS stayed at a flat 14, which
-# is enough runway for a 3-day window but not a 30-day one - the most
-# recently queried headlines would have silently gotten a truncated,
-# shorter-than-intended window instead of the full 30 days, since that
-# much future price history wouldn't exist yet at fetch time).
-FORWARD_WINDOW_CALENDAR_BUFFER_DAYS = FORWARD_WINDOW_TRADING_DAYS * 7 // 5 + 10
+# How many calendar days of price history to fetch BEFORE the published
+# date, so measure_reaction_windows can always find at least one prior
+# trading day's close to anchor move_1d against - sized past the longest
+# normal gap in a trading calendar (a 3-day weekend abutting a holiday),
+# with margin.
+PRE_PUBLISH_BUFFER_DAYS = 7
 
-# Trading days of margin label_from_forward_return's earnings-truncation
-# cuts before the next earnings date, not just excluding that day itself -
-# see that function's own comment on why (pre-earnings anticipation
-# trading can move a stock before the report lands).
-EARNINGS_TRUNCATION_BUFFER_DAYS = 2
+# Earnings-truncation guard for label_news_reaction (see that function's
+# own docstring): a real earnings report landing on the SAME trading day
+# as the headline (day 0) contaminates move_1d itself - the single-day
+# move can't be attributed to this headline specifically vs. the earnings
+# report (full skip). A report landing days 1-21 after day 0 only
+# contaminates the day-21 retracement check (good/bad/neutral off move_1d
+# is still trustworthy, overreaction_* is not). Was EARNINGS_WITHIN_3D_
+# SKIP_DAYS=3 under the old 3-trading-day window; day 0 is the only day
+# move_1d can be contaminated on now that the window is a single day.
+EARNINGS_WITHIN_1D_SKIP_DAYS = 0
+EARNINGS_UNASSESSABLE_DAYS = 21
 
-# History (2026-08-17, same day): +/-2% -> +/-3% for the old 3-trading-day
-# window (a real, confirmed-live label-quality problem: a v16 eval scored
-# 32% direction accuracy on real val, below the 33% random baseline, with
-# the model avoiding HOLD even though real val's true label was HOLD ~49%
-# of the time). Then +/-3% -> +/-8% via a generic sqrt(time) volatility
-# estimate when the window went 3 -> 30 trading days - re-measured after
-# that change and it didn't help (HOLD-despite-large-valuation-gap rows
-# went from 30.3% to 33.2% of the dataset). Then +/-8% -> +/-5% reasoned
-# from a "normal good value stock returns 10-15%/year" argument when the
-# window became 63 trading days (~1 quarter) - but that reasoning
-# conflated average return with volatility, two different things: a
-# stock's quarter-to-quarter SPREAD is much larger than its average
-# quarterly gain even when the average itself is modest.
-#
-# Settled by actually measuring it (diagnose_return_distribution.py, zero
-# Gemini cost - reuses this file's own label_from_forward_return against
-# real yfinance price history across all 40 tickers, 720 samples): 63-day
-# forward returns for this ticker set have mean +3.9%, median +1.6%, but
-# stdev 15.3% - confirming the volatility lens, not the average-return
-# lens, is what a noise-filtering threshold needs to be built on. Measured
-# HOLD/BUY/SELL split at +/-8%: 58.8%/27.1%/14.2% - a real majority-HOLD
-# distribution (matching the historical ~49-50% HOLD figures cited above)
-# while both BUY and SELL keep meaningful representation, unlike +/-10-12%
-# where they nearly disappear. BUY consistently exceeds SELL at every
-# threshold tested - the return distribution is right-skewed (occasional
-# large rallies), which is normal for stocks, not a labeling artifact.
-BUY_THRESHOLD = 0.08          # forward return >= +8% -> BUY
-SELL_THRESHOLD = -0.08         # forward return <= -8% -> SELL
-                                   # (between the two -> HOLD)
+# Gates the Gemini-costing half of this pipeline (Task B: reasoning/answer
+# generation, given news_reaction + fuse()'s recommendation as INPUT - see
+# make_real_example). Default False: a plain run of this script only ever
+# produces free Task A (news_reaction) rows. Flip to True only after
+# explicitly confirming the Gemini budget spend (GATE A in the project's
+# two-stage-pipeline plan) - this is a deliberate manual switch, not
+# something main() decides on its own.
+ENABLE_TASK_B_GENERATION = False
+
 OUTPUT_TRAIN_FILE = "dataset_train_real.jsonl"
 OUTPUT_VAL_FILE = "dataset_val_real.jsonl"
 
 # How far back, and how close to "now", to search. The gap between
 # SAFETY_BUFFER_DAYS and today guarantees every queried window already has
 # a complete forward price window by the time we look it up - derived from
-# FORWARD_WINDOW_CALENDAR_BUFFER_DAYS (see that constant's own comment) so
+# REACTION_WINDOW_CALENDAR_BUFFER_DAYS (see that constant's own comment) so
 # the two can't silently drift out of sync again.
 LOOKBACK_WEEKS = 18
-SAFETY_BUFFER_DAYS = FORWARD_WINDOW_CALENDAR_BUFFER_DAYS
+SAFETY_BUFFER_DAYS = REACTION_WINDOW_CALENDAR_BUFFER_DAYS
 MAX_HEADLINES_PER_TICKER = 50
 
 # Caps how many KEPT examples any single week's window can contribute to a
@@ -493,6 +560,28 @@ PRICE_REQUEST_DELAY_SECONDS = 0.3  # be polite to yfinance between calls
 
 PUBLISHER_FALLBACK = "Google News"
 
+# Confirmed live (2026-08-19, user feedback): surveying live Google News
+# RSS results for ORCL/TSLA/QCOM found a SINGLE publisher (MarketBeat)
+# accounted for 36-40% of ALL 100 results per ticker - almost entirely
+# auto-generated institutional-13F-filing spam ("46,643 Shares in Oracle
+# Corporation $ORCL Purchased by Trust Co. of Vermont") rather than news.
+# Publisher-based filtering catches this kind of homogeneous, high-volume
+# noise far more effectively than a headline-shape regex ever could (see
+# _is_low_content_headline's own comment on that filter's whack-a-mole
+# limits) - these sources are excluded from candidacy entirely, same
+# treatment as _is_low_content_headline gives individual headlines.
+# Deliberately NOT a blanket exclude of every "opinion/commentary"-style
+# outlet (Motley Fool, Benzinga, 24/7 Wall St. are left in) - those are
+# more heterogeneous (real reporting mixed with opinion pieces), and the
+# headline-shape filter already catches their worst individual offenders;
+# this list is reserved for sources that were confirmed near-100% low-
+# content in the live sample.
+LOW_QUALITY_PUBLISHERS = {
+    "MarketBeat", "Stocktwits", "GuruFocus", "Trefis", "Simply Wall St.",
+    "simplywall.st", "Zacks Investment Research", "StockStory",
+    "TIKR.com", "Moomoo", "TradingKey", "Quiver Quantitative",
+}
+
 # Reused verbatim from generate_synthetic_dataset.py so both datasets' news
 # blocks have the same shape - real feeds do mix in unrelated market
 # headlines too, same as the synthetic version simulates.
@@ -511,6 +600,179 @@ NOISE_HEADLINES = [
     "Bond markets rally as recession fears ease",
 ]
 NOISE_PUBLISHERS = ["Reuters", "Bloomberg", "MarketWatch", "CNBC"]
+
+# Headline SHAPES known to carry little/no real information about the
+# company - bare price-recap wrappers ("Intel (INTC) Stock Trades Up,
+# Here Is Why"), listicle/opinion bait ("Should You Buy Microsoft Stock?",
+# "2 Reasons PYPL Is Risky"), and fund-flow filing spam ("338,950 shares
+# added to ... portfolio"). Confirmed live (user feedback, 2026-08-19):
+# Google News RSS returns these often enough that they were ending up as
+# the PRIMARY (signal) headline for a real-dataset row - measured ~9% of
+# rows in an early real Task B sample. This is a different, WORSE problem
+# than generic macro noise (NOISE_HEADLINES above, mixed in deliberately
+# so the model learns to ignore truly irrelevant headlines): a price-
+# recap headline directly states the very move label_news_reaction's
+# price data also encodes, so a row built on one teaches "read the
+# headline's own stated direction back out" rather than genuine news
+# judgment - a shortcut-learning risk, not a source of useful noise.
+# Filtered out entirely in process_ticker (never even considered as a
+# candidate) rather than kept and mislabeled - this dataset ends up
+# smaller as a direct result, an accepted tradeoff for not training on
+# a signal that gives the answer away.
+# Shared by both alternatives below - "Why {Ticker} Stock Dropped Today"
+# and "{Ticker} Stock Is Falling" are the same information-free shape as
+# "Stock Trades Up, Here Is Why", just phrased as a headline instead of a
+# two-clause sentence. Confirmed live (2026-08-19): the first version of
+# this filter (without this pattern) still let "Why Tesla Stock Dropped
+# on Tuesday" / "Why is Amazon stock rallying today?" / "Why Adobe (ADBE)
+# Stock Is Falling Today" / "Why Qualcomm (QCOM) Stock Is Nosediving"
+# straight through - this is a real, ongoing whack-a-mole problem, not a
+# one-time fix; expect to keep extending this pattern as new phrasings
+# turn up, not treat it as solved.
+_MOVE_VERB_RE_FRAGMENT = (
+    r"(?:ris(?:e|es|ing)|fell|fall(?:s|ing)?|dropp?(?:ed|s|ing)?|"
+    r"rall(?:y|ies|ying|ied)|slid(?:e|es|ing)?|climb(?:s|ed|ing)?|"
+    r"surg(?:e|es|ed|ing)?|plung(?:e|es|ed|ing)?|jump(?:s|ed|ing)?|"
+    r"sank|sink(?:s|ing)?|tumbl(?:e|es|ed|ing)|gain(?:s|ed|ing)?|"
+    r"los(?:es|ing)|lost|nosediv(?:e|es|ed|ing)|soar(?:s|ed|ing)?|"
+    r"sag(?:s|ged|ging)?|slump(?:s|ed|ing)?|wilt(?:s|ed|ing)?|"
+    r"slip(?:s|ped|ping)?|retreat(?:s|ed|ing)?|advanc(?:e|es|ed|ing)?|"
+    r"wobbl(?:e|es|ed|ing)|sink|dip(?:s|ped|ping)?|swoon(?:s|ed|ing)?|"
+    r"spik(?:e|es|ed|ing)|skid(?:s|ded|ding)?)"
+)
+
+# Headline SHAPES known to carry little/no real information about the
+# company - bare price-recap wrappers ("Intel (INTC) Stock Trades Up,
+# Here Is Why", "Why Tesla Stock Dropped on Tuesday"), listicle/opinion
+# bait ("Should You Buy Microsoft Stock?", "2 Reasons PYPL Is Risky",
+# "Is Oracle Stock a Buy at $245?"), and fund-flow filing spam ("338,950
+# shares added to ... portfolio"). Confirmed live (user feedback,
+# 2026-08-19): Google News RSS returns these often enough that they were
+# ending up as the PRIMARY (signal) headline for a real-dataset row -
+# measured ~9% of rows in an early real Task B sample, before the "why +
+# move verb" variants above were even accounted for. This is a
+# different, WORSE problem than generic macro noise (NOISE_HEADLINES
+# above, mixed in deliberately so the model learns to ignore truly
+# irrelevant headlines): a price-recap headline directly states the very
+# move label_news_reaction's price data also encodes, so a row built on
+# one teaches "read the headline's own stated direction back out" rather
+# than genuine news judgment - a shortcut-learning risk, not a source of
+# useful noise. Filtered out entirely in process_ticker (never even
+# considered as a candidate) rather than kept and mislabeled - this
+# dataset ends up smaller as a direct result, an accepted tradeoff for
+# not training on a signal that gives the answer away.
+#
+# This is a regex denylist, not a robust classifier - it will keep
+# missing new phrasings (see the history note above) and is not the only
+# fix: financial-sentiment-api's app/services/news.py applies an
+# equivalent filter at INFERENCE time too (a live production quality
+# issue, not just a training-data one - a request whose top 4 raw RSS
+# results are all low-content headlines like these currently gives the
+# model nothing real to reason about).
+_LOW_CONTENT_HEADLINE_RE = re.compile(
+    r"stock (?:is )?trad(?:ing|es) (?:up|down|higher|lower)"
+    r"|shares (?:are|is) (?:up|down|higher|lower) today"
+    r"|here.s why|here.s what (?:investors|we|you) (?:need to know|see)"
+    r"|what you need to know|laps the stock market|what.s going on with"
+    rf"|\bwhy\b.{{0,60}}\b(?:stock|shares?)\b.{{0,30}}\b{_MOVE_VERB_RE_FRAGMENT}\b"
+    rf"|\b(?:stock|shares?)\b.{{0,20}}\b(?:is|are)\b.{{0,10}}\b{_MOVE_VERB_RE_FRAGMENT}(?:ing)?\b"
+    r"|^Is .+ a Good Stock|Stock a (?:Good )?Buy\b|^Should You Buy|Buy,? Hold,? (?:or|and) Sell"
+    r"|^\d+ (?:Reasons?|Stocks?)|Better Buy|Zacks (?:Investment|Rank)|Trending Stock"
+    r"|shares (?:added to|removed from|acquired by|sold by|purchased by)"
+    r"|^[\d,]+\+? Shares (?:in|of)|(?:Buys|Purchases?|Sells) Shares (?:in|of)"
+    r"|(?:Takes|Makes New) .{0,25}(?:Position|Investment) in|Invests? \$[\d,.]+|13F"
+    r"|portfolio.{0,20}(?:quiverquant|according to a)",
+    re.IGNORECASE,
+)
+
+
+def _is_low_content_headline(title: str) -> bool:
+    return bool(_LOW_CONTENT_HEADLINE_RE.search(title))
+
+
+# Yahoo Finance .info `sector` strings -> lowercase keywords whose presence
+# in a headline suggests it's about the company's broader market even
+# without naming the company/ticker directly (e.g. "OPEC agrees to cut oil
+# output" is relevant to XOM even though it never says "Exxon"). Starter
+# list from the redesign plan (docs/two-stage-task-a-redesign-plan.md item
+# 2) - covers only the sectors actually present in TICKERS above; expect
+# this to need live refinement against real headlines the same way
+# LOW_QUALITY_PUBLISHERS/_is_low_content_headline did (3-4 rounds each,
+# see those constants' own history notes). A ticker whose sector isn't
+# listed here just falls back to name/ticker-only matching in
+# _is_relevant_headline below, which is always checked first regardless.
+SECTOR_KEYWORDS = {
+    "Technology": {
+        "ai", "artificial intelligence", "chip", "chips", "semiconductor",
+        "software", "cloud", "cybersecurity", "data center", "data centers",
+    },
+    "Communication Services": {
+        "streaming", "advertising", "ad revenue", "social media", "telecom",
+        "wireless", "broadband", "5g",
+    },
+    "Consumer Cyclical": {
+        "retail sales", "consumer spending", "e-commerce", "auto sales",
+        "vehicle sales", "electric vehicle", "tariff", "tariffs",
+    },
+    "Consumer Defensive": {
+        "retail sales", "consumer spending", "grocery", "beverage",
+    },
+    "Financial Services": {
+        "rate hike", "rate cut", "federal reserve", "fed", "banking",
+        "interest rates", "credit", "payments", "fintech",
+    },
+    "Industrials": {
+        "aerospace", "defense", "manufacturing", "supply chain", "factory",
+        "airline", "aviation",
+    },
+    "Energy": {
+        "oil", "gas", "crude", "opec", "drilling", "refinery", "pipeline",
+    },
+    "Healthcare": {
+        "drug", "fda", "clinical trial", "biotech", "pharma", "vaccine",
+    },
+}
+
+# Precompiled per-sector regex (word-boundary, case-insensitive) - built
+# once at import time rather than re.search-ing every keyword individually
+# per headline. Word boundaries matter: a naive substring check on "ai"
+# or "oil" would false-positive on "said"/"maintain"/"turmoil"/"Vegas".
+SECTOR_KEYWORD_PATTERNS = {
+    sector: re.compile(
+        r"\b(?:" + "|".join(re.escape(k) for k in sorted(keywords, key=len, reverse=True)) + r")\b",
+        re.IGNORECASE,
+    )
+    for sector, keywords in SECTOR_KEYWORDS.items()
+}
+
+
+def _is_relevant_headline(ticker: str, name: str, sector, title: str) -> bool:
+    """True if `title` plausibly concerns `ticker`'s company or its sector -
+    the redesign plan's relevance pre-filter (docs/two-stage-task-a-
+    redesign-plan.md item 2). The earlier publisher/shape filters above
+    catch bad SOURCES and bad SHAPES, not well-sourced, well-shaped
+    headlines that simply aren't about this company (a generic macro
+    roundup, a different company's earnings) - this is a different problem
+    from either. Checked in order: (1) company name substring (case-
+    insensitive - "Apple", "General Motors"), (2) ticker as a standalone,
+    case-SENSITIVE token (tickers are conventionally all-caps in real
+    headlines - "$TSLA", "(NVDA)" - a case-INsensitive check on short
+    tickers like V/F/MA/GS would false-positive on ordinary English words),
+    (3) sector keyword match via SECTOR_KEYWORD_PATTERNS, if this ticker's
+    sector has an entry. A headline matching none of these is dropped in
+    process_ticker before pricing/classification - never reaching Task A
+    (falls through to no example for that headline, same as the other
+    pre-filters; NOT forced into a neutral-labeled row for a headline that
+    was never even about the company)."""
+    title_lower = title.lower()
+    if name.lower() in title_lower:
+        return True
+    if re.search(rf"\b{re.escape(ticker)}\b", title):
+        return True
+    keyword_pattern = SECTOR_KEYWORD_PATTERNS.get(sector)
+    if keyword_pattern is not None and keyword_pattern.search(title):
+        return True
+    return False
 
 # Reused verbatim from generate_synthetic_dataset.py.
 USER_QUESTION_TEMPLATES = [
@@ -672,121 +934,187 @@ def fetch_headlines_for_window(ticker, name, after_date, before_date):
     return results
 
 
-def label_from_forward_return(ticker_obj, published_at, earnings_dates=None):
-    """Returns (direction, pct_change, actual_window_days, skip_reason).
+def measure_reaction_windows(ticker_obj, published_at, earnings_dates=None):
+    """Returns (move_1d, move_21d, overreaction_assessable, skip_reason).
     skip_reason is None on success, otherwise "no_date",
-    "history_fetch_failed", or "insufficient_history".
+    "history_fetch_failed", "insufficient_history", or
+    "earnings_within_1d".
 
-    Because callers only pass in headlines from deliberately-old query
-    windows (see weekly_windows/SAFETY_BUFFER_DAYS), the full
-    FORWARD_WINDOW_TRADING_DAYS should be available almost every time. The
-    adaptive/floor-of-1-day behavior is kept as a safety net for edge cases
-    (market holidays, sparse data), not as the primary mechanism.
+    move_1d is the SINGLE trading day's close-to-close reaction: "day 0"'s
+    close (the first trading day on or after published_at's date - so a
+    headline published after close, or on a weekend/holiday, correctly
+    rolls forward to the next real trading day) vs. the immediately
+    PRECEDING trading day's close. Changed 2026-08-20 from a 3-trading-day
+    forward-cumulative window - confirmed live (user's own SIGN.SW
+    example: a CEO-change headline, >10% drop the SAME day, +4% over the
+    next two days) that a multi-day cumulative window dilutes/nets out
+    exactly the fast-reverting crashes that are the clearest overreaction
+    signal, understating a move the single day alone makes obvious. This
+    also matches what's actually available in production: a per-headline
+    day-of-publish move is real, already-happened data, computable at
+    inference time the same way it's computed here for training - unlike
+    the OLD training-time 3-day figure, which measured price action
+    AFTER the headline and could never be reproduced live for a
+    just-published story.
 
-    earnings_dates (optional, fundamentals_history["earnings_dates"]): if a
-    real earnings report lands strictly between the headline's date and the
-    end of the window, the window is truncated to stop the trading day
-    before it. Confirmed live (2026-08-17): raising
-    FORWARD_WINDOW_TRADING_DAYS to 30 (see that constant's own comment) was
-    the fix for value convergence needing more than 3 days to show up in
-    price, but a 30-day window is long enough that an unrelated earnings
-    report easily falls inside it - and earnings is the single most
-    reliably strong, scheduled catalyst that could hijack the label,
-    attributing a move to whatever headline anchors this row when the real
-    driver was a totally different, later event. Only earnings gets this
-    treatment (not every possible intervening catalyst - that's
-    unbounded and unknowable in advance); it's the one predictable
-    exception worth guarding against specifically.
+    move_21d is measured from the SAME baseline as move_1d (the preceding
+    trading day's close, not day 0's own close) - so classify_reaction's
+    retracement check compares apples to apples: "how far from where it
+    started before the news, at day 0 vs. at day 21." move_21d is None
+    when there isn't yet 21 trading days of history past day 0 in the
+    fetched window - a normal outcome for a very recent headline, not a
+    failure (move_1d is still usable).
+
+    overreaction_assessable is False when a real earnings report falls
+    inside trading days 1-21 after day 0 - move_1d (and therefore
+    good/bad/neutral) is still trustworthy since the report hadn't landed
+    yet, but a day-21 retracement can't be trusted to reflect genuine
+    overreaction fading rather than a fresh earnings-driven move layered
+    on top. A report ON day 0 itself contaminates move_1d directly, so
+    that's a full skip (see EARNINGS_WITHIN_1D_SKIP_DAYS) rather than a
+    partial one.
+
+    This is the production twin of calibrate_reaction_thresholds.py's
+    identically-named function, ported here once calibration had picked
+    real thresholds - see this module's history item 10 and that script's
+    own docstring for why measurement and classification (classify_
+    reaction below) are kept as separate functions: calibrate_reaction_
+    thresholds.py imports both from here and sweeps classify_reaction's
+    threshold arguments directly, rather than keeping a second copy of
+    this logic to drift out of sync (the same "reuse the exact production
+    function" precedent diagnose_return_distribution.py established for
+    the now-retired label_from_forward_return).
     """
     if published_at is None:
-        return None, None, None, "no_date"
+        return None, None, False, "no_date"
 
-    start_date = published_at.date()
-    # FORWARD_WINDOW_CALENDAR_BUFFER_DAYS (module-level, shared with
-    # SAFETY_BUFFER_DAYS - see that constant's own comment) instead of a
-    # fixed +4 tuned for the old 3-trading-day window.
-    end_date = start_date + datetime.timedelta(days=FORWARD_WINDOW_CALENDAR_BUFFER_DAYS)
+    published_date = published_at.date()
+    start_date = published_date - datetime.timedelta(days=PRE_PUBLISH_BUFFER_DAYS)
+    end_date = published_date + datetime.timedelta(days=REACTION_WINDOW_CALENDAR_BUFFER_DAYS)
     try:
         hist = ticker_obj.history(start=start_date, end=end_date)
     except Exception as e:
         print(f"    Warning: price history fetch failed: {e}", flush=True)
-        return None, None, None, "history_fetch_failed"
+        return None, None, False, "history_fetch_failed"
 
-    if len(hist) < 2:
-        return None, None, None, "insufficient_history"
+    if hist.empty:
+        return None, None, False, "insufficient_history"
 
+    published_ts = _as_of_timestamp(hist.index, published_date)
+    day0_pos = hist.index.searchsorted(published_ts)
+    if day0_pos == 0 or day0_pos >= len(hist):
+        # day0_pos == 0: no prior trading day found in our fetched window
+        # (shouldn't happen given PRE_PUBLISH_BUFFER_DAYS, but fails soft
+        # rather than risk an IndexError). day0_pos >= len(hist): no
+        # trading day on/after published_date within the fetched window -
+        # e.g. published right at the edge of what's currently available.
+        return None, None, False, "insufficient_history"
+
+    prev_close = hist["Close"].iloc[day0_pos - 1]
+    day0_close = hist["Close"].iloc[day0_pos]
+    if not prev_close:
+        return None, None, False, "insufficient_history"
+
+    earnings_pos = None
     if earnings_dates is not None and not earnings_dates.empty:
-        future_as_of_ts = _as_of_timestamp(earnings_dates.index, start_date)
+        future_as_of_ts = _as_of_timestamp(earnings_dates.index, published_date)
         future_earnings = earnings_dates[earnings_dates.index > future_as_of_ts]
         if not future_earnings.empty:
             next_earnings_date = future_earnings.sort_index().index.min()
             cutoff_ts = _as_of_timestamp(hist.index, next_earnings_date.date())
-            # EARNINGS_TRUNCATION_BUFFER_DAYS trading days of margin before
-            # the earnings date itself, not just excluding that one day -
-            # pre-earnings anticipation (previews, options positioning,
-            # leaks) can move a stock before the report actually lands, so
-            # stopping exactly at the earnings day still lets some of that
-            # bleed into the label. searchsorted finds the row position the
-            # earnings date would occupy (or does occupy, if it's itself a
-            # trading day) in the ascending-sorted history index; subtract
-            # the buffer in trading-day units (consistent with how the rest
-            # of this window is measured) rather than calendar days.
-            earnings_pos = hist.index.searchsorted(cutoff_ts)
-            truncate_pos = max(0, earnings_pos - EARNINGS_TRUNCATION_BUFFER_DAYS)
-            truncated = hist.iloc[:truncate_pos]
-            # Only truncate if the earnings date actually falls inside the
-            # fetched window and leaves at least one real trading day - an
-            # earnings date on/before start_date, or one so close it would
-            # leave nothing, isn't a truncation case, just insufficient
-            # data (falls through to the check below).
-            if len(truncated) >= 2:
-                hist = truncated
+            earnings_pos = hist.index.searchsorted(cutoff_ts) - day0_pos
 
-    if len(hist) < 2:
-        return None, None, None, "insufficient_history"
+    if earnings_pos is not None and earnings_pos <= EARNINGS_WITHIN_1D_SKIP_DAYS:
+        return None, None, False, "earnings_within_1d"
 
-    start_price = hist["Close"].iloc[0]
-    end_idx = min(FORWARD_WINDOW_TRADING_DAYS, len(hist) - 1)
-    actual_window_days = end_idx  # how many trading days forward this label actually reflects
-    end_price = hist["Close"].iloc[end_idx]
-    if not start_price:
-        return None, None, None, "insufficient_history"
+    overreaction_assessable = earnings_pos is None or earnings_pos > EARNINGS_UNASSESSABLE_DAYS
 
-    pct_change = (end_price - start_price) / start_price
-    if pct_change >= BUY_THRESHOLD:
-        direction = "BUY"
-    elif pct_change <= SELL_THRESHOLD:
-        direction = "SELL"
-    else:
-        direction = "HOLD"
-    return direction, pct_change, actual_window_days, None
+    move_1d = (day0_close - prev_close) / prev_close
+
+    move_21d = None
+    day21_pos = day0_pos + 21
+    if day21_pos < len(hist):
+        move_21d = (hist["Close"].iloc[day21_pos] - prev_close) / prev_close
+
+    return move_1d, move_21d, overreaction_assessable, None
 
 
-def confidence_from_move(direction, pct_change, contradicts=False):
-    # Bigger moves get higher confidence, on the reasoning that a move well
-    # past the threshold is less likely to be pure noise than one that
-    # barely cleared it. Loosely mirrors the synthetic generator's
-    # per-category confidence ranges, not derived from anything rigorous.
-    #
-    # `contradicts` - whether Gemini judged the headline's own content to
-    # point the OPPOSITE way from the price-derived `direction` (see
-    # GEMINI_REASONING_PROMPT's CONTRADICTS line) - overrides the magnitude
-    # formula entirely rather than blending with it. This was a real,
-    # confirmed-live gap: PR #10 told Gemini to WRITE low confidence
-    # (0.5-0.6) in the reasoning prose for exactly this case, but the
-    # actual numeric confidence field was computed here, from price
-    # magnitude alone, before Gemini's judgment existed anywhere - Gemini's
-    # text said "hedge," the label said 0.69-0.7 (this formula's own output
-    # for a move barely past the +/-2% threshold, which is also exactly the
-    # noisiest, most contradiction-prone case), and the trained model
-    # dutifully reproduced that exact mismatched pairing at inference time
-    # instead of the calibration PR #10 intended.
-    if contradicts:
-        return round(random.uniform(0.50, 0.60), 2)
-    magnitude = min(abs(pct_change), 0.15) / 0.15  # normalize, cap at a 15% move
-    if direction == "HOLD":
-        return round(0.55 + 0.15 * (1 - magnitude), 2)
-    return round(0.65 + 0.30 * magnitude, 2)
+def classify_reaction(move_1d, move_21d, overreaction_assessable,
+                       good_bad_threshold=REACTION_GOOD_BAD_THRESHOLD,
+                       overreaction_move_threshold=REACTION_OVERREACTION_MOVE_THRESHOLD,
+                       retracement_fraction=REACTION_RETRACEMENT_FRACTION):
+    """Pure classification over an already-measured (move_1d, move_21d,
+    overreaction_assessable) triple - overreaction checked first (requires
+    BOTH an outsized single-day move AND a day-21 retracement of at least
+    `retracement_fraction` of that move), then plain good/bad/neutral off
+    move_1d alone. Threshold args are keyword-overridable so calibrate_
+    reaction_thresholds.py can sweep a grid without a second copy of this
+    logic."""
+    if overreaction_assessable and move_21d is not None:
+        if move_1d <= -overreaction_move_threshold:
+            retraced = (move_21d - move_1d) / abs(move_1d)
+            if retraced >= retracement_fraction:
+                return "overreaction_down"
+        elif move_1d >= overreaction_move_threshold:
+            retraced = (move_1d - move_21d) / move_1d
+            if retraced >= retracement_fraction:
+                return "overreaction_up"
+
+    if move_1d >= good_bad_threshold:
+        return "good"
+    if move_1d <= -good_bad_threshold:
+        return "bad"
+    return "neutral"
+
+
+def label_news_reaction(ticker_obj, published_at, earnings_dates=None):
+    """Returns (reaction, move_1d, move_21d, skip_reason) - the production
+    Task A labeler, replacing the retired label_from_forward_return (see
+    history item 10). skip_reason is None on success."""
+    move_1d, move_21d, overreaction_assessable, skip_reason = measure_reaction_windows(
+        ticker_obj, published_at, earnings_dates,
+    )
+    if skip_reason is not None:
+        return None, None, None, skip_reason
+    reaction = classify_reaction(move_1d, move_21d, overreaction_assessable)
+    return reaction, move_1d, move_21d, None
+
+
+def price_context_block(ticker, move_1d):
+    """Canonical phrasing for the stock's single-day reaction on the day a
+    headline was published - Task A's only price signal (see the Task A
+    prompt template in the training repo's synced files). Changed
+    2026-08-20 (see history item 12): move_1d is real, already-happened
+    price data, computed the SAME way in this dataset (day-0 close vs.
+    the preceding trading day's close, day 0 being the headline's own
+    publish date) and at real inference time (financial-sentiment-api
+    looks up the SAME specific day's move for whichever headline it
+    selects) - no more train/inference approximation gap, unlike the
+    retired 3-day-forward-vs-3-day-trailing mismatch this replaced."""
+    return f"{ticker} moved {move_1d * 100:+.1f}% on the day this was published."
+
+
+# Ported from generate_synthetic_dataset.py's identically-named regex/
+# function (not imported - these two files deliberately stay independent
+# scripts, same "ported, not imported" pattern already used for this
+# file's DCF valuation_block port - see that block's own comment). Used
+# only when ENABLE_TASK_B_GENERATION is True, to recover a numeric,
+# SIGNED gap (positive = overvalued, matching fusion_rules.fuse's own
+# convention) from the rendered Valuation block string, since nothing
+# upstream of that string keeps the raw intrinsic value around once
+# build_fundamentals_blocks returns.
+_VALUATION_GAP_RE = re.compile(r"(overvalued|undervalued) by [~>](\d+)%")
+
+
+def _signed_gap_pct(valuation_text):
+    """None when there's no real directional gap to parse ("Data
+    unavailable.", "Not applicable (...)", "trading near fair value") -
+    fusion_rules.fuse treats None as valuation_bucket "no_data"."""
+    match = _VALUATION_GAP_RE.search(valuation_text)
+    if not match:
+        return None
+    verdict, pct = match.group(1), float(match.group(2))
+    return pct if verdict == "overvalued" else -pct
 
 
 FINVIZ_REQUEST_DELAY_SECONDS = 0.3  # once per ticker (40 total), not per
@@ -1934,68 +2262,60 @@ def build_news_block(primary_headline_line):
     return "\n".join(lines)
 
 
-def _template_reasoning(ticker, direction, original_direction, pct_change, actual_window_days):
-    # The original mechanism, kept only as generate_grounded_reasoning's
-    # fallback for when the Gemini call itself fails - see that function's
-    # docstring for why this text alone was the root cause of the model
-    # learning to recall a memorized per-ticker answer instead of reading
-    # the headline. Losing headline-grounding on an occasional row (a
-    # transient API hiccup) is an acceptable degradation; losing it on
-    # every row (the old default) is what broke real-data generalization.
-    #
-    # direction != original_direction only when make_real_example's
-    # headroom gate downgraded a real BUY/SELL-magnitude move to HOLD - the
-    # plain "moved X%, which resolves as {direction}" phrasing below would
-    # otherwise falsely imply HOLD follows directly from the move itself,
-    # when it's actually the valuation gate overriding what the move alone
-    # would have resolved to.
-    if direction != original_direction:
-        day_word = "trading day" if actual_window_days == 1 else "trading days"
-        return (
-            f"Over the {actual_window_days} {day_word} following this news, "
-            f"{ticker} moved {pct_change * 100:+.1f}%, consistent with {original_direction} - "
-            f"but the valuation estimate was already stretched the same way, leaving no "
-            f"headroom, so this resolves as {direction} instead."
-        )
-    day_word = "trading day" if actual_window_days == 1 else "trading days"
+def _template_reasoning(ticker, news_reaction, recommendation):
+    # Kept only as generate_grounded_reasoning's fallback for when the
+    # Gemini call itself fails/is skipped - see that function's docstring
+    # for why headline-grounded Gemini text is the default and this is
+    # only a degradation path (module docstring item 0's original
+    # diagnosis - a fixed template never referencing the headline itself
+    # taught the model to memorize per-ticker answers - applies here just
+    # as much as it did to the old direction-based template this replaces).
+    reaction_phrasing = {
+        "good": "positive for the stock",
+        "bad": "negative for the stock",
+        "neutral": "routine, without a clear directional catalyst",
+        "overreaction_down": "an apparent overreaction to the downside - the recent move looks larger than this headline alone would justify",
+        "overreaction_up": "an apparent overreaction to the upside - the recent move looks larger than this headline alone would justify",
+    }[news_reaction]
     return (
-        f"Over the {actual_window_days} {day_word} following this news, "
-        f"{ticker} moved {pct_change * 100:+.1f}%, which resolves as {direction}. "
-        f"This label reflects the market's actual subsequent move, not a "
+        f"This headline about {ticker} reads as {reaction_phrasing}. Combined with the "
+        f"valuation picture above, this resolves to {recommendation}. This reflects a "
+        f"deterministic rule (news reaction combined with valuation headroom), not a "
         f"hand-verified causal read of the headline itself."
     )
 
 
-# {valuation_alignment} is computed in Python (see valuation_alignment()
-# below), not left for Gemini to derive - whether "overvalued by ~86%"
-# agrees or disagrees with a BUY/SELL label is a small, fully-
-# determined arithmetic/logic step, and there's no reason to trust an LLM
-# to get that right when the answer is already known from data already in
-# hand. Feeding it the precomputed fact keeps Gemini's actual job limited
-# to prose quality, not judgment calls it doesn't need to make.
-#
-# This addresses a real, confirmed-live gap in how this dataset previously
-# treated the Valuation block: the old instruction only ever said "weave
-# it in where relevant," which is soft enough that Gemini can - and,
-# unmeasured, likely did - skip it by default. Explicitly telling it when
-# valuation genuinely agrees with the label (rather than asking it to
-# figure that out) is the same fix generate_synthetic_dataset.py's
-# VALUATION_SIGNAL_SCENARIOS category applies on the synthetic side: make
-# the "valuation actually correlates with direction sometimes" fact
-# concrete and visible in training data, instead of leaving it as
-# something the model was never shown had any bearing on the answer.
+# news_reaction and recommendation are both computed in Python before this
+# prompt ever runs (see label_news_reaction/fusion_rules.fuse below), not
+# left for Gemini to derive - Gemini's only job here is prose quality,
+# explaining a decision it's given rather than making one. This is a
+# deliberate architecture change (2026-08-19, see module docstring history
+# item 10): the OLD prompt asked Gemini to write reasoning consistent with
+# a price-derived BUY/SELL/HOLD label it had no real evidence for, which
+# is exactly what produced the fabricated-contrarian-story and flip-then-
+# hedge failure modes documented in history items 0 and 7 above. Now
+# Gemini is never asked to reconcile a label against a headline that might
+# contradict it - the label already accounts for the headline (via
+# news_reaction) and the valuation (via fuse()), so there's no tension
+# left to paper over with an invented narrative.
 GEMINI_REASONING_PROMPT = """You are labeling training data for a financial-news analyst model.
 
-You are given a stock ticker, its current market data, a valuation estimate, its most recent earnings, a real news headline about it, a user's question, and a recommendation label (BUY, SELL, or HOLD). That label was already determined from the stock's ACTUAL subsequent price move over the next few trading days - not from reading anything below. You do not have access to that price-move data, and you must not reference it, invent a percentage move, or write anything implying you know what the stock did afterward.
+You are given a stock ticker, its current market data, a valuation estimate, its most recent earnings, a real news headline about it, a user's question, this model's own classification of how the market reacted to the headline (news_reaction), and a recommendation (BUY, SELL, or HOLD) already computed from news_reaction plus the valuation estimate below - not from reading anything else. You do not have access to the stock's actual subsequent price move, and you must not reference it, invent a percentage move, or write anything implying you know what happened afterward - news_reaction and recommendation are the only price-derived facts you get.
 
-Write THREE things, each as its own labeled line (see OUTPUT FORMAT):
+news_reaction is one of:
+- good: the headline is genuinely positive for the stock.
+- bad: the headline is genuinely negative for the stock.
+- neutral: the headline is routine/ambiguous, not a real catalyst either way.
+- overreaction_down: the stock's recent price action looks like it fell MORE than this headline alone would justify - a plausible overreaction to the downside.
+- overreaction_up: the stock's recent price action looks like it rose MORE than this headline alone would justify - a plausible overreaction to the upside.
 
-1. REASONING (2-3 sentences): Reads the headline and explains why it's plausibly consistent with a {direction} outlook - the way a financial analyst would talk through the available evidence, not the outcome. Weave in the market data or earnings below ONLY where they genuinely reinforce or complicate the headline's own signal - don't force a mention if a block is irrelevant to this specific headline or says "Data unavailable."/"Not applicable", and never invent facts or numbers that aren't in what you were given.
-   - Valuation alignment (already computed, not your judgment to make): {valuation_alignment}. If "yes", the valuation estimate below points the SAME way as {direction} - actively mention it as one piece of corroborating evidence (still subject to the "never invent numbers" rule - only state what the Valuation block actually says). If "no", the price action actually moved consistent with {original_direction}, but the valuation estimate already read the opposite way - meaning that move pushed the price further from a reasonable entry/exit, not closer to one, so there's no headroom left to act on it. That's why the label here is HOLD rather than {original_direction} - write REASONING that explains this tension (the headline may look like a case for {original_direction}, but valuation leaves no room to act on it), still without stating the actual price move or a percentage. If "no_data", the Valuation block has no usable reading (HOLD label, "Data unavailable.", or "Not applicable...") - don't mention it at all.
-   - If the headline's content does not obviously support {direction} (this happens often - many price moves in a short window are unrelated to the nearest headline), say so plainly - call it a weak or indirect signal rather than forcing a confident causal claim that isn't there.
-   - If the headline's content clearly points the OPPOSITE way from {direction} (e.g. a headline reporting good news paired with a SELL label, or bad news paired with BUY - this happens often, since the label reflects the actual subsequent move and headlines don't always predict it), do NOT invent a contrarian story to force a fit - phrases like "already priced in," "overbought/oversold," or "the market sees through this" sound analytical but aren't something you can actually know from a single headline. Acknowledge honestly, in your own words, that this specific headline runs the other way and the labeled move likely came from something not shown here - but vary your phrasing and sentence structure from one headline to the next. This case recurs across many rows in this dataset; if you settle into one stock formulation for it, the model trained on your output will learn to recite that sentence instead of genuinely reasoning about each headline.
-2. ANSWER (1-2 sentences): A direct, plain answer to the user's question below, consistent with {direction} and, where relevant, the data above. If the question is empty, give a general one-line read on {ticker} instead.
-3. CONTRADICTS: yes if the headline's own content clearly points the OPPOSITE way from {direction} (the case described in REASONING's second bullet above) - no otherwise, including the "weak/indirect signal" case (first bullet), which is NOT a contradiction, just a lack of strong support. This drives the confidence score a downstream step assigns to this example (low if yes) - answer based on what the headline itself says, not on any hedging language you used in REASONING. This is about the HEADLINE only, not the valuation alignment note above.
+Write TWO things, each as its own labeled line (see OUTPUT FORMAT):
+
+1. REASONING (2-3 sentences): Explains why {recommendation} follows from news_reaction={news_reaction} and the valuation picture below, the way a financial analyst would talk through the available evidence.
+   - If news_reaction is "overreaction_down" or "overreaction_up": say so plainly - the recent move looks larger than the headline itself justifies. Vary your phrasing (e.g. "looks overdone," "an outsized reaction to fairly routine news," "the market may be overreacting here") rather than repeating one fixed sentence structure across rows - many rows in this dataset will hit this case, and settling into one canned formulation would teach the model to recite it instead of genuinely reasoning about each headline.
+   - If the recommendation is HOLD despite a clear "good"/"bad" reaction, or an "overreaction_*" reaction with real conviction, that means the valuation estimate already leaves no headroom to act on it (see Valuation below) - explain that tension: the reaction is real, but the price already reflects it (or worse).
+   - Weave in the market data, valuation, or earnings below ONLY where they genuinely reinforce the point - don't force a mention if a block says "Data unavailable." or "Not applicable", and never invent facts or numbers that aren't in what you were given.
+2. ANSWER (1-2 sentences): A direct, plain answer to the user's question below, consistent with {recommendation}. If the question is empty, give a general one-line read on {ticker} instead.
 
 Ticker: {ticker}
 Current Market Data:
@@ -2009,30 +2329,12 @@ Recent Earnings:
 
 Headline: {headline}
 User Question: {user_query}
-Recommendation: {direction}
+News Reaction: {news_reaction}
+Recommendation: {recommendation}
 
-OUTPUT FORMAT - exactly three lines, nothing else, no preamble or quotes:
+OUTPUT FORMAT - exactly two lines, nothing else, no preamble or quotes:
 REASONING: <text>
-ANSWER: <text>
-CONTRADICTS: <yes or no>"""
-
-
-def valuation_alignment(valuation_text, direction):
-    """"yes"/"no"/"no_data" - whether the Valuation block's own over/
-    undervalued reading points the same way as `direction`. See
-    GEMINI_REASONING_PROMPT's own comment for why this is computed here
-    rather than left for Gemini to work out. HOLD always resolves to
-    "no_data" - "does an over/undervalued reading agree with HOLD" isn't
-    a meaningful question the way it is for BUY/SELL."""
-    if direction == "HOLD":
-        return "no_data"
-    if "undervalued" in valuation_text:
-        implied_direction = "BUY"
-    elif "overvalued" in valuation_text:
-        implied_direction = "SELL"
-    else:
-        return "no_data"
-    return "yes" if implied_direction == direction else "no"
+ANSWER: <text>"""
 
 
 def _retry_delay_seconds(error_text, default=10.0):
@@ -2047,91 +2349,67 @@ def _retry_delay_seconds(error_text, default=10.0):
 
 
 def _parse_gemini_output(text):
-    """Splits Gemini's 'REASONING: ...\\nANSWER: ...\\nCONTRADICTS: ...'
-    response into (reasoning, answer, contradicts). Raises ValueError if
-    the REASONING section is missing/empty - callers catch that as a
-    normal Gemini-call failure and fall back to the template, same as any
-    other malformed/empty response. A missing ANSWER or CONTRADICTS
-    section alone is NOT fatal - the caller fills the answer from
-    ANSWER_TEMPLATES and defaults contradicts to False (the conservative
-    choice: an unparseable flag should NOT suppress confidence, only an
-    explicit "yes" should), since losing just one field shouldn't discard
-    an otherwise-good REASONING."""
+    """Splits Gemini's 'REASONING: ...\\nANSWER: ...' response into
+    (reasoning, answer). Raises ValueError if the REASONING section is
+    missing/empty - callers catch that as a normal Gemini-call failure and
+    fall back to the template, same as any other malformed/empty response.
+    A missing ANSWER section alone is NOT fatal - the caller fills the
+    answer from ANSWER_TEMPLATES, since losing just one field shouldn't
+    discard an otherwise-good REASONING."""
     reasoning_match = re.search(r"REASONING:\s*(.*?)(?:\n\s*ANSWER:|$)", text, re.DOTALL | re.IGNORECASE)
-    answer_match = re.search(r"ANSWER:\s*(.*?)(?:\n\s*CONTRADICTS:|$)", text, re.DOTALL | re.IGNORECASE)
-    contradicts_match = re.search(r"CONTRADICTS:\s*(yes|no)", text, re.IGNORECASE)
+    answer_match = re.search(r"ANSWER:\s*(.*)", text, re.DOTALL | re.IGNORECASE)
     reasoning = reasoning_match.group(1).strip() if reasoning_match else ""
     answer = answer_match.group(1).strip() if answer_match else ""
-    contradicts = bool(contradicts_match) and contradicts_match.group(1).lower() == "yes"
     if not reasoning:
         raise ValueError("no REASONING section in Gemini output")
-    return reasoning, answer, contradicts
+    return reasoning, answer
 
 
-def generate_grounded_reasoning(ticker, title, direction, original_direction, alignment,
-                                 pct_change, actual_window_days,
+def generate_grounded_reasoning(ticker, title, news_reaction, recommendation,
                                  market_data, valuation, earnings, user_query, qtype):
-    """Replaces the old fixed template (ticker + price move + direction,
-    never the headline itself) with headline-grounded reasoning from
-    Gemini, now also weaving in market_data/valuation/earnings and writing
-    the `answer` field for user_query. That template was confirmed live as
-    the root cause of a trained model reproducing an identical memorized
-    answer for a given ticker across unrelated headlines - see the module
-    docstring's item 0.
+    """Writes headline-grounded (reasoning, answer) for a Task B row, given
+    news_reaction and recommendation as ALREADY-DECIDED inputs (see
+    GEMINI_REASONING_PROMPT's own comment for why Gemini is never asked to
+    produce either). Only called when ENABLE_TASK_B_GENERATION is True
+    (see that flag's own comment - the Gemini-costing GATE A path).
 
-    Returns (reasoning, answer, contradicts) - each falls back
-    independently: a Gemini failure/empty response/quota exhaustion falls
-    back to (_template_reasoning(...), ANSWER_TEMPLATES[qtype][direction],
-    False); a response with REASONING but no parseable ANSWER/CONTRADICTS
-    line keeps Gemini's reasoning and only falls back the missing half(es).
-    `contradicts` feeds confidence_from_move's override (see that
-    function's docstring for why this exists - the confidence field used
-    to be entirely blind to whether the headline actually agreed with the
-    label).
+    Returns (reasoning, answer) - each falls back independently: a Gemini
+    failure/empty response/quota exhaustion falls back to
+    (_template_reasoning(...), ANSWER_TEMPLATES[qtype][recommendation]); a
+    response with REASONING but no parseable ANSWER line keeps Gemini's
+    reasoning and only falls back the answer.
 
-    Confirmed live: the free tier's 15-requests/minute cap gets hit almost
+    Confirmed live (unchanged from the retired direction-based version of
+    this function - see history item 0/7 above for the original
+    diagnosis): the free tier's 15-requests/minute cap gets hit almost
     immediately with no pacing, and every call after that silently fell
     back to the template - defeating the whole point of this function
     without ever raising an error you'd notice. A 429/RESOURCE_EXHAUSTED
     is retried (honoring Google's suggested retryDelay) up to
     GEMINI_MAX_RETRIES times before giving up; every other failure (network
     error, empty response, safety block, etc.) falls back to the template
-    immediately, same as before, so one non-recoverable bad call still
-    can't abort an unattended multi-hundred-row run. Paces itself to
-    GEMINI_REQUEST_DELAY_SECONDS between calls either way, to avoid
-    re-triggering the same limit on the next row.
+    immediately, so one non-recoverable bad call still can't abort an
+    unattended multi-hundred-row run. Paces itself to GEMINI_REQUEST_
+    DELAY_SECONDS between calls either way, to avoid re-triggering the
+    same limit on the next row.
 
     Also confirmed live, and more serious: the free tier separately caps
     total requests at 500/DAY (RequestsPerDayPerProjectPerModel), distinct
-    from the 15/minute cap above - a 40-ticker run needs up to ~2000 Gemini
-    calls (kept headlines only), so hitting this is expected, not a fluke.
-    Unlike the per-minute cap, no amount of waiting fixes this within the
-    same day - the very first version of this retry loop didn't
-    distinguish the two, so once the daily cap hit it wasted a full
-    per-minute-style retry (tens of seconds) on every single remaining
-    headline for the rest of the run before falling back. Detected
-    separately here: once seen, every later call in this process skips
-    straight to the template with no retry and no per-call pacing delay -
-    there's nothing to wait out until the quota resets (~24h from first
-    use)."""
+    from the 15/minute cap above. Unlike the per-minute cap, no amount of
+    waiting fixes this within the same day - detected separately here:
+    once seen, every later call in this process skips straight to the
+    template with no retry and no per-call pacing delay - there's nothing
+    to wait out until the quota resets (~24h from first use)."""
     global _gemini_daily_quota_exhausted
-    reasoning = _template_reasoning(ticker, direction, original_direction, pct_change, actual_window_days)
-    answer = ANSWER_TEMPLATES[qtype][direction].format(ticker=ticker)
-    contradicts = False
+    reasoning = _template_reasoning(ticker, news_reaction, recommendation)
+    answer = ANSWER_TEMPLATES[qtype][recommendation].format(ticker=ticker)
     if _gemini_daily_quota_exhausted:
-        return reasoning, answer, contradicts
+        return reasoning, answer
 
-    # `alignment` is passed in (computed by the caller against
-    # original_direction) rather than recomputed here against `direction` -
-    # recomputing against `direction` would silently lose the "no" signal
-    # for a downgraded row, since valuation_alignment(valuation, "HOLD")
-    # always returns "no_data" (HOLD has no directional pole to compare
-    # against) - see that function's own docstring.
     prompt = GEMINI_REASONING_PROMPT.format(
-        ticker=ticker, headline=title, direction=direction, original_direction=original_direction,
-        market_data=market_data, valuation=valuation, earnings=earnings,
+        ticker=ticker, headline=title, market_data=market_data, valuation=valuation, earnings=earnings,
         user_query=user_query or "(none)",
-        valuation_alignment=alignment,
+        news_reaction=news_reaction, recommendation=recommendation,
     )
     for attempt in range(GEMINI_MAX_RETRIES + 1):
         try:
@@ -2139,9 +2417,8 @@ def generate_grounded_reasoning(ticker, title, direction, original_direction, al
             text = (response.text or "").strip()
             if not text:
                 raise ValueError("empty response")
-            parsed_reasoning, parsed_answer, parsed_contradicts = _parse_gemini_output(text)
+            parsed_reasoning, parsed_answer = _parse_gemini_output(text)
             reasoning = parsed_reasoning
-            contradicts = parsed_contradicts
             if parsed_answer:
                 answer = parsed_answer
             break
@@ -2164,86 +2441,80 @@ def generate_grounded_reasoning(ticker, title, direction, original_direction, al
             break
     if not _gemini_daily_quota_exhausted:
         time.sleep(GEMINI_REQUEST_DELAY_SECONDS)
-    return reasoning, answer, contradicts
+    return reasoning, answer
+
+
+def _task_a_row(ticker, price_context, news_block, reaction):
+    return {
+        "task": "reaction",
+        "ticker": ticker,
+        "user_query": "",
+        "price_context": price_context,
+        "market_data": "",
+        "valuation": "",
+        "earnings": "",
+        "news": news_block,
+        "news_reaction": reaction,
+        "recommendation": "",
+        "output": json.dumps({"news_reaction": reaction}),
+    }
 
 
 def make_real_example(ticker, ticker_obj, fundamentals_history, title, publisher, published_at):
-    """Returns (example_or_None, skip_reason). skip_reason is None on
-    success, otherwise whatever label_from_forward_return reported."""
-    direction, pct_change, actual_window_days, skip_reason = label_from_forward_return(
+    """Returns (examples, skip_reason). `examples` is a list of 0-2 rows:
+    always a Task A (news_reaction classification) row on success, PLUS a
+    Task B (reasoning/answer generation) row when ENABLE_TASK_B_GENERATION
+    is True (see that flag's own comment - the Gemini-costing GATE A
+    path). skip_reason is None on success, otherwise whatever label_news_
+    reaction reported - only Task A's labeling can fail here, since Task B
+    (when enabled) reuses the same successful reaction/move rather than
+    independently deciding anything."""
+    reaction, move_1d, move_21d, skip_reason = label_news_reaction(
         ticker_obj, published_at, fundamentals_history.get("earnings_dates"),
     )
-    if direction is None:
-        return None, skip_reason
+    if reaction is None:
+        return [], skip_reason
 
     date_str = _format_date(published_at) if published_at else "recent"
     headline_line = f"- [{date_str}] {title} - {publisher}"
+    news_block = build_news_block(headline_line)
+    price_context = price_context_block(ticker, move_1d)
 
-    user_query, qtype = build_user_query(ticker)
+    examples = [_task_a_row(ticker, price_context, news_block, reaction)]
 
-    as_of_date = published_at.date() if published_at else datetime.date.today()
-    market_data, valuation, earnings = build_fundamentals_blocks(ticker_obj, fundamentals_history, as_of_date)
+    if ENABLE_TASK_B_GENERATION:
+        user_query, qtype = build_user_query(ticker)
+        as_of_date = published_at.date() if published_at else datetime.date.today()
+        market_data, valuation, earnings = build_fundamentals_blocks(ticker_obj, fundamentals_history, as_of_date)
 
-    # Headroom gate, mirroring generate_synthetic_dataset.py's
-    # VALUATION_CONFLICT_DOWNGRADE_THRESHOLD fix: label_from_forward_return
-    # is purely price-based - a stock can rally past BUY_THRESHOLD while
-    # already overvalued (or sell off past SELL_THRESHOLD while already
-    # undervalued), which is exactly "the move had no valuation headroom
-    # behind it," not a genuine buy/sell case. valuation_alignment already
-    # computes this ("no" only ever happens for a BUY/SELL original_direction
-    # - HOLD always resolves alignment to "no_data", never "no" - so every
-    # "no" here is a headroom conflict by construction). original_direction
-    # is kept for generate_grounded_reasoning to explain the tension - the
-    # resolved `direction` becomes HOLD, but Gemini still needs to know what
-    # the price action actually pointed toward to write an honest REASONING.
-    original_direction = direction
-    alignment = valuation_alignment(valuation, original_direction)
-    downgraded = original_direction in ("BUY", "SELL") and alignment == "no"
-    if downgraded:
-        direction = "HOLD"
+        # The only place this file decides BUY/SELL/HOLD - fuse() is the
+        # exact same function financial-sentiment-api calls at inference
+        # time (see fusion_rules.py's own module docstring), so Task B
+        # training data and production always agree on what a given
+        # (news_reaction, valuation gap) pair resolves to.
+        gap_pct = _signed_gap_pct(valuation)
+        fusion_result = fusion_rules.fuse(reaction, gap_pct)
 
-    # Gemini's contradicts judgment has to exist BEFORE confidence is
-    # computed - confidence_from_move needs it to override the magnitude-
-    # only formula for headline-contradicted rows (see that function's
-    # docstring). Confidence used to be computed first, independent of
-    # Gemini entirely, which was the actual root cause of PR #10's
-    # "use low confidence when contradicted" instruction never taking
-    # effect on the trained model's calibration - only on the prose.
-    reasoning, answer, contradicts = generate_grounded_reasoning(
-        ticker, title, direction, original_direction, alignment, pct_change, actual_window_days,
-        market_data, valuation, earnings, user_query, qtype,
-    )
-    confidence = confidence_from_move(direction, pct_change, contradicts)
+        reasoning, answer = generate_grounded_reasoning(
+            ticker, title, reaction, fusion_result.recommendation,
+            market_data, valuation, earnings, user_query, qtype,
+        )
 
-    output_payload = {
-        "impacted_stocks": [
-            {
-                "ticker": ticker,
-                "reasoning": reasoning,
-                "recommendation": direction,
-                "confidence": confidence,
-                "answer": answer,
-            }
-        ]
-    }
+        examples.append({
+            "task": "analysis",
+            "ticker": ticker,
+            "user_query": user_query,
+            "price_context": price_context,
+            "market_data": market_data,
+            "valuation": valuation,
+            "earnings": earnings,
+            "news": news_block,
+            "news_reaction": reaction,
+            "recommendation": fusion_result.recommendation,
+            "output": json.dumps({"reasoning": reasoning, "answer": answer}, indent=2),
+        })
 
-    example = {
-        "ticker": ticker,
-        "user_query": user_query,
-        "market_data": market_data,
-        "valuation": valuation,
-        "earnings": earnings,
-        "news": build_news_block(headline_line),
-        "output": json.dumps(output_payload, indent=2),
-        # Transient - not part of the canonical schema. Lets main()'s
-        # downsample_contradicts_in_place (train) / the val strip pass
-        # find and remove these rows/keys after the fact, without
-        # threading a third return value through generate_and_write's
-        # only caller. Always stripped before training - see history
-        # item 7 above.
-        "_contradicts": contradicts,
-    }
-    return example, None
+    return examples, None
 
 
 def append_examples(filepath, examples):
@@ -2372,13 +2643,22 @@ def process_ticker(ticker, name):
             if title in seen_titles:
                 continue
             seen_titles.add(title)
+            if publisher in LOW_QUALITY_PUBLISHERS:
+                ticker_skips["low_quality_publisher"] = ticker_skips.get("low_quality_publisher", 0) + 1
+                continue
+            if _is_low_content_headline(title):
+                ticker_skips["low_content_headline"] = ticker_skips.get("low_content_headline", 0) + 1
+                continue
+            if not _is_relevant_headline(ticker, name, fundamentals_history.get("sector"), title):
+                ticker_skips["not_relevant"] = ticker_skips.get("not_relevant", 0) + 1
+                continue
 
-            example, skip_reason = make_real_example(
+            examples, skip_reason = make_real_example(
                 ticker, ticker_obj, fundamentals_history, title, publisher, published_at)
             time.sleep(PRICE_REQUEST_DELAY_SECONDS)
 
-            if example:
-                ticker_examples.append(example)
+            if examples:
+                ticker_examples.extend(examples)
                 kept += 1
                 kept_this_window += 1
                 print(f"      [{ticker}] [{kept}/{MAX_HEADLINES_PER_TICKER}, {kept_this_window}/{MAX_HEADLINES_PER_WINDOW} this window] kept: {title[:70]!r}", flush=True)
@@ -2460,99 +2740,56 @@ def generate_and_write():
     print(f"Collected {total_train} raw train examples, {total_val} val examples (before rebalancing)", flush=True)
 
 
-def direction_of(example):
-    return json.loads(example["output"])["impacted_stocks"][0]["recommendation"]
+def rebalance_task_a(examples):
+    """Rebalances Task A (task="reaction") rows only - any Task B rows
+    (task="analysis", only present when ENABLE_TASK_B_GENERATION was True
+    for this run) pass through untouched.
 
-
-def downsample_contradicts_in_place(filepath, max_fraction=CONTRADICTS_MAX_FRACTION):
-    """Undersamples rows tagged "_contradicts": true (Gemini judged the
-    headline's own content pointed the OPPOSITE way from the price-derived
-    label - see GEMINI_REASONING_PROMPT's CONTRADICTS line) down to at most
-    max_fraction of the file, then strips the transient "_contradicts" key
-    from every row so what's left matches the canonical 7-field schema.
-    See history item 7 above for why: this pattern was over-represented
-    enough in real training data (tight +/-2% move threshold -> frequent
-    headline/price mismatches -> frequent CONTRADICTS=yes) that the model
-    memorized "read the headline correctly, then flip anyway" as a general
-    strategy instead of a rare, narrowly-applicable judgment - and applied
-    it even to synthetic examples that never used this framing at all.
-    Undersampling (not duplicating the majority "not contradicted" rows up
-    to match) mirrors rebalance_by_direction's own reasoning: this project
-    has already hit a real overfitting problem from repeated content once,
-    and train-only, like that function - val stays untouched (natural/
-    unbalanced), so its accuracy stays an honest read of real-world
-    performance, contradicts cases included."""
-    with open(filepath) as f:
-        rows = [json.loads(line) for line in f]
-
-    contradicts_rows = [r for r in rows if r.get("_contradicts")]
-    other_rows = [r for r in rows if not r.get("_contradicts")]
-
-    ratio = max_fraction / (1 - max_fraction)  # solves contradicts/(contradicts+other) <= max_fraction
-    max_contradicts = int(len(other_rows) * ratio)
-    kept_contradicts = (random.sample(contradicts_rows, max_contradicts)
-                         if len(contradicts_rows) > max_contradicts else contradicts_rows)
-
-    result = other_rows + kept_contradicts
-    random.shuffle(result)
-    for r in result:
-        r.pop("_contradicts", None)
-
-    print(f"Downsampled CONTRADICTS=yes rows in {filepath}: "
-          f"{len(contradicts_rows)} -> {len(kept_contradicts)} "
-          f"(of {len(rows)} total, capped at {max_fraction:.0%})", flush=True)
-
-    with open(filepath, "w") as f:
-        for row in result:
-            f.write(json.dumps(row) + "\n")
-    return len(result)
-
-
-def strip_contradicts_field_in_place(filepath):
-    """Removes the transient "_contradicts" key (see make_real_example)
-    from every row without changing which rows are kept - used on the val
-    file, which stays at its natural/unbalanced distribution (see
-    downsample_contradicts_in_place's docstring for why train differs)."""
-    with open(filepath) as f:
-        rows = [json.loads(line) for line in f]
-    for r in rows:
-        r.pop("_contradicts", None)
-    with open(filepath, "w") as f:
-        for row in rows:
-            f.write(json.dumps(row) + "\n")
-
-
-def rebalance_by_direction(examples):
-    """Undersamples down to the minority class's count, so BUY/SELL/
-    HOLD are equally represented. Undersampling (not duplicating the
-    minority classes up) is deliberate - this project has already run into
-    a real overfitting problem from repeated content once (see the
-    synthetic generator's template-count history), and duplicating real
-    rows to pad a minority class would risk the same thing here. The cost
-    is fewer total rows; that's an accepted tradeoff for a dataset this is
-    only ever meant to be a supplement to, not the primary training set."""
-    by_direction = {}
+    Overreaction rows are structurally rare in real data (~5% combined,
+    see calibrate_reaction_thresholds.py and the REACTION_* constants'
+    own comment) - unlike good/bad/neutral, undersampling them down to
+    the smallest class the way the old rebalance_by_direction did would
+    throw away most of the real overreaction signal this dataset exists
+    to capture. Instead: keep every overreaction row, and undersample
+    each of good/bad/neutral down to whichever is larger of 30 or the
+    combined overreaction count - so the majority classes don't swamp the
+    dataset, without artificially forcing them down to the overreaction
+    classes' own (deliberately small) size. generate_synthetic_dataset.py's
+    REACTION_WEIGHTS carries the actual oversampling load for the rare
+    classes; this just keeps real data from being 90%+ good/bad/neutral."""
+    by_reaction = {}
+    other_rows = []
     for ex in examples:
-        by_direction.setdefault(direction_of(ex), []).append(ex)
+        if ex.get("task") != "reaction":
+            other_rows.append(ex)
+            continue
+        by_reaction.setdefault(ex["news_reaction"], []).append(ex)
 
-    if not by_direction:
+    if not by_reaction:
         return examples
 
-    minority_count = min(len(rows) for rows in by_direction.values())
-    rebalanced = []
-    for rows in by_direction.values():
-        rebalanced.extend(random.sample(rows, minority_count))
+    overreaction_count = len(by_reaction.get("overreaction_down", [])) + len(by_reaction.get("overreaction_up", []))
+    target = max(30, overreaction_count)
+
+    rebalanced = list(other_rows)
+    before = {reaction: len(rows) for reaction, rows in by_reaction.items()}
+    for reaction, rows in by_reaction.items():
+        if reaction in ("overreaction_down", "overreaction_up"):
+            rebalanced.extend(rows)  # keep all
+        else:
+            n = min(len(rows), target)
+            rebalanced.extend(random.sample(rows, n))
     random.shuffle(rebalanced)
 
-    before = {d: len(rows) for d, rows in by_direction.items()}
-    print(f"Rebalanced train set by direction: {before} -> {minority_count} each ({minority_count * len(by_direction)} total)", flush=True)
+    print(f"Rebalanced Task A rows by news_reaction: {before} -> target {target} for good/bad/neutral, "
+          f"all kept for overreaction_* ({len(rebalanced)} total incl. {len(other_rows)} unrebalanced Task B rows)", flush=True)
     return rebalanced
 
 
 def rebalance_file_in_place(filepath):
     with open(filepath) as f:
         rows = [json.loads(line) for line in f]
-    rebalanced = rebalance_by_direction(rows)
+    rebalanced = rebalance_task_a(rows)
     with open(filepath, "w") as f:
         for row in rebalanced:
             f.write(json.dumps(row) + "\n")
@@ -2561,14 +2798,6 @@ def rebalance_file_in_place(filepath):
 
 def main():
     generate_and_write()
-
-    # Downsample CONTRADICTS=yes rows BEFORE rebalancing by direction (see
-    # history item 7 above) - runs first so rebalance_by_direction's
-    # minority-class count is computed on the post-downsample set, not
-    # skewed by whichever direction the discarded contradicts rows happened
-    # to lean toward. Train only, same reasoning as the rebalance below.
-    downsample_contradicts_in_place(OUTPUT_TRAIN_FILE)
-    strip_contradicts_field_in_place(OUTPUT_VAL_FILE)
 
     # Rebalance train only - an artificially-balanced val set would give a
     # less honest read of real-world performance than val's actual (skewed)
