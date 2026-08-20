@@ -163,11 +163,71 @@ REASONING_RE = re.compile(r'"reasoning"\s*:\s*"((?:[^"\\]|\\.)*)"')
 # forbids. Not a full correctness check (an evasive or vacuous answer
 # would pass this too), just the sharpest, cheapest signal available
 # without a second model-as-judge call.
+#
+# Revised 2026-08-20 (v1 fine-tune eval): the original version was a
+# bare \b(word)\b search with no negation awareness and no allowance
+# for common hyphenated finance jargon - confirmed live, EVERY ONE of a
+# batch of 19 rows a real eval run flagged turned out to be a false
+# positive on manual read-through, from two bug classes:
+#   1. \b treats a hyphen (and a plain space) as a word boundary, so
+#      "sell-out"/"sell out"/"sell-off"/"short-term"/"buy-in" (all
+#      completely benign, common finance vocabulary) matched the bare
+#      trigger word inside them - fixed by requiring "short"/"shorting"
+#      appear with an actual object (short(?:ing)? the stock/it/shares/
+#      a position) instead of as a bare word at all (this alone removes
+#      "short-term"/"short report"/"in short" as false-trigger sources),
+#      and by a negative lookahead (_BENIGN_COMPOUND_SUFFIX_RE) excluding
+#      the sell/buy compounds.
+#   2. No negation/hedge handling - "doesn't look like a buy", "selling
+#      now may be premature", and the model's own "...which runs counter
+#      to a SELL outlook. However, the valuation..." pivot phrasing (the
+#      model correctly acknowledging a conflicting individual signal
+#      before reconciling toward the given recommendation - sophisticated,
+#      CORRECT reasoning, not a contradiction) were all flagged despite
+#      not actually advising the opposite action. _NEGATION_CUE_RE,
+#      checked in a window around each match (not just before it - some
+#      of these cues land after, e.g. "selling now may be premature"),
+#      addresses this.
+# Verified empirically against all 19 original false positives (now 0/19
+# flagged) AND five constructed genuine-contradiction cases (still 5/5
+# caught) before landing this - see the PR description/commit for the
+# actual test script, not committed here since it's a one-off validation
+# aid, not part of the eval pipeline itself.
+_BENIGN_COMPOUND_SUFFIX_RE = r"(?![\s-](?:out|off|side|in)\b)"
+_NEGATION_CUE_RE = re.compile(
+    r"n['’]t\b|\b(?:not|no|never|rather than|instead of|more attractive than|"
+    r"premature|avoid|against|however|but|despite|nevertheless|nonetheless|"
+    r"missed opportunity|counter to|weak (?:or indirect )?signal|indirect signal)\b",
+    re.IGNORECASE,
+)
 _OPPOSITE_ACTION_WORDS = {
-    "BUY": re.compile(r"\b(sell|selling|short|shorting|exit|take profits?)\b", re.IGNORECASE),
-    "SELL": re.compile(r"\b(buy|buying|accumulate|accumulating|add(?:ing)? (?:shares|to (?:a |the )?position)|initiate a (?:buy|long) position)\b", re.IGNORECASE),
+    "BUY": re.compile(
+        rf"\b(sell|selling|exit|take profits?)\b{_BENIGN_COMPOUND_SUFFIX_RE}"
+        r"|\bshort(?:ing)?\b\s+(?:the stock|it|shares|a position)\b"
+        r"|\bgo short\b|\binitiate a short\b|\bshort position\b",
+        re.IGNORECASE,
+    ),
+    "SELL": re.compile(
+        rf"\b(buy|buying|accumulate|accumulating|add(?:ing)? (?:shares|to (?:a |the )?position)|initiate a (?:buy|long) position)\b{_BENIGN_COMPOUND_SUFFIX_RE}",
+        re.IGNORECASE,
+    ),
     "HOLD": None,  # HOLD has no single "opposite" action to flag against
 }
+
+
+def _has_opposite_action_language(text: str, opposite_re, window: int = 100) -> bool:
+    """True if `text` contains real opposite-action language per
+    `opposite_re` - a match with no negation/hedge cue (n't, not,
+    however, counter to, etc. - see _NEGATION_CUE_RE) within `window`
+    characters on either side. See _OPPOSITE_ACTION_WORDS' own comment
+    for the false-positive classes this fixes and why the window checks
+    BOTH sides, not just the text before a match."""
+    for match in opposite_re.finditer(text):
+        span = text[max(0, match.start() - window):match.end() + window]
+        if _NEGATION_CUE_RE.search(span):
+            continue
+        return True
+    return False
 
 EVAL_SAMPLE_PER_SOURCE = 100
 VAL_FILES = {"synthetic": "dataset_val.jsonl", "real": "dataset_val_real.jsonl"}
@@ -324,7 +384,7 @@ def run_task_b_eval(label):
             stats["nonempty"] += 1
 
         opposite_re = _OPPOSITE_ACTION_WORDS.get(row["recommendation"])
-        contradicts = bool(opposite_re and (opposite_re.search(answer) or opposite_re.search(reasoning)))
+        contradicts = bool(opposite_re and (_has_opposite_action_language(answer, opposite_re) or _has_opposite_action_language(reasoning, opposite_re)))
         if not contradicts:
             stats["consistent"] += 1
         elif len(flagged_samples) < 20:
