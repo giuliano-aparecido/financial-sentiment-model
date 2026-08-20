@@ -669,14 +669,47 @@ _MOVE_VERB_RE_FRAGMENT = (
 # issue, not just a training-data one - a request whose top 4 raw RSS
 # results are all low-content headlines like these currently gives the
 # model nothing real to reason about).
+#
+# Confirmed via the 2026-08-20 fine-tune's Task A eval misclassifications
+# (real-data confusions were disproportionately headlines like these -
+# see docs/training-results-analysis.md): "Why Netflix (NFLX) Stock Is
+# Up Today" slipped through because the "shares are/is up/down/higher/
+# lower today" branch only recognized "shares" as the subject, not
+# "stock" - same MOVE_VERB-less gap the "why + move verb" branch above
+# has (bare "up"/"down"/"higher"/"lower" were never move VERBS, so
+# neither branch caught them). "Is Exxon Mobil (XOM) Still Attractive
+# After A 49% One Year Share Price Surge?" slipped through as a
+# rhetorical-question bait variant the existing "^Is .+ a Good Stock"
+# pattern didn't generalize to. Fixed narrowly (broadened subject word;
+# a second "^Is ... Still ... After ..." bait pattern) rather than
+# loosely - the second one in particular needed a real second pass: an
+# early version matching ANY "Is X Still Y After Z" shape false-
+# positived on genuine analysis headlines like "Is the Federal Reserve
+# Still Fighting Inflation After the Latest CPI Report Showed a Surprise
+# Uptick" (confirmed via this file's own adversarial check, not live) -
+# now requires the "After" clause to itself contain a price-move signal
+# (a percent figure, or rally/surge/drop/plunge/rout/gain/dip/slump/
+# rebound), which both real trigger cases have and a genuine macro/
+# analysis headline usually doesn't. See tests/test_generate_real_
+# dataset.py for the negative (must NOT match) cases that guard against
+# over-broadening this again. A
+# third observed shape - "JPMorgan Chase (JPM) Stock After 25% Yearly
+# Gain Is The Price Still Reasonable" (a mid-sentence declarative
+# variant of the same bait, not the "^Is..." question form) - is a KNOWN
+# GAP, deliberately left unfixed: a safe, narrow pattern for it wasn't
+# obvious without more real examples, and force-fitting one risked
+# catching genuinely substantive "after earnings, does the valuation
+# still make sense" analysis headlines along with it.
 _LOW_CONTENT_HEADLINE_RE = re.compile(
     r"stock (?:is )?trad(?:ing|es) (?:up|down|higher|lower)"
-    r"|shares (?:are|is) (?:up|down|higher|lower) today"
+    r"|(?:shares|stock) (?:are|is) (?:up|down|higher|lower) today"
     r"|here.s why|here.s what (?:investors|we|you) (?:need to know|see)"
     r"|what you need to know|laps the stock market|what.s going on with"
     rf"|\bwhy\b.{{0,60}}\b(?:stock|shares?)\b.{{0,30}}\b{_MOVE_VERB_RE_FRAGMENT}\b"
     rf"|\b(?:stock|shares?)\b.{{0,20}}\b(?:is|are)\b.{{0,10}}\b{_MOVE_VERB_RE_FRAGMENT}(?:ing)?\b"
-    r"|^Is .+ a Good Stock|Stock a (?:Good )?Buy\b|^Should You Buy|Buy,? Hold,? (?:or|and) Sell"
+    r"|^Is .+ a Good Stock"
+    r"|^Is .{1,60}\bStill\b.{1,25}\bAfter\b.{0,40}(?:\d+%|rally|surge|drop|plunge|rout|gain|dip|slump|rebound)"
+    r"|Stock a (?:Good )?Buy\b|^Should You Buy|Buy,? Hold,? (?:or|and) Sell"
     r"|^\d+ (?:Reasons?|Stocks?)|Better Buy|Zacks (?:Investment|Rank)|Trending Stock"
     r"|shares (?:added to|removed from|acquired by|sold by|purchased by)"
     r"|^[\d,]+\+? Shares (?:in|of)|(?:Buys|Purchases?|Sells) Shares (?:in|of)"
