@@ -1,13 +1,28 @@
-"""Empirically measures the 3-trading-day and 21-trading-day forward-return
-distributions for the real dataset's 40 tickers, to pick thresholds for the
-5-class news_reaction labeling (good/bad/neutral/overreaction_down/
-overreaction_up) used by generate_real_dataset.py's label_news_reaction
-(Task A of the two-stage pipeline - see the plan file for the full
-architecture).
+"""Empirically measures the single-day (move_1d) and 21-trading-day
+forward-return distributions for the real dataset's 40 tickers, to pick
+thresholds for the 5-class news_reaction labeling (good/bad/neutral/
+overreaction_down/overreaction_up) used by generate_real_dataset.py's
+label_news_reaction (Task A of the two-stage pipeline - see the plan file
+for the full architecture).
+
+Re-run 2026-08-20 against move_1d (day-0/publish-day close vs. the
+preceding trading day's close) instead of the original move_3d
+(3-trading-day forward cumulative window) - see generate_real_dataset.py's
+history item 12 for why: a 3-day cumulative window was found to dilute
+fast-reverting crashes (a >10% same-day drop that mostly reverses within 2
+days read as only ~-6% under the old window), and wasn't reproducible at
+real inference time for a brand-new headline anyway. The candidate grids
+below are widened downward from the original 2026-08-19 run's, since
+single-day return volatility is smaller in magnitude than 3-day
+cumulative for the same underlying "genuinely large move" - re-verify
+against this run's actual measured distribution, don't assume the old
+grids still bracket the right answer.
 
 Zero Gemini cost: only touches yfinance price history, same pattern as
-diagnose_return_distribution.py (which settled the earlier +/-8% BUY/SELL
-threshold the same way). Read-only: doesn't write dataset_train_real.jsonl/
+the now-deleted diagnose_return_distribution.py (which settled the
+earlier +/-8% BUY/SELL threshold the same way, then went dead on this
+branch once label_from_forward_return was retired). Read-only: doesn't
+write dataset_train_real.jsonl/
 dataset_val_real.jsonl.
 
 Imports measure_reaction_windows/classify_reaction directly from
@@ -38,12 +53,16 @@ from generate_real_dataset import (
 
 SAMPLES_PER_TICKER = 18  # matches LOOKBACK_WEEKS - one anchor date per weekly window
 
-# Candidate threshold grids swept below - see the plan file's Phase 0 for
-# the starting-default rationale (3% ~= 1 stdev of the 3-day return
-# distribution by sqrt-time scaling from the measured 63-day 15.3% stdev;
-# 6% ~= 2 stdev; 0.5 retracement = "more than half the move given back").
-GOOD_BAD_CANDIDATES = (0.02, 0.03, 0.04, 0.05)
-OVERREACTION_MOVE_CANDIDATES = (0.05, 0.06, 0.07, 0.08)
+# Candidate threshold grids swept below - widened downward from the
+# original 3-day-window run's (0.02-0.05 / 0.05-0.08) since single-day
+# return volatility is structurally smaller in magnitude than 3-day
+# cumulative for the same z-score; this run's own printed distribution
+# (percentiles/stdev) is the actual source of truth, these are just a
+# generous starting bracket. Retracement fraction is scale-invariant (a
+# FRACTION of move_1d, not an absolute return) so unchanged from before -
+# the original run found it barely moved class counts across 0.4-0.6.
+GOOD_BAD_CANDIDATES = (0.01, 0.015, 0.02, 0.025, 0.03)
+OVERREACTION_MOVE_CANDIDATES = (0.03, 0.04, 0.05, 0.06, 0.07)
 RETRACEMENT_FRACTION_CANDIDATES = (0.4, 0.5, 0.6)
 
 # Acceptance band from the plan: combined overreaction classes should be a
@@ -55,10 +74,10 @@ NEUTRAL_FRACTION_BAND = (0.25, 0.45)
 
 
 class Sample:
-    __slots__ = ("move_3d", "move_21d", "overreaction_assessable")
+    __slots__ = ("move_1d", "move_21d", "overreaction_assessable")
 
-    def __init__(self, move_3d, move_21d, overreaction_assessable):
-        self.move_3d = move_3d
+    def __init__(self, move_1d, move_21d, overreaction_assessable):
+        self.move_1d = move_1d
         self.move_21d = move_21d
         self.overreaction_assessable = overreaction_assessable
 
@@ -75,13 +94,13 @@ def sample_ticker(ticker, name):
     skip_reasons = []
     for after_date, before_date in weekly_windows():
         anchor = datetime.datetime.combine(after_date, datetime.time(12, 0), tzinfo=datetime.timezone.utc)
-        move_3d, move_21d, overreaction_assessable, skip_reason = measure_reaction_windows(
+        move_1d, move_21d, overreaction_assessable, skip_reason = measure_reaction_windows(
             ticker_obj, anchor, earnings_dates,
         )
         if skip_reason is not None:
             skip_reasons.append(skip_reason)
             continue
-        samples.append(Sample(move_3d, move_21d, overreaction_assessable))
+        samples.append(Sample(move_1d, move_21d, overreaction_assessable))
     print(f"  [{ticker}] {len(samples)}/{SAMPLES_PER_TICKER} samples collected", flush=True)
     return samples, skip_reasons
 
@@ -131,23 +150,23 @@ def main():
         print("No samples collected - aborting.")
         return
 
-    print_distribution("3-trading-day move", [s.move_3d for s in all_samples])
+    print_distribution("single-day move", [s.move_1d for s in all_samples])
 
     assessable_with_21d = [s for s in all_samples if s.overreaction_assessable and s.move_21d is not None]
     print(f"\nOverreaction-assessable samples with a full 21-day window: {len(assessable_with_21d)}/{n}")
 
-    # Retracement distribution for large movers only (|move_3d| >= the
+    # Retracement distribution for large movers only (|move_1d| >= the
     # smallest overreaction-move candidate) - the population any
     # OVERREACTION_MOVE_THRESHOLD choice would actually draw from.
-    large_movers = [s for s in assessable_with_21d if abs(s.move_3d) >= min(OVERREACTION_MOVE_CANDIDATES)]
+    large_movers = [s for s in assessable_with_21d if abs(s.move_1d) >= min(OVERREACTION_MOVE_CANDIDATES)]
     down_retracements = [
-        (s.move_21d - s.move_3d) / abs(s.move_3d) for s in large_movers if s.move_3d < 0
+        (s.move_21d - s.move_1d) / abs(s.move_1d) for s in large_movers if s.move_1d < 0
     ]
     up_retracements = [
-        (s.move_3d - s.move_21d) / s.move_3d for s in large_movers if s.move_3d > 0
+        (s.move_1d - s.move_21d) / s.move_1d for s in large_movers if s.move_1d > 0
     ]
-    print_distribution(f"Retracement fraction, down-movers (|move_3d| >= {min(OVERREACTION_MOVE_CANDIDATES)*100:.0f}%)", down_retracements)
-    print_distribution(f"Retracement fraction, up-movers (|move_3d| >= {min(OVERREACTION_MOVE_CANDIDATES)*100:.0f}%)", up_retracements)
+    print_distribution(f"Retracement fraction, down-movers (|move_1d| >= {min(OVERREACTION_MOVE_CANDIDATES)*100:.0f}%)", down_retracements)
+    print_distribution(f"Retracement fraction, up-movers (|move_1d| >= {min(OVERREACTION_MOVE_CANDIDATES)*100:.0f}%)", up_retracements)
 
     print("\nClass-count grid (X=good/bad threshold, Y=overreaction move threshold, Z=retracement fraction):")
     print(f"Acceptance band: overreaction {OVERREACTION_FRACTION_BAND[0]*100:.0f}-{OVERREACTION_FRACTION_BAND[1]*100:.0f}%, "
@@ -161,7 +180,7 @@ def main():
             for z in RETRACEMENT_FRACTION_CANDIDATES:
                 counts = {"good": 0, "bad": 0, "neutral": 0, "overreaction_down": 0, "overreaction_up": 0}
                 for s in all_samples:
-                    label = classify_reaction(s.move_3d, s.move_21d, s.overreaction_assessable, x, y, z)
+                    label = classify_reaction(s.move_1d, s.move_21d, s.overreaction_assessable, x, y, z)
                     counts[label] += 1
                 overreaction_n = counts["overreaction_down"] + counts["overreaction_up"]
                 overreaction_frac = overreaction_n / n

@@ -4,9 +4,11 @@ retired label_from_forward_return scheme - 63-trading-day, earnings-
 truncated, +/-8% thresholds) into Task B (task="analysis") rows for the
 two-stage pipeline, at ZERO Gemini cost: the Gemini-written `reasoning`/
 `answer` prose in these rows describes the HEADLINE itself, which hasn't
-changed - it's reused as-is. Only `news_reaction` (re-labeled via the new
-3-trading-day label_news_reaction) and `recommendation` (recomputed via
-fusion_rules.fuse(), never reused from the old row) are new.
+changed - it's reused as-is. Only `news_reaction` (re-labeled via the
+current label_news_reaction - single-day move as of 2026-08-20, see
+generate_real_dataset.py's module docstring history item 12) and
+`recommendation` (recomputed via fusion_rules.fuse(), never reused from
+the old row) are new.
 
 Real headline recovery: each old row's `news` block mixes the one real
 (signal) headline in with 1-3 fixed NOISE_HEADLINES entries, shuffled
@@ -17,15 +19,15 @@ Rows where this can't be uniquely resolved are dropped, not guessed at.
 
 Consistency filter (the actual reason this needs care, not just a
 mechanical field rename): the measurement window changed completely (63
-trading days -> 3), so the OLD row's Gemini-written reasoning - written to
-justify a conclusion drawn from a 63-day price move - has no guarantee of
-still matching what fuse() computes from a freshly re-labeled 3-day
-reaction. Rather than pairing possibly-inconsistent prose with a new
-label, this script KEEPS a converted row only when the old row's original
-recommendation happens to already agree with fuse()'s fresh output -
-report the match rate; a low rate is real, informative signal about how
-much the redesign actually changed labeling, not a bug to "fix" by
-forcing a keep.
+trading days -> now a single day, via two intermediate redesigns), so the
+OLD row's Gemini-written reasoning - written to justify a conclusion drawn
+from a 63-day price move - has no guarantee of still matching what fuse()
+computes from a freshly re-labeled single-day reaction. Rather than
+pairing possibly-inconsistent prose with a new label, this script KEEPS a
+converted row only when the old row's original recommendation happens to
+already agree with fuse()'s fresh output - report the match rate; a low
+rate is real, informative signal about how much the redesign actually
+changed labeling, not a bug to "fix" by forcing a keep.
 
 Zero Gemini cost, zero new dataset regeneration - read-only against
 yfinance (for label_news_reaction's price history) and the two existing
@@ -105,7 +107,7 @@ def convert_file(in_path, out_path):
         earnings_dates = fundamentals_cache[ticker].get("earnings_dates")
 
         published_at = datetime.datetime.combine(published_date, datetime.time(12, 0), tzinfo=datetime.timezone.utc)
-        reaction, move_3d, _move_21d, skip_reason = label_news_reaction(ticker_obj, published_at, earnings_dates)
+        reaction, move_1d, _move_21d, skip_reason = label_news_reaction(ticker_obj, published_at, earnings_dates)
         if reaction is None:
             dropped[f"relabel_failed:{skip_reason}"] += 1
             continue
@@ -121,7 +123,7 @@ def convert_file(in_path, out_path):
             "task": "analysis",
             "ticker": ticker,
             "user_query": row["user_query"],
-            "price_context": price_context_block(ticker, move_3d),
+            "price_context": price_context_block(ticker, move_1d),
             "market_data": row["market_data"],
             "valuation": row["valuation"],
             "earnings": row["earnings"],

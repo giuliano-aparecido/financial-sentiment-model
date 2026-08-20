@@ -2391,30 +2391,42 @@ def _fusion_explanation(ticker, reaction, fusion_result, gap_pct):
 
 def price_context_block(ticker, move_pct):
     """Canonical phrasing shared with generate_real_dataset.py's
-    identically-named function and financial-sentiment-api's
-    recent_price_move() (ported, not imported - this file's own long-
-    standing "ported, not imported" convention for the DCF math above
-    applies here too)."""
-    return f"{ticker} moved {move_pct:+.1f}% over the last 3 trading days."
+    identically-named function and financial-sentiment-api's planned
+    per-headline date-specific price lookup (ported, not imported - this
+    file's own long-standing "ported, not imported" convention for the
+    DCF math above applies here too). Single-day phrasing since 2026-08-20
+    (see generate_real_dataset.py's module docstring history item 12) -
+    was "over the last 3 trading days.", now the single publish-day close-
+    to-close move, matching what's actually reproducible at inference time
+    for a brand-new headline."""
+    return f"{ticker} moved {move_pct:+.1f}% on the day this was published."
 
 
 def _fabricate_move_pct(reaction):
-    """Fabricated 3-day price move consistent with `reaction`'s class -
-    the actual training signal for overreaction_down/up is the (modest
-    headline, outsized move) MISMATCH, so those two ranges are
+    """Fabricated single-day price move consistent with `reaction`'s
+    class - the actual training signal for overreaction_down/up is the
+    (modest headline, outsized move) MISMATCH, so those two ranges are
     deliberately much larger than good/bad's, and clearly separated from
     every other class so a given row is never ambiguous about which class
-    it's demonstrating."""
+    it's demonstrating. Rescaled 2026-08-20 for the single-day move
+    redefinition (generate_real_dataset.py history item 12) - single-day
+    return magnitudes are structurally smaller than the old 3-day
+    cumulative window's, per calibrate_reaction_thresholds.py's re-run
+    (717 real samples: p90 +3.2%, p95 +4.8%, stdev 2.4%). Ranges keep the
+    same ordering/separation shape as the old 3-day ranges (3.0-8.0 /
+    -8.0--3.0 / -2.5-2.5 / -15.0--8.0 / 8.0-15.0), scaled down to sit
+    around the new REACTION_GOOD_BAD_THRESHOLD=1%/REACTION_OVERREACTION_
+    MOVE_THRESHOLD=3% boundaries instead of the old 2%/5%."""
     if reaction == "good":
-        return round(random.uniform(3.0, 8.0), 1)
+        return round(random.uniform(1.2, 2.8), 1)
     if reaction == "bad":
-        return round(random.uniform(-8.0, -3.0), 1)
+        return round(random.uniform(-2.8, -1.2), 1)
     if reaction == "neutral":
-        return round(random.uniform(-2.5, 2.5), 1)
+        return round(random.uniform(-0.8, 0.8), 1)
     if reaction == "overreaction_down":
-        return round(random.uniform(-15.0, -8.0), 1)
+        return round(random.uniform(-9.0, -3.2), 1)
     if reaction == "overreaction_up":
-        return round(random.uniform(8.0, 15.0), 1)
+        return round(random.uniform(3.2, 9.0), 1)
     raise ValueError(f"Unknown reaction: {reaction!r}")
 
 

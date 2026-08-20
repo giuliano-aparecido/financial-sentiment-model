@@ -228,6 +228,51 @@ got on synthetic val):
     recap headline states the very move the label is derived from, a
     shortcut-learning risk). Now filtered out of process_ticker's
     candidate loop entirely before make_real_example ever sees them.
+12. Single-day move redefinition (2026-08-20, user feedback): the
+    "immediate move" behind news_reaction was a 3-trading-day FORWARD
+    cumulative window from the headline's publish date. Confirmed live
+    (user's own SIGN.SW example: CEO-change headline, >10% drop the SAME
+    day, +4% recovery over the next two days) that this dilutes/nets out
+    exactly the fast-reverting crashes that make the clearest overreaction
+    cases - a >10% same-day crash that mostly reverses within 2 days
+    reads as only ~-6% under a 3-day cumulative window. Also: a 3-day
+    FORWARD window is unreproducible at real inference time for a
+    brand-new headline (no "after" exists yet) - production was papering
+    over this with a 3-day TRAILING approximation instead, a genuine
+    train/inference mismatch. Replaced with move_1d: the single day-0
+    (publish day, or the next trading day if published after close/on a
+    weekend) close vs. the immediately preceding trading day's close -
+    real, already-happened data, computed identically in training and at
+    inference (see financial-sentiment-api's planned per-headline date-
+    specific price lookup). move_21d keeps its role as the retracement
+    check (training-label-only, inherently retrospective, never shown to
+    the model) but is now anchored to the SAME baseline as move_1d (the
+    pre-headline close) instead of day-0's own close, so the retracement
+    fraction stays an apples-to-apples comparison. REACTION_GOOD_BAD_
+    THRESHOLD/REACTION_OVERREACTION_MOVE_THRESHOLD/REACTION_RETRACEMENT_
+    FRACTION were re-calibrated against the new move_1d distribution via
+    calibrate_reaction_thresholds.py (717 samples, 40 tickers): X=1%/
+    Y=3%/Z=0.5, down from the old 3-day-window X=2%/Y=5%/Z=0.5, since
+    single-day volatility is smaller in magnitude than 3-day cumulative -
+    same "measure it, don't guess it" precedent as item 10's original
+    calibration.
+13. Relevance pre-filter (2026-08-20, user feedback): the existing
+    publisher/shape filters (LOW_QUALITY_PUBLISHERS, item 11's
+    _is_low_content_headline) catch bad sources and bad shapes, but not
+    well-sourced, well-shaped headlines that simply aren't about this
+    company - a generic macro roundup or a different company's earnings
+    could still become the PRIMARY headline for a row, especially now that
+    each row is built from a single headline (no other real headline in
+    the window to fall back on). Added _is_relevant_headline: passes if
+    the headline names the company or its ticker, OR matches a sector/
+    industry keyword (SECTOR_KEYWORDS, keyed by the same yfinance .info
+    sector string fetch_ticker_fundamentals_history already fetches -
+    "if the news are related to the market the company is at (oil,
+    technology, AI, space, etc)" per the user's own framing). Wired into
+    process_ticker's per-headline loop alongside the existing filters,
+    same skip-reason-tracking pattern ("not_relevant"). A headline that
+    fails this check is dropped entirely - never reaches make_real_example
+    - not forced into a neutral-labeled row.
 
 Earlier history: this script originally used yfinance's Ticker.news for
 headlines, which only returns the current "latest ~10" items with no
@@ -434,22 +479,22 @@ TICKERS = [
 # way META/BA alone could.
 VAL_HOLDOUT_TICKERS = {"META", "BA", "JPM", "XOM", "KO", "NFLX"}
 
-# news_reaction classification thresholds, picked by calibrate_reaction_
-# thresholds.py (2026-08-19, 653 usable samples across these 40 tickers -
-# see that script for the full grid and methodology, same "measure it,
-# don't guess it" precedent as the old BUY_THRESHOLD/SELL_THRESHOLD had).
-# X=2%/Y=5%/Z=0.5 was the closest fit to the target acceptance band
-# (overreaction 5-12% of rows, neutral 25-45%): measured neutral=45.2%
-# (0.2 points over the nominal 45% edge, within the sampling noise of 653
-# rows) and overreaction=5.4% (35 rows), comfortably past the 5% floor.
-# The retracement fraction (Z) turned out strongly bimodal in the real
-# data - a large mover either mostly round-trips within 21 trading days or
-# keeps drifting, with very few landing near a 40-60% partial retrace - so
-# Z barely moved the class counts across the whole 0.4-0.6 sweep; treat it
-# as confirmed non-critical, not a precisely-tuned cutoff.
-REACTION_GOOD_BAD_THRESHOLD = 0.02             # |move_3d| >= this -> good/bad
-REACTION_OVERREACTION_MOVE_THRESHOLD = 0.05    # |move_3d| >= this -> overreaction CANDIDATE
-REACTION_RETRACEMENT_FRACTION = 0.5            # fraction of move_3d retraced by day 21 -> confirmed overreaction
+# news_reaction classification thresholds - recalibrated 2026-08-20 for
+# the single-day move redefinition (see history item 12 below), replacing
+# the OLD 3-trading-day-window calibration (2026-08-19, 653 samples,
+# X=2%/Y=5%/Z=0.5). Re-run of calibrate_reaction_thresholds.py against
+# move_1d (717 samples, 40 tickers) found only 3/75 swept combos meeting
+# the acceptance band (overreaction 5-12%, neutral 25-45% of labelable
+# rows), all sharing X=1%/Y=3% (Z barely moved class counts, same weak-
+# discriminator finding as the original run - Z=0.5 kept as the middle
+# candidate). Single-day moves are smaller-magnitude than the old 3-day
+# cumulative window (measured stdev 2.4%), hence lower absolute
+# thresholds. Same "measure it, don't guess it" precedent as the old
+# BUY_THRESHOLD/SELL_THRESHOLD had - do not hand-tune these without
+# re-running that script.
+REACTION_GOOD_BAD_THRESHOLD = 0.01             # |move_1d| >= this -> good/bad
+REACTION_OVERREACTION_MOVE_THRESHOLD = 0.03    # |move_1d| >= this -> overreaction CANDIDATE
+REACTION_RETRACEMENT_FRACTION = 0.5            # fraction of move_1d retraced by day 21 -> confirmed overreaction
 
 # 21 trading days -> calendar days (5 trading days/week) + a flat 10-day
 # cushion for holidays/gaps - sized for label_news_reaction's 21-trading-
@@ -458,12 +503,23 @@ REACTION_RETRACEMENT_FRACTION = 0.5            # fraction of move_3d retraced by
 # no longer come from this file at all - see history item 10 above).
 REACTION_WINDOW_CALENDAR_BUFFER_DAYS = 21 * 7 // 5 + 10
 
+# How many calendar days of price history to fetch BEFORE the published
+# date, so measure_reaction_windows can always find at least one prior
+# trading day's close to anchor move_1d against - sized past the longest
+# normal gap in a trading calendar (a 3-day weekend abutting a holiday),
+# with margin.
+PRE_PUBLISH_BUFFER_DAYS = 7
+
 # Earnings-truncation guard for label_news_reaction (see that function's
-# own docstring): a real earnings report inside trading days 1-3 after the
-# headline contaminates move_3d itself (full skip); inside days 4-21 it
-# only contaminates the day-21 retracement check (good/bad/neutral still
-# usable, overreaction_* is not).
-EARNINGS_WITHIN_3D_SKIP_DAYS = 3
+# own docstring): a real earnings report landing on the SAME trading day
+# as the headline (day 0) contaminates move_1d itself - the single-day
+# move can't be attributed to this headline specifically vs. the earnings
+# report (full skip). A report landing days 1-21 after day 0 only
+# contaminates the day-21 retracement check (good/bad/neutral off move_1d
+# is still trustworthy, overreaction_* is not). Was EARNINGS_WITHIN_3D_
+# SKIP_DAYS=3 under the old 3-trading-day window; day 0 is the only day
+# move_1d can be contaminated on now that the window is a single day.
+EARNINGS_WITHIN_1D_SKIP_DAYS = 0
 EARNINGS_UNASSESSABLE_DAYS = 21
 
 # Gates the Gemini-costing half of this pipeline (Task B: reasoning/answer
@@ -633,6 +689,91 @@ _LOW_CONTENT_HEADLINE_RE = re.compile(
 def _is_low_content_headline(title: str) -> bool:
     return bool(_LOW_CONTENT_HEADLINE_RE.search(title))
 
+
+# Yahoo Finance .info `sector` strings -> lowercase keywords whose presence
+# in a headline suggests it's about the company's broader market even
+# without naming the company/ticker directly (e.g. "OPEC agrees to cut oil
+# output" is relevant to XOM even though it never says "Exxon"). Starter
+# list from the redesign plan (docs/two-stage-task-a-redesign-plan.md item
+# 2) - covers only the sectors actually present in TICKERS above; expect
+# this to need live refinement against real headlines the same way
+# LOW_QUALITY_PUBLISHERS/_is_low_content_headline did (3-4 rounds each,
+# see those constants' own history notes). A ticker whose sector isn't
+# listed here just falls back to name/ticker-only matching in
+# _is_relevant_headline below, which is always checked first regardless.
+SECTOR_KEYWORDS = {
+    "Technology": {
+        "ai", "artificial intelligence", "chip", "chips", "semiconductor",
+        "software", "cloud", "cybersecurity", "data center", "data centers",
+    },
+    "Communication Services": {
+        "streaming", "advertising", "ad revenue", "social media", "telecom",
+        "wireless", "broadband", "5g",
+    },
+    "Consumer Cyclical": {
+        "retail sales", "consumer spending", "e-commerce", "auto sales",
+        "vehicle sales", "electric vehicle", "tariff", "tariffs",
+    },
+    "Consumer Defensive": {
+        "retail sales", "consumer spending", "grocery", "beverage",
+    },
+    "Financial Services": {
+        "rate hike", "rate cut", "federal reserve", "fed", "banking",
+        "interest rates", "credit", "payments", "fintech",
+    },
+    "Industrials": {
+        "aerospace", "defense", "manufacturing", "supply chain", "factory",
+        "airline", "aviation",
+    },
+    "Energy": {
+        "oil", "gas", "crude", "opec", "drilling", "refinery", "pipeline",
+    },
+    "Healthcare": {
+        "drug", "fda", "clinical trial", "biotech", "pharma", "vaccine",
+    },
+}
+
+# Precompiled per-sector regex (word-boundary, case-insensitive) - built
+# once at import time rather than re.search-ing every keyword individually
+# per headline. Word boundaries matter: a naive substring check on "ai"
+# or "oil" would false-positive on "said"/"maintain"/"turmoil"/"Vegas".
+SECTOR_KEYWORD_PATTERNS = {
+    sector: re.compile(
+        r"\b(?:" + "|".join(re.escape(k) for k in sorted(keywords, key=len, reverse=True)) + r")\b",
+        re.IGNORECASE,
+    )
+    for sector, keywords in SECTOR_KEYWORDS.items()
+}
+
+
+def _is_relevant_headline(ticker: str, name: str, sector, title: str) -> bool:
+    """True if `title` plausibly concerns `ticker`'s company or its sector -
+    the redesign plan's relevance pre-filter (docs/two-stage-task-a-
+    redesign-plan.md item 2). The earlier publisher/shape filters above
+    catch bad SOURCES and bad SHAPES, not well-sourced, well-shaped
+    headlines that simply aren't about this company (a generic macro
+    roundup, a different company's earnings) - this is a different problem
+    from either. Checked in order: (1) company name substring (case-
+    insensitive - "Apple", "General Motors"), (2) ticker as a standalone,
+    case-SENSITIVE token (tickers are conventionally all-caps in real
+    headlines - "$TSLA", "(NVDA)" - a case-INsensitive check on short
+    tickers like V/F/MA/GS would false-positive on ordinary English words),
+    (3) sector keyword match via SECTOR_KEYWORD_PATTERNS, if this ticker's
+    sector has an entry. A headline matching none of these is dropped in
+    process_ticker before pricing/classification - never reaching Task A
+    (falls through to no example for that headline, same as the other
+    pre-filters; NOT forced into a neutral-labeled row for a headline that
+    was never even about the company)."""
+    title_lower = title.lower()
+    if name.lower() in title_lower:
+        return True
+    if re.search(rf"\b{re.escape(ticker)}\b", title):
+        return True
+    keyword_pattern = SECTOR_KEYWORD_PATTERNS.get(sector)
+    if keyword_pattern is not None and keyword_pattern.search(title):
+        return True
+    return False
+
 # Reused verbatim from generate_synthetic_dataset.py.
 USER_QUESTION_TEMPLATES = [
     "Will ${ticker} go up or down based on recent news?",
@@ -794,23 +935,43 @@ def fetch_headlines_for_window(ticker, name, after_date, before_date):
 
 
 def measure_reaction_windows(ticker_obj, published_at, earnings_dates=None):
-    """Returns (move_3d, move_21d, overreaction_assessable, skip_reason).
+    """Returns (move_1d, move_21d, overreaction_assessable, skip_reason).
     skip_reason is None on success, otherwise "no_date",
     "history_fetch_failed", "insufficient_history", or
-    "earnings_within_3d".
+    "earnings_within_1d".
 
-    move_3d/move_21d are None on failure. move_21d is also None (but
-    move_3d still usable) when there isn't yet 21 trading days of history
-    in the fetched window - a normal outcome for a very recent headline,
-    not a failure.
+    move_1d is the SINGLE trading day's close-to-close reaction: "day 0"'s
+    close (the first trading day on or after published_at's date - so a
+    headline published after close, or on a weekend/holiday, correctly
+    rolls forward to the next real trading day) vs. the immediately
+    PRECEDING trading day's close. Changed 2026-08-20 from a 3-trading-day
+    forward-cumulative window - confirmed live (user's own SIGN.SW
+    example: a CEO-change headline, >10% drop the SAME day, +4% over the
+    next two days) that a multi-day cumulative window dilutes/nets out
+    exactly the fast-reverting crashes that are the clearest overreaction
+    signal, understating a move the single day alone makes obvious. This
+    also matches what's actually available in production: a per-headline
+    day-of-publish move is real, already-happened data, computable at
+    inference time the same way it's computed here for training - unlike
+    the OLD training-time 3-day figure, which measured price action
+    AFTER the headline and could never be reproduced live for a
+    just-published story.
+
+    move_21d is measured from the SAME baseline as move_1d (the preceding
+    trading day's close, not day 0's own close) - so classify_reaction's
+    retracement check compares apples to apples: "how far from where it
+    started before the news, at day 0 vs. at day 21." move_21d is None
+    when there isn't yet 21 trading days of history past day 0 in the
+    fetched window - a normal outcome for a very recent headline, not a
+    failure (move_1d is still usable).
 
     overreaction_assessable is False when a real earnings report falls
-    inside trading days 4-21 after the headline - move_3d (and therefore
+    inside trading days 1-21 after day 0 - move_1d (and therefore
     good/bad/neutral) is still trustworthy since the report hadn't landed
     yet, but a day-21 retracement can't be trusted to reflect genuine
     overreaction fading rather than a fresh earnings-driven move layered
-    on top. A report inside days 1-3 contaminates move_3d itself, so
-    that's a full skip (see EARNINGS_WITHIN_3D_SKIP_DAYS) rather than a
+    on top. A report ON day 0 itself contaminates move_1d directly, so
+    that's a full skip (see EARNINGS_WITHIN_1D_SKIP_DAYS) rather than a
     partial one.
 
     This is the production twin of calibrate_reaction_thresholds.py's
@@ -827,99 +988,110 @@ def measure_reaction_windows(ticker_obj, published_at, earnings_dates=None):
     if published_at is None:
         return None, None, False, "no_date"
 
-    start_date = published_at.date()
-    end_date = start_date + datetime.timedelta(days=REACTION_WINDOW_CALENDAR_BUFFER_DAYS)
+    published_date = published_at.date()
+    start_date = published_date - datetime.timedelta(days=PRE_PUBLISH_BUFFER_DAYS)
+    end_date = published_date + datetime.timedelta(days=REACTION_WINDOW_CALENDAR_BUFFER_DAYS)
     try:
         hist = ticker_obj.history(start=start_date, end=end_date)
     except Exception as e:
         print(f"    Warning: price history fetch failed: {e}", flush=True)
         return None, None, False, "history_fetch_failed"
 
-    if len(hist) < 4:  # need start + at least 3 trading days
+    if hist.empty:
+        return None, None, False, "insufficient_history"
+
+    published_ts = _as_of_timestamp(hist.index, published_date)
+    day0_pos = hist.index.searchsorted(published_ts)
+    if day0_pos == 0 or day0_pos >= len(hist):
+        # day0_pos == 0: no prior trading day found in our fetched window
+        # (shouldn't happen given PRE_PUBLISH_BUFFER_DAYS, but fails soft
+        # rather than risk an IndexError). day0_pos >= len(hist): no
+        # trading day on/after published_date within the fetched window -
+        # e.g. published right at the edge of what's currently available.
+        return None, None, False, "insufficient_history"
+
+    prev_close = hist["Close"].iloc[day0_pos - 1]
+    day0_close = hist["Close"].iloc[day0_pos]
+    if not prev_close:
         return None, None, False, "insufficient_history"
 
     earnings_pos = None
     if earnings_dates is not None and not earnings_dates.empty:
-        future_as_of_ts = _as_of_timestamp(earnings_dates.index, start_date)
+        future_as_of_ts = _as_of_timestamp(earnings_dates.index, published_date)
         future_earnings = earnings_dates[earnings_dates.index > future_as_of_ts]
         if not future_earnings.empty:
             next_earnings_date = future_earnings.sort_index().index.min()
             cutoff_ts = _as_of_timestamp(hist.index, next_earnings_date.date())
-            earnings_pos = hist.index.searchsorted(cutoff_ts)
+            earnings_pos = hist.index.searchsorted(cutoff_ts) - day0_pos
 
-    if earnings_pos is not None and earnings_pos <= EARNINGS_WITHIN_3D_SKIP_DAYS:
-        return None, None, False, "earnings_within_3d"
+    if earnings_pos is not None and earnings_pos <= EARNINGS_WITHIN_1D_SKIP_DAYS:
+        return None, None, False, "earnings_within_1d"
 
     overreaction_assessable = earnings_pos is None or earnings_pos > EARNINGS_UNASSESSABLE_DAYS
 
-    start_price = hist["Close"].iloc[0]
-    if not start_price:
-        return None, None, False, "insufficient_history"
-
-    pos_3d = min(3, len(hist) - 1)
-    move_3d = (hist["Close"].iloc[pos_3d] - start_price) / start_price
+    move_1d = (day0_close - prev_close) / prev_close
 
     move_21d = None
-    if len(hist) - 1 >= 21:
-        move_21d = (hist["Close"].iloc[21] - start_price) / start_price
+    day21_pos = day0_pos + 21
+    if day21_pos < len(hist):
+        move_21d = (hist["Close"].iloc[day21_pos] - prev_close) / prev_close
 
-    return move_3d, move_21d, overreaction_assessable, None
+    return move_1d, move_21d, overreaction_assessable, None
 
 
-def classify_reaction(move_3d, move_21d, overreaction_assessable,
+def classify_reaction(move_1d, move_21d, overreaction_assessable,
                        good_bad_threshold=REACTION_GOOD_BAD_THRESHOLD,
                        overreaction_move_threshold=REACTION_OVERREACTION_MOVE_THRESHOLD,
                        retracement_fraction=REACTION_RETRACEMENT_FRACTION):
-    """Pure classification over an already-measured (move_3d, move_21d,
+    """Pure classification over an already-measured (move_1d, move_21d,
     overreaction_assessable) triple - overreaction checked first (requires
-    BOTH an outsized 3-day move AND a day-21 retracement of at least
+    BOTH an outsized single-day move AND a day-21 retracement of at least
     `retracement_fraction` of that move), then plain good/bad/neutral off
-    move_3d alone. Threshold args are keyword-overridable so calibrate_
+    move_1d alone. Threshold args are keyword-overridable so calibrate_
     reaction_thresholds.py can sweep a grid without a second copy of this
     logic."""
     if overreaction_assessable and move_21d is not None:
-        if move_3d <= -overreaction_move_threshold:
-            retraced = (move_21d - move_3d) / abs(move_3d)
+        if move_1d <= -overreaction_move_threshold:
+            retraced = (move_21d - move_1d) / abs(move_1d)
             if retraced >= retracement_fraction:
                 return "overreaction_down"
-        elif move_3d >= overreaction_move_threshold:
-            retraced = (move_3d - move_21d) / move_3d
+        elif move_1d >= overreaction_move_threshold:
+            retraced = (move_1d - move_21d) / move_1d
             if retraced >= retracement_fraction:
                 return "overreaction_up"
 
-    if move_3d >= good_bad_threshold:
+    if move_1d >= good_bad_threshold:
         return "good"
-    if move_3d <= -good_bad_threshold:
+    if move_1d <= -good_bad_threshold:
         return "bad"
     return "neutral"
 
 
 def label_news_reaction(ticker_obj, published_at, earnings_dates=None):
-    """Returns (reaction, move_3d, move_21d, skip_reason) - the production
+    """Returns (reaction, move_1d, move_21d, skip_reason) - the production
     Task A labeler, replacing the retired label_from_forward_return (see
     history item 10). skip_reason is None on success."""
-    move_3d, move_21d, overreaction_assessable, skip_reason = measure_reaction_windows(
+    move_1d, move_21d, overreaction_assessable, skip_reason = measure_reaction_windows(
         ticker_obj, published_at, earnings_dates,
     )
     if skip_reason is not None:
         return None, None, None, skip_reason
-    reaction = classify_reaction(move_3d, move_21d, overreaction_assessable)
-    return reaction, move_3d, move_21d, None
+    reaction = classify_reaction(move_1d, move_21d, overreaction_assessable)
+    return reaction, move_1d, move_21d, None
 
 
-def price_context_block(ticker, move_3d):
-    """Canonical phrasing for a stock's trailing move around the time of a
-    headline - Task A's only price signal (see the Task A prompt template
-    in the training repo's synced files). Documented approximation: this
-    dataset measures the 3 trading days AFTER the headline's publish date
-    (a clean, unambiguous window to label from); at real inference time a
-    brand-new headline has no "after" yet, so financial-sentiment-api's
-    recent_price_move() measures the 3 trading days BEFORE/trailing the
-    request instead. Both describe the same underlying thing - how has
-    this stock been moving around the time of this news - just anchored
-    from opposite ends of the (headline, price-window) pair, which is
-    close enough for the model to generalize across."""
-    return f"{ticker} moved {move_3d * 100:+.1f}% over the last 3 trading days."
+def price_context_block(ticker, move_1d):
+    """Canonical phrasing for the stock's single-day reaction on the day a
+    headline was published - Task A's only price signal (see the Task A
+    prompt template in the training repo's synced files). Changed
+    2026-08-20 (see history item 12): move_1d is real, already-happened
+    price data, computed the SAME way in this dataset (day-0 close vs.
+    the preceding trading day's close, day 0 being the headline's own
+    publish date) and at real inference time (financial-sentiment-api
+    looks up the SAME specific day's move for whichever headline it
+    selects) - no more train/inference approximation gap, unlike the
+    retired 3-day-forward-vs-3-day-trailing mismatch this replaced."""
+    return f"{ticker} moved {move_1d * 100:+.1f}% on the day this was published."
 
 
 # Ported from generate_synthetic_dataset.py's identically-named regex/
@@ -2297,7 +2469,7 @@ def make_real_example(ticker, ticker_obj, fundamentals_history, title, publisher
     reaction reported - only Task A's labeling can fail here, since Task B
     (when enabled) reuses the same successful reaction/move rather than
     independently deciding anything."""
-    reaction, move_3d, move_21d, skip_reason = label_news_reaction(
+    reaction, move_1d, move_21d, skip_reason = label_news_reaction(
         ticker_obj, published_at, fundamentals_history.get("earnings_dates"),
     )
     if reaction is None:
@@ -2306,7 +2478,7 @@ def make_real_example(ticker, ticker_obj, fundamentals_history, title, publisher
     date_str = _format_date(published_at) if published_at else "recent"
     headline_line = f"- [{date_str}] {title} - {publisher}"
     news_block = build_news_block(headline_line)
-    price_context = price_context_block(ticker, move_3d)
+    price_context = price_context_block(ticker, move_1d)
 
     examples = [_task_a_row(ticker, price_context, news_block, reaction)]
 
@@ -2476,6 +2648,9 @@ def process_ticker(ticker, name):
                 continue
             if _is_low_content_headline(title):
                 ticker_skips["low_content_headline"] = ticker_skips.get("low_content_headline", 0) + 1
+                continue
+            if not _is_relevant_headline(ticker, name, fundamentals_history.get("sector"), title):
+                ticker_skips["not_relevant"] = ticker_skips.get("not_relevant", 0) + 1
                 continue
 
             examples, skip_reason = make_real_example(
