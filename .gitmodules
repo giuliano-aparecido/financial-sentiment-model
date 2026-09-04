@@ -1,0 +1,3 @@
+[submodule "agent-config"]
+	path = agent-config
+	url = https://github.com/GiulianoAparecido/agent-config.git

@@ -13,6 +13,9 @@ Full documentation lives in dedicated files, not duplicated here:
   two-stage redesign) rather than living reference docs; check dates and
   whether a plan there was ever executed before trusting it as current
 
-Branch + PR, never push directly to `main` — see the fleet-wide
-`AGENTS.md` one directory up (outside this repo, alongside its siblings)
-for the full workflow.
+Branch + PR, never push directly to `main` — see
+[`agent-config/AGENTS.md`](agent-config/AGENTS.md) (a git submodule
+shared across this repo's siblings) for the full workflow, plus the rest
+of the fleet-wide conventions, loaded automatically below for Claude Code.
+
+@agent-config/AGENTS.md
