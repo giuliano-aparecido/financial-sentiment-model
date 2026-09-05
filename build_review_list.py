@@ -54,23 +54,27 @@ def build_review(label, sources, output_file):
                 out.write(f"\n{'#' * 100}\n# TICKER: {current_ticker}\n{'#' * 100}\n\n")
 
             output = json.loads(row["output"])
-            impact = output["impacted_stocks"][0]
-            # "recommendation" is the current schema key (BUY/SELL/HOLD);
-            # "direction" is the old one (BULLISH/BEARISH/NEUTRAL), still
-            # present in dataset_train_real.jsonl/dataset_val_real.jsonl
-            # until generate_real_dataset.py's regenerated output replaces
-            # them - tolerate both so this script keeps working mid-migration.
-            label_value = impact.get("recommendation", impact.get("direction"))
+            task = row.get("task")
 
-            out.write(f"--- [{row['_split']}] {row['ticker']} ---\n")
-            out.write(f"User Question: {row['user_query']}\n\n")
-            out.write(f"Market Data:\n{row['market_data']}\n\n")
-            out.write(f"Valuation:\n{row['valuation']}\n\n")
-            out.write(f"Earnings:\n{row['earnings']}\n\n")
-            out.write(f"News:\n{row['news']}\n\n")
-            out.write(f"Recommendation (dataset label): {label_value}  |  Confidence: {impact['confidence']}\n")
-            out.write(f"Reasoning (dataset label): {impact['reasoning']}\n")
-            out.write(f"Answer (dataset label): {impact['answer']}\n")
+            out.write(f"--- [{row['_split']}] {row['ticker']} ({task}) ---\n")
+            if task == "reaction":
+                # Task A rows only carry the news block and the classified
+                # reaction - no market_data/valuation/earnings/recommendation,
+                # see generate_synthetic_dataset.py/generate_real_dataset.py's
+                # own task_a_row builders.
+                out.write(f"News:\n{row['news']}\n\n")
+                out.write(f"News reaction (dataset label): {output['news_reaction']}\n")
+            elif task == "analysis":
+                out.write(f"User Question: {row['user_query']}\n\n")
+                out.write(f"Market Data:\n{row['market_data']}\n\n")
+                out.write(f"Valuation:\n{row['valuation']}\n\n")
+                out.write(f"Earnings:\n{row['earnings']}\n\n")
+                out.write(f"News:\n{row['news']}\n\n")
+                out.write(f"Recommendation (dataset label): {row.get('recommendation', '')}\n")
+                out.write(f"Reasoning (dataset label): {output['reasoning']}\n")
+                out.write(f"Answer (dataset label): {output['answer']}\n")
+            else:
+                raise ValueError(f"Unknown task: {task!r}")
             out.write("\n" + "-" * 100 + "\n\n")
 
     print(f"Wrote {output_file}: {len(rows)} rows, {len(set(r['ticker'] for r in rows))} distinct tickers.")

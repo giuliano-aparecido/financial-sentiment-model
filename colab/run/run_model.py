@@ -3,11 +3,13 @@
 import nest_asyncio
 import uvicorn
 from pyngrok import ngrok
-from fastapi import FastAPI
+from fastapi import Depends, FastAPI, HTTPException, status
+from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from pydantic import BaseModel
 from unsloth import FastLanguageModel
 import asyncio
 import os
+import secrets
 import threading    # ← ADD THIS LINE
 import time         # ← ADD THIS LINE
 
@@ -39,7 +41,6 @@ def get_secret(name):
         # .env file, or `export NAME=value` before running this script).
         return os.environ.get(name)
 
-# 1. Load fine-tuned weights directly from Hugging Face
 HF_USER = get_secret("HF_USER")
 
 # MODEL_CHOICE_DEFAULT is the git-committed baseline. Add an OPTIONAL
@@ -73,28 +74,37 @@ model, tokenizer = FastLanguageModel.from_pretrained(
 )
 FastLanguageModel.for_inference(model)
 
-# 2. Setup FastAPI App
 app = FastAPI()
 
 class InferenceRequest(BaseModel):
     inputs: str
 
+# Required so this endpoint isn't open to anyone who reaches the ngrok URL -
+# add an "ENDPOINT_AUTH_TOKEN" Colab/Kaggle Secret (or env var, off-platform)
+# with any random string, and set financial-sentiment-api's HF_API_TOKEN to
+# match. Same check as ../../modal/serve_model.py's serving alternative.
+ENDPOINT_AUTH_TOKEN = get_secret("ENDPOINT_AUTH_TOKEN")
+auth_scheme = HTTPBearer()
+
 @app.post("/generate")
-def generate(req: InferenceRequest):
-    # 1. Tokenize input
+def generate(req: InferenceRequest, token: HTTPAuthorizationCredentials = Depends(auth_scheme)):
+    if not secrets.compare_digest(token.credentials, ENDPOINT_AUTH_TOKEN or ""):
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Invalid token",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+
     inputs = tokenizer([req.inputs], return_tensors="pt").to("cuda")
     input_len = inputs["input_ids"].shape[1]
 
-    # 2. Generate new tokens
     outputs = model.generate(**inputs, max_new_tokens=350, use_cache=True)
 
-    # 3. Slice out the prompt tokens and decode ONLY newly generated tokens
     new_tokens = outputs[0][input_len:]
     generated_text = tokenizer.decode(new_tokens, skip_special_tokens=True)
 
     return [{"generated_text": generated_text.strip()}]
 
-# 3. Authenticate & Connect Ngrok
 # Get your free token at: https://dashboard.ngrok.com/get-started/your-authtoken
 NGROK_AUTH_TOKEN = get_secret("NGROK_AUTH_TOKEN")
 ngrok.set_auth_token(NGROK_AUTH_TOKEN)
@@ -103,11 +113,11 @@ endpoint = public_url + "/generate"
 
 print(f"\n🚀 SUCCESS! YOUR ENDPOINT IS LIVE AT:\n{endpoint}\n")
 
-# 2. Configure Uvicorn Server
 config = uvicorn.Config(app, host="0.0.0.0", port=8000, log_level="info")
 server = uvicorn.Server(config)
 
-# 3. Use top-level await to attach to Colab's running event loop
+# Runs in a background thread so this cell returns and the notebook can move
+# on to the next cell while the server keeps handling requests.
 def run_server():
     asyncio.run(server.serve())
 

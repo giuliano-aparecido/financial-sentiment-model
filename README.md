@@ -4,7 +4,9 @@ Dataset generation, LoRA fine-tuning, and evaluation scripts for the LLM
 that powers [`financial-sentiment-api`](https://github.com/GiulianoAparecido/financial-sentiment-api)'s
 news-sentiment reasoning. Everything here is designed to be pasted into
 Google Colab cells and run on Colab's free GPU tier — there's no local
-training path, and no CI, since nothing here runs outside a notebook.
+training path and no CI. The pure-logic pieces (filters, parsing helpers)
+do have a real `tests/` suite that runs outside Colab via plain `pytest` —
+see CONTRIBUTING.md.
 
 Built as a portfolio/curriculum project — hardened and documented for the
 practice of doing it properly, not because it needs to scale.
