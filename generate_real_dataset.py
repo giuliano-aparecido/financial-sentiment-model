@@ -2383,20 +2383,38 @@ def _retry_delay_seconds(error_text, default=10.0):
     return float(match.group(1)) if match else default
 
 
+_MAX_REASONING_CHARS = 800
+_MAX_ANSWER_CHARS = 400
+_SUSPICIOUS_OUTPUT_PATTERNS = re.compile(
+    r"\bignore (the )?(above|previous|prior) instructions\b"
+    r"|\bdisregard (the )?(above|previous|prior) instructions\b"
+    r"|\bnew instructions\b"
+    r"|\bsystem prompt\b"
+    r"|\byou are now (an ai|in developer mode|acting as)\b"
+    r"|\bas an ai( language model)?\b",
+    re.IGNORECASE,
+)
+
+
 def _parse_gemini_output(text):
     """Splits Gemini's 'REASONING: ...\\nANSWER: ...' response into
     (reasoning, answer). Raises ValueError if the REASONING section is
-    missing/empty - callers catch that as a normal Gemini-call failure and
-    fall back to the template, same as any other malformed/empty response.
-    A missing ANSWER section alone is NOT fatal - the caller fills the
-    answer from ANSWER_TEMPLATES, since losing just one field shouldn't
-    discard an otherwise-good REASONING."""
+    missing/empty, implausibly long, or contains obvious meta-instruction
+    phrasing - callers catch that as a normal Gemini-call failure and fall
+    back to the template, same as any other malformed/empty response. A
+    missing ANSWER section alone is NOT fatal - the caller fills the answer
+    from ANSWER_TEMPLATES, since losing just one field shouldn't discard an
+    otherwise-good REASONING."""
     reasoning_match = re.search(r"REASONING:\s*(.*?)(?:\n\s*ANSWER:|$)", text, re.DOTALL | re.IGNORECASE)
     answer_match = re.search(r"ANSWER:\s*(.*)", text, re.DOTALL | re.IGNORECASE)
     reasoning = reasoning_match.group(1).strip() if reasoning_match else ""
     answer = answer_match.group(1).strip() if answer_match else ""
     if not reasoning:
         raise ValueError("no REASONING section in Gemini output")
+    if len(reasoning) > _MAX_REASONING_CHARS or len(answer) > _MAX_ANSWER_CHARS:
+        raise ValueError("Gemini output implausibly long for a 2-3/1-2 sentence response - discarding")
+    if _SUSPICIOUS_OUTPUT_PATTERNS.search(reasoning) or _SUSPICIOUS_OUTPUT_PATTERNS.search(answer):
+        raise ValueError("Gemini output contains suspicious meta-instruction phrasing - discarding")
     return reasoning, answer
 
 
