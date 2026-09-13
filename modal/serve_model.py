@@ -62,6 +62,7 @@ Cost shape - the whole point of this file over an always-on host:
 """
 
 import os
+import secrets
 
 import modal
 from fastapi import Depends, HTTPException, status
@@ -93,14 +94,14 @@ image = modal.Image.debian_slim(python_version="3.11").pip_install(
 model_cache = modal.Volume.from_name("financial-sentiment-model-cache", create_if_missing=True)
 MODEL_CACHE_DIR = "/cache"
 
-secrets = [modal.Secret.from_name("financial-sentiment-model-secrets")]
+modal_secrets = [modal.Secret.from_name("financial-sentiment-model-secrets")]
 
 
 @app.cls(
     image=image,
     gpu="T4",
     volumes={MODEL_CACHE_DIR: model_cache},
-    secrets=secrets,
+    secrets=modal_secrets,
     scaledown_window=60,
     max_containers=1,
     timeout=300,
@@ -147,13 +148,13 @@ class GenerateRequest(BaseModel):
 auth_scheme = HTTPBearer()
 
 
-@app.function(image=image, secrets=secrets)
+@app.function(image=image, secrets=modal_secrets)
 @modal.fastapi_endpoint(method="POST")
 async def generate(
     req: GenerateRequest,
     token: HTTPAuthorizationCredentials = Depends(auth_scheme),
 ) -> list[dict]:
-    if token.credentials != os.environ["ENDPOINT_AUTH_TOKEN"]:
+    if not secrets.compare_digest(token.credentials, os.environ["ENDPOINT_AUTH_TOKEN"]):
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Invalid token",

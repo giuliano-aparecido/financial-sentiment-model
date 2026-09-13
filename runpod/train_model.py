@@ -268,10 +268,12 @@ def format_prompts(examples):
     for task, ticker, user_query, price_context, market_data, valuation, earnings, news, news_reaction, recommendation, output in fields:
         if task == "reaction":
             text = task_a_prompt.format(ticker, price_context, news, output) + tokenizer.eos_token
-        else:
+        elif task == "analysis":
             text = task_b_prompt.format(
                 ticker, user_query, news_reaction, recommendation, market_data, valuation, earnings, news, output,
             ) + tokenizer.eos_token
+        else:
+            raise ValueError(f"Unknown task: {task!r}")
         texts.append(text)
     return {"text": texts}
 
