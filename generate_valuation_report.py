@@ -76,7 +76,7 @@ def main():
             rows.append({
                 "ticker": ticker, "name": name, "price": "ERROR", "pe_trailing": "-",
                 "pe_forward": "-", "sector": "-", "basis": "-", "intrinsic": "-",
-                "verdict": "-", "pct": "-", "signed_pct": "-",
+                "verdict": "-", "pct": "-", "gap_label": "-",
                 "market_data": f"Fetch failed: {e}", "valuation": "-", "earnings": "-",
             })
 

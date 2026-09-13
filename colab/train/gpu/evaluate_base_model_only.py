@@ -416,7 +416,6 @@ BASE_MODEL_REPO_BY_CHOICE = {
     "apertus-0.5b": "swiss-ai/Apertus-v1.1-0.5B-Instruct",
     "qwen-2.5-7b": "unsloth/Qwen2.5-7B-Instruct-bnb-4bit",
     "mistral-7b": "unsloth/mistral-7b-instruct-v0.3-bnb-4bit",
-    "llama-3.1-8b": "unsloth/Meta-Llama-3.1-8B-Instruct-bnb-4bit",
 }
 
 # Prefers temporarily disabling the LoRA adapter on the already-loaded
