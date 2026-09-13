@@ -2383,6 +2383,15 @@ def _retry_delay_seconds(error_text, default=10.0):
     return float(match.group(1)) if match else default
 
 
+# Defense-in-depth behind GEMINI_REASONING_PROMPT's own <headline>-tag
+# injection mitigation, not a replacement for it: an untrusted RSS headline
+# still reaches the prompt, and instruction-following defenses aren't
+# guaranteed robust against a sufficiently adversarial one. Generous
+# relative to the prompt's own "REASONING: 2-3 sentences, ANSWER: 1-2
+# sentences" ask (typically well under 300/150 chars) so normal verbose-
+# but-legitimate output is never rejected - this only catches a response
+# that's blown far past that shape, the kind of thing a successful
+# injection (dumping unrelated instructions/content) would produce.
 _MAX_REASONING_CHARS = 800
 _MAX_ANSWER_CHARS = 400
 _SUSPICIOUS_OUTPUT_PATTERNS = re.compile(
