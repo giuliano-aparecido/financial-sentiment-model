@@ -160,22 +160,23 @@ Practical consequences:
 Two ways to expose the trained model to `financial-sentiment-api` over
 HTTP - pick one, both speak the exact same `{"inputs": ..., "parameters":
 {...}}` request / `[{"generated_text": ...}]` response shape, so switching
-between them is just repointing `HF_INFERENCE_URL` (its runtime-mutable
-`/api/update-inference-url` endpoint exists for exactly this):
+between them is just repointing that model's inference URL (its
+runtime-mutable `/api/update-inference-url` endpoint exists for exactly this):
 
 - **`colab/run/run_model.py`** (default) - paste into a Colab cell, loads the
   model on Colab's free GPU, exposes it through an ngrok tunnel. Free, but
   the tunnel dies with the Colab session (90-minute idle timeout, 12-hour
   hard cap - see `colab/run/keep_running.py`), and needs a browser tab open.
-- **`modal/serve_model.py`** - deploys to [Modal](https://modal.com) as a
-  scale-to-zero serverless GPU function: no browser tab, no session limit,
-  but you pay per-second of actual GPU use. For occasional personal-project
-  traffic (a handful of requests a day) this lands well under Modal's
-  $30/month free credit - see the file's own docstring for the exact
-  autoscaling config (`min_containers` deliberately unset, `max_containers
-  =1`, `scaledown_window=120`) and the one-time `modal setup` / `modal
-  secret create` steps needed before `modal deploy modal/serve_model.py`
-  will work.
+- **`modal/serve.py`** - deploys to [Modal](https://modal.com) as a
+  scale-to-zero serverless GPU function, one app per model
+  (`MODEL_CHOICE=apertus-8b GPU=L4 modal deploy modal/serve.py`): no
+  browser tab, no session limit, but you pay per-second of actual GPU use.
+  For occasional personal-project traffic (a handful of requests a day)
+  this lands well under Modal's $30/month free credit - see the file's own
+  docstring for the deploy-time parameters, the exact autoscaling config
+  (`min_containers` deliberately unset, `max_containers=1`,
+  `scaledown_window=60`) and the one-time `modal setup` / `modal secret
+  create` steps needed before the first deploy will work.
 
 ## Required Colab Secrets (environment variables)
 
