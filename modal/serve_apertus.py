@@ -1,9 +1,10 @@
 """
 Serves the apertus-8b-financial-reasoner model on Modal, as a separate
 endpoint from serve_model.py's llama deployment. Same model-loading call,
-request/response shape, GPU class, and autoscaling config as serve_model.py -
-see that file's own docstring for the full rationale (cold start budget,
-cost shape, timeout sizing). This file exists only to give apertus its own
+request/response shape, and autoscaling config as serve_model.py - see that
+file's own docstring for the full rationale (cold start budget, cost shape,
+timeout sizing) - except the GPU: L4 rather than T4, see the comment on the
+class decorator, and price the cost shape accordingly. This file exists to give apertus its own
 Modal app/URL so financial-sentiment-api's ?model=apertus routing (see
 APERTUS_INFERENCE_URL) can hit it independently of the llama endpoint,
 without either one's traffic/cold-starts affecting the other.
@@ -49,9 +50,13 @@ MODEL_CACHE_DIR = "/cache"
 modal_secrets = [modal.Secret.from_name("financial-sentiment-model-secrets")]
 
 
+# L4, not the T4 serve_model.py uses: Apertus is bf16-trained and overflows
+# to NaN in fp16 (confirmed live on a T4 - all-NaN logits, every generated
+# token id 0 / <unk>, empty output), and the T4 has no bf16 support, so
+# Unsloth silently downgrades to fp16 there. Any bf16-capable GPU works.
 @app.cls(
     image=image,
-    gpu="T4",
+    gpu="L4",
     volumes={MODEL_CACHE_DIR: model_cache},
     secrets=modal_secrets,
     scaledown_window=60,
@@ -76,6 +81,16 @@ class Model:
             token=os.environ.get("HF_TOKEN"),
         )
         FastLanguageModel.for_inference(self.model)
+        # Both the upstream swiss-ai/Apertus-8B config.json and this merged
+        # checkpoint ship use_cache=false, and the merged push has no
+        # generation_config.json to override it, so the KV cache is off by
+        # default and a 512-token call blows the 300s timeout. This is
+        # inherited from upstream, not a training artifact - a retrain won't
+        # remove it. Passing use_cache=True to generate() below did not fix
+        # it under Unsloth's generic path for this architecture (the hang
+        # reproduced with it present), so pin it on both configs.
+        self.model.config.use_cache = True
+        self.model.generation_config.use_cache = True
 
     @modal.method()
     def generate(self, prompt: str, max_new_tokens: int) -> str:
@@ -113,5 +128,5 @@ async def generate(
             headers={"WWW-Authenticate": "Bearer"},
         )
 
-    generated_text = Model().generate.remote(req.inputs, req.parameters.max_new_tokens)
+    generated_text = await Model().generate.remote.aio(req.inputs, req.parameters.max_new_tokens)
     return [{"generated_text": generated_text}]
