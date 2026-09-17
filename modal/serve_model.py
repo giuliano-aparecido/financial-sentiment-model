@@ -161,5 +161,5 @@ async def generate(
             headers={"WWW-Authenticate": "Bearer"},
         )
 
-    generated_text = Model().generate.remote(req.inputs, req.parameters.max_new_tokens)
+    generated_text = await Model().generate.remote.aio(req.inputs, req.parameters.max_new_tokens)
     return [{"generated_text": generated_text}]
