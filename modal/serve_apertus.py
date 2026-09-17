@@ -1,9 +1,10 @@
 """
 Serves the apertus-8b-financial-reasoner model on Modal, as a separate
 endpoint from serve_model.py's llama deployment. Same model-loading call,
-request/response shape, GPU class, and autoscaling config as serve_model.py -
-see that file's own docstring for the full rationale (cold start budget,
-cost shape, timeout sizing). This file exists only to give apertus its own
+request/response shape, and autoscaling config as serve_model.py - see that
+file's own docstring for the full rationale (cold start budget, cost shape,
+timeout sizing) - except the GPU: L4 rather than T4, see the comment on the
+class decorator, and price the cost shape accordingly. This file exists to give apertus its own
 Modal app/URL so financial-sentiment-api's ?model=apertus routing (see
 APERTUS_INFERENCE_URL) can hit it independently of the llama endpoint,
 without either one's traffic/cold-starts affecting the other.
@@ -52,8 +53,7 @@ modal_secrets = [modal.Secret.from_name("financial-sentiment-model-secrets")]
 # L4, not the T4 serve_model.py uses: Apertus is bf16-trained and overflows
 # to NaN in fp16 (confirmed live on a T4 - all-NaN logits, every generated
 # token id 0 / <unk>, empty output), and the T4 has no bf16 support, so
-# Unsloth silently downgrades to fp16 there. The L4 is the cheapest Modal
-# GPU with native bf16.
+# Unsloth silently downgrades to fp16 there. Any bf16-capable GPU works.
 @app.cls(
     image=image,
     gpu="L4",
@@ -81,15 +81,14 @@ class Model:
             token=os.environ.get("HF_TOKEN"),
         )
         FastLanguageModel.for_inference(self.model)
-        # The merged checkpoint's config.json carries use_cache=false (a
-        # gradient-checkpointing artifact from training that got saved into
-        # the model) and ships no generation_config.json to override it, so
-        # generation inherits a disabled KV cache and recomputes attention
-        # over the whole sequence for every new token - quadratic instead of
-        # linear, enough to blow the 300s call timeout. generate(use_cache=
-        # True) below should win in plain transformers, but Unsloth's patched
-        # generate path for this architecture isn't guaranteed to honor it,
-        # so pin it on both configs directly.
+        # Both the upstream swiss-ai/Apertus-8B config.json and this merged
+        # checkpoint ship use_cache=false, and the merged push has no
+        # generation_config.json to override it, so the KV cache is off by
+        # default and a 512-token call blows the 300s timeout. This is
+        # inherited from upstream, not a training artifact - a retrain won't
+        # remove it. Passing use_cache=True to generate() below did not fix
+        # it under Unsloth's generic path for this architecture (the hang
+        # reproduced with it present), so pin it on both configs.
         self.model.config.use_cache = True
         self.model.generation_config.use_cache = True
 
