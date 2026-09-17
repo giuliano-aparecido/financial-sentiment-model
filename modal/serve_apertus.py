@@ -76,6 +76,17 @@ class Model:
             token=os.environ.get("HF_TOKEN"),
         )
         FastLanguageModel.for_inference(self.model)
+        # The merged checkpoint's config.json carries use_cache=false (a
+        # gradient-checkpointing artifact from training that got saved into
+        # the model) and ships no generation_config.json to override it, so
+        # generation inherits a disabled KV cache and recomputes attention
+        # over the whole sequence for every new token - quadratic instead of
+        # linear, enough to blow the 300s call timeout. generate(use_cache=
+        # True) below should win in plain transformers, but Unsloth's patched
+        # generate path for this architecture isn't guaranteed to honor it,
+        # so pin it on both configs directly.
+        self.model.config.use_cache = True
+        self.model.generation_config.use_cache = True
 
     @modal.method()
     def generate(self, prompt: str, max_new_tokens: int) -> str:
@@ -113,5 +124,5 @@ async def generate(
             headers={"WWW-Authenticate": "Bearer"},
         )
 
-    generated_text = Model().generate.remote(req.inputs, req.parameters.max_new_tokens)
+    generated_text = await Model().generate.remote.aio(req.inputs, req.parameters.max_new_tokens)
     return [{"generated_text": generated_text}]
