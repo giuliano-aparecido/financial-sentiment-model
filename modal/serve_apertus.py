@@ -49,9 +49,14 @@ MODEL_CACHE_DIR = "/cache"
 modal_secrets = [modal.Secret.from_name("financial-sentiment-model-secrets")]
 
 
+# L4, not the T4 serve_model.py uses: Apertus is bf16-trained and overflows
+# to NaN in fp16 (confirmed live on a T4 - all-NaN logits, every generated
+# token id 0 / <unk>, empty output), and the T4 has no bf16 support, so
+# Unsloth silently downgrades to fp16 there. The L4 is the cheapest Modal
+# GPU with native bf16.
 @app.cls(
     image=image,
-    gpu="T4",
+    gpu="L4",
     volumes={MODEL_CACHE_DIR: model_cache},
     secrets=modal_secrets,
     scaledown_window=60,
