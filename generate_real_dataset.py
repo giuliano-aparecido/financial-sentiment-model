@@ -357,6 +357,7 @@ import random
 import re
 import threading
 import time
+import unicodedata
 import urllib.parse
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
@@ -578,9 +579,43 @@ PUBLISHER_FALLBACK = "Google News"
 # content in the live sample.
 LOW_QUALITY_PUBLISHERS = {
     "MarketBeat", "Stocktwits", "GuruFocus", "Trefis", "Simply Wall St.",
-    "simplywall.st", "Zacks Investment Research", "StockStory",
-    "TIKR.com", "Moomoo", "TradingKey", "Quiver Quantitative",
+    "simplywall.st", "Zacks", "StockStory", "TIKR", "Moomoo",
+    "TradingKey", "Quiver Quantitative",
 }
+
+
+def _publisher_tokens(publisher: str) -> tuple[str, ...]:
+    """Lower-cased alphanumeric tokens, split on everything else, so one
+    entry covers every spelling Google News uses for an outlet.
+
+    It relabels them between runs - "MarketBeat" one day,
+    "marketbeat.com" the next. Confirmed live 2026-09-18 (in
+    portfolio-manager-backend, which runs this same filter): with
+    exact-string matching, ALL FOUR results in IBM's 7-day window were
+    "marketbeat.com" 13F spam, i.e. the exact source this list exists to
+    exclude, passing through on spelling alone.
+    """
+    return tuple(re.findall(r"[a-z0-9]+", publisher.lower()))
+
+
+_LOW_QUALITY_PUBLISHER_TOKENS = frozenset(_publisher_tokens(p) for p in LOW_QUALITY_PUBLISHERS)
+
+
+def _is_low_quality_publisher(publisher: str) -> bool:
+    """True when `publisher`'s leading tokens are a denylist entry, so a
+    trailing domain or qualifier is covered: "marketbeat.com" ->
+    ("marketbeat", "com") matches the "MarketBeat" entry, and "Zacks"
+    alone now covers "Zacks.com" and "Zacks Investment Research".
+
+    Matching whole TOKENS rather than a raw string prefix is what keeps
+    the short stems safe - "TIKR" must not also deny a hypothetical
+    "Tikrit Daily", which a plain `startswith` on alphanumerics-only keys
+    would. "simplywall.st" stays in the list alongside "Simply Wall St."
+    because the two tokenize differently ("simplywall" vs "simply",
+    "wall") and neither is a token-prefix of the other.
+    """
+    tokens = _publisher_tokens(publisher)
+    return any(tokens[: len(denied)] == denied for denied in _LOW_QUALITY_PUBLISHER_TOKENS if denied)
 
 # Reused verbatim from generate_synthetic_dataset.py so both datasets' news
 # blocks have the same shape - real feeds do mix in unrelated market
@@ -703,7 +738,13 @@ _MOVE_VERB_RE_FRAGMENT = (
 _LOW_CONTENT_HEADLINE_RE = re.compile(
     r"stock (?:is )?trad(?:ing|es) (?:up|down|higher|lower)"
     r"|(?:shares|stock) (?:are|is) (?:up|down|higher|lower) today"
-    r"|here.s why|here.s what (?:investors|we|you) (?:need to know|see)"
+    # 2026-09-18: `here.s` matches "here's" and "heres" but NOT "Here Is
+    # Why", which is how several outlets write it - "IBM Stock Trades Up
+    # After Revenue Report, Here Is Why". "should know" added alongside
+    # "need to know" for the same reason. Both widen rejection, which is
+    # the safe direction for this filter (see the shortcut-learning note
+    # in generate_real_dataset.py).
+    r"|here(?:.|\s+i)s why|here(?:.|\s+i)s what (?:investors|we|you) (?:need to know|see|should know)"
     r"|what you need to know|laps the stock market|what.s going on with"
     rf"|\bwhy\b.{{0,60}}\b(?:stock|shares?)\b.{{0,30}}\b{_MOVE_VERB_RE_FRAGMENT}\b"
     rf"|\b(?:stock|shares?)\b.{{0,20}}\b(?:is|are)\b.{{0,10}}\b{_MOVE_VERB_RE_FRAGMENT}(?:ing)?\b"
@@ -714,7 +755,39 @@ _LOW_CONTENT_HEADLINE_RE = re.compile(
     r"|shares (?:added to|removed from|acquired by|sold by|purchased by)"
     r"|^[\d,]+\+? Shares (?:in|of)|(?:Buys|Purchases?|Sells) Shares (?:in|of)"
     r"|(?:Takes|Makes New) .{0,25}(?:Position|Investment) in|Invests? \$[\d,.]+|13F"
-    r"|portfolio.{0,20}(?:quiverquant|according to a)",
+    r"|portfolio.{0,20}(?:quiverquant|according to a)"
+    # 2026-09-18, back-ported: more 13F filing-spam shapes, all four
+    # observed in a single live IBM window. The existing branches above
+    # miss them because a share count sits between the verb and "Shares",
+    # or the verb isn't in their list.
+    #
+    # Every branch here keys on a SHARE COUNT or a dollar figure, never on
+    # a word that merely sounds financial. "Bank", "Capital", "Financial",
+    # "Trust" and "Management" are also just what financial-sector issuers
+    # are called, so gating on those rejects "Bank of America Buys Stake
+    # in Fintech Startup" and "Prudential Financial Sells Shares of Its
+    # Annuity Unit" - real corporate events, and a denylist match has
+    # nothing downstream to rescue it.
+    #
+    # A percentage is NOT a usable gate either, for the same reason: a
+    # company raising its own stake ("Berkshire Hathaway Boosts Stake in
+    # Occidental Petroleum by 5%") reads identically to a fund's 13F
+    # delta. So "Baird Financial Group Inc. Reduces Position in IBM" - a
+    # real observed spam headline with no quantity at all - is a KNOWN,
+    # deliberate gap here: nothing in the headline distinguishes it from
+    # an issuer doing the same thing. That shape is caught at the
+    # publisher tier instead (it came from marketbeat.com), which is the
+    # right layer for it - see _is_low_quality_publisher.
+    # A "Shares of X ... Acquired by Y" branch with a gap between the two
+    # halves was tried and removed: `.{0,60}` also matches ordinary M&A
+    # reporting ("Shares of Activision Jumped After the Company Was
+    # Acquired by Microsoft"), which is a large, high-value, causally
+    # informative category. The pre-existing adjacent form above
+    # ("shares acquired by") and the count-led form ("46,643 Shares in
+    # ...") already cover the spam without that gap.
+    r"|\b(?:Acquires|Buys|Purchases|Sells|Snaps Up|Reduces|Boosts|Trims|Grows)\s+"
+    r"(?:its\s+)?(?:stake|position|holdings?)?\s*(?:of|in|by)?\s*[\d,]+\+?\s+shares\b"
+    r"|\bHas \$[\d,.]+ (?:Million|Billion) (?:Stock )?(?:Holdings|Position|Stake)\b",
     re.IGNORECASE,
 )
 
@@ -779,6 +852,119 @@ SECTOR_KEYWORD_PATTERNS = {
 }
 
 
+# 2026-09-18, back-ported: legal-entity suffixes dropped from a company
+# name before it's matched against a headline. `name` reaches this module
+# from yfinance's `.info` (shortName/longName, see fundamentals.py), which
+# reports the full REGISTERED name - "Nestle S.A.", "Alphabet Inc.",
+# "Mondi plc", "The Coca-Cola Company" - while headlines write the plain
+# brand. A raw substring test therefore never fires for most non-US names,
+# and the headline falls through to the much weaker ticker and sector
+# tiers.
+_LEGAL_SUFFIX_WORDS = frozenset(
+    {
+        "inc", "incorporated", "corp", "corporation", "co", "cos", "company",
+        "ltd", "limited", "plc", "llc", "lp", "llp", "pte", "sarl", "gmbh",
+        "sa", "sas", "nv", "bv", "ag", "se", "spa", "ab", "asa", "oyj", "as", "kgaa",
+        "holding", "holdings", "group", "the",
+    }
+)
+
+# Below this, a needle is too generic to match on: the tier is
+# case-INsensitive, so a 1-character needle turns every "v." citation into
+# a Visa story. 2 rather than 3 because `\b` now does the anti-substring
+# work, and real 2-character brands exist ("3M" -> "3m").
+_MIN_NEEDLE_LENGTH = 2
+
+# Single-token cores that are also ordinary English words. Suffix
+# stripping goes too far for these: "Target Corporation" -> "target" then
+# matches "Analysts Raise Price Target for Nvidia to $200", "Sea Limited"
+# -> "sea" matches "Rescues Sailors After Storm at Sea", and "Box Inc." ->
+# "box" matches "Cardboard Box Shortage". The name tier short-circuits
+# _is_relevant_headline, so nothing downstream catches the mistake - the
+# headline is simply served as if it were about this company.
+#
+# For these the FULL normalized name is required instead, i.e. the
+# behaviour that predates suffix stripping, which is safe precisely
+# because "target corporation" as a phrase is not ordinary English.
+#
+# The cost is a real false negative: "Shell reports record profit" no
+# longer matches on the name tier. That's the direction to err in. A
+# false positive pairs an unrelated headline with this ticker - in the
+# API the model then reasons about the wrong company's news, and in
+# generate_real_dataset.py it becomes a training row pairing that
+# headline with this ticker's price move, i.e. label noise. A false
+# negative only costs a better candidate; the ticker tier below still
+# catches the very common "Shell (SHEL) reports ..." RSS phrasing.
+#
+# Whack-a-mole like the rest of this module's denylists - extend it when
+# a collision shows up, and the three verified cases are the seed.
+_AMBIGUOUS_NAME_CORES = frozenset(
+    {
+        "target", "sea", "box", "gap", "shell", "ford", "key", "cross",
+        "square", "block", "match", "unity", "arrow", "sun", "star",
+        "first", "general", "national", "global", "standard", "premier",
+        "energy", "power", "health", "service", "systems", "industries",
+        "brands", "foods", "express", "motion", "signal", "vision",
+        "focus", "edge", "peak", "summit", "pioneer", "eagle", "anchor",
+        "compass", "apex", "core", "prime", "elite", "liberty",
+        "atlantic", "pacific", "western", "eastern", "northern",
+        "southern", "central",
+    }
+)
+
+
+def _normalize_for_match(text: str) -> str:
+    """Accents folded, lower-cased, periods and commas dropped, whitespace
+    collapsed - applied to BOTH the name and the headline so "Nestle S.A."
+    and "Nestle SA" compare equal."""
+    folded = unicodedata.normalize("NFKD", text)
+    folded = "".join(c for c in folded if not unicodedata.combining(c))
+    folded = folded.lower().replace(".", "").replace(",", "")
+    return " ".join(folded.split())
+
+
+def _company_match_name(name: str) -> str:
+    """The brand part of a registered company name - "Nestle S.A." ->
+    "nestle". Stripped from BOTH ends: "The Coca-Cola Company" tail-only
+    leaves "the coca-cola", which never appears in a headline that writes
+    "Coca-Cola". "" when nothing survives, so the caller can fall back.
+
+    Known limitation, deliberately not chased: a name carrying its brand
+    AFTER the suffix ("Petroleo Brasileiro S.A. - Petrobras") keeps the
+    whole string and won't match a "Petrobras ..." headline on this tier -
+    it still has the ticker tier.
+    """
+    words = _normalize_for_match(name).split()
+    while words and words[0] in _LEGAL_SUFFIX_WORDS:
+        words.pop(0)
+    while words and words[-1] in _LEGAL_SUFFIX_WORDS:
+        words.pop()
+    return " ".join(words)
+
+
+def _name_needle(name: str) -> str:
+    """The string a headline is matched against for this company - the
+    brand core, or the whole normalized name when stripping leaves
+    nothing. "" when neither is long enough to be worth matching, i.e.
+    skip the name tier entirely.
+
+    The length floor is applied to the RESULT, not just the core: the API
+    passes the ticker itself as `name` when yfinance has no company name
+    (see routers/analyze.py), so the fallback can otherwise be a single
+    letter.
+    """
+    if not name:
+        return ""
+    core = _company_match_name(name)
+    # A multi-word core is specific enough to match on as-is. A
+    # single-word one is only safe if it isn't ordinary English.
+    if core and (" " in core or core not in _AMBIGUOUS_NAME_CORES):
+        needle = core
+    else:
+        needle = _normalize_for_match(name)
+    return needle if len(needle) >= _MIN_NEEDLE_LENGTH else ""
+
+
 def _is_relevant_headline(ticker: str, name: str, sector, title: str) -> bool:
     """True if `title` plausibly concerns `ticker`'s company or its sector -
     the redesign plan's relevance pre-filter (docs/two-stage-task-a-
@@ -797,8 +983,11 @@ def _is_relevant_headline(ticker: str, name: str, sector, title: str) -> bool:
     (falls through to no example for that headline, same as the other
     pre-filters; NOT forced into a neutral-labeled row for a headline that
     was never even about the company)."""
-    title_lower = title.lower()
-    if name.lower() in title_lower:
+    needle = _name_needle(name)
+    # Word-boundary, not plain substring: "Sea Limited" -> "sea" would
+    # otherwise match the "sea" inside "research" and let an unrelated
+    # company's story become this ticker's signal headline.
+    if needle and re.search(rf"\b{re.escape(needle)}\b", _normalize_for_match(title)):
         return True
     if re.search(rf"\b{re.escape(ticker)}\b", title):
         return True
@@ -2696,7 +2885,7 @@ def process_ticker(ticker, name):
             if title in seen_titles:
                 continue
             seen_titles.add(title)
-            if publisher in LOW_QUALITY_PUBLISHERS:
+            if _is_low_quality_publisher(publisher):
                 ticker_skips["low_quality_publisher"] = ticker_skips.get("low_quality_publisher", 0) + 1
                 continue
             if _is_low_content_headline(title):
