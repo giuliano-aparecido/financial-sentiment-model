@@ -162,17 +162,14 @@ Recent News & Results:
 
 ### Instruction:
 
-You are given a recommended action for this stock, already determined from valuation and news analysis - your job is to explain it, not decide it. Output JSON containing detailed reasoning and a direct answer to the user's question, in exactly this shape:
-{{"reasoning": "...", "answer": "..."}}
-
-Your reasoning and answer must be consistent with the Recommended Action below and must never advise the opposite. Treat News Reaction and Recommended Action as given facts, not conclusions to re-derive.
+Decide the recommended action for this stock (BUY, SELL, or HOLD) yourself from the news reaction, valuation, earnings, and market data below, then explain your reasoning and answer the user's question. Output JSON in exactly this shape:
+{{"recommendation": "BUY|SELL|HOLD", "reasoning": "...", "answer": "..."}}
 
 ### Input:
 
 Target Stock: {}
 User Question: {}
 News Reaction: {}
-Recommended Action: {}
 
 Current Market Data:
 {}
@@ -203,83 +200,11 @@ if os.path.exists("dataset_val_real_taskb.jsonl"):
     VAL_FILES["real_taskb"] = "dataset_val_real_taskb.jsonl"
 
 REACTION_RE = re.compile(r'"news_reaction"\s*:\s*"(good|bad|neutral|overreaction_down|overreaction_up)"')
+RECOMMENDATION_RE = re.compile(r'"recommendation"\s*:\s*"(BUY|SELL|HOLD)"')
 # Not used for accuracy scoring, just to surface the model's generated
 # text in the misclassification/flagged-sample dumps below.
 ANSWER_RE = re.compile(r'"answer"\s*:\s*"((?:[^"\\]|\\.)*)"')
 REASONING_RE = re.compile(r'"reasoning"\s*:\s*"((?:[^"\\]|\\.)*)"')
-
-# Crude but effective direction-consistency check for Task B: given a
-# GIVEN recommendation (fed to the model as input, never predicted by
-# it), flag generated prose that explicitly advises the OPPOSITE action -
-# the one failure mode task_b_prompt's own instruction explicitly
-# forbids. Not a full correctness check (an evasive or vacuous answer
-# would pass this too), just the sharpest, cheapest signal available
-# without a second model-as-judge call.
-#
-# Revised 2026-08-20 (v1 fine-tune eval): the original version was a
-# bare \b(word)\b search with no negation awareness and no allowance
-# for common hyphenated finance jargon - confirmed live, EVERY ONE of a
-# batch of 19 rows a real eval run flagged turned out to be a false
-# positive on manual read-through, from two bug classes:
-#   1. \b treats a hyphen (and a plain space) as a word boundary, so
-#      "sell-out"/"sell out"/"sell-off"/"short-term"/"buy-in" (all
-#      completely benign, common finance vocabulary) matched the bare
-#      trigger word inside them - fixed by requiring "short"/"shorting"
-#      appear with an actual object (short(?:ing)? the stock/it/shares/
-#      a position) instead of as a bare word at all (this alone removes
-#      "short-term"/"short report"/"in short" as false-trigger sources),
-#      and by a negative lookahead (_BENIGN_COMPOUND_SUFFIX_RE) excluding
-#      the sell/buy compounds.
-#   2. No negation/hedge handling - "doesn't look like a buy", "selling
-#      now may be premature", and the model's own "...which runs counter
-#      to a SELL outlook. However, the valuation..." pivot phrasing (the
-#      model correctly acknowledging a conflicting individual signal
-#      before reconciling toward the given recommendation - sophisticated,
-#      CORRECT reasoning, not a contradiction) were all flagged despite
-#      not actually advising the opposite action. _NEGATION_CUE_RE,
-#      checked in a window around each match (not just before it - some
-#      of these cues land after, e.g. "selling now may be premature"),
-#      addresses this.
-# Verified empirically against all 19 original false positives (now 0/19
-# flagged) AND five constructed genuine-contradiction cases (still 5/5
-# caught) before landing this - see the PR description/commit for the
-# actual test script, not committed here since it's a one-off validation
-# aid, not part of the eval pipeline itself.
-_BENIGN_COMPOUND_SUFFIX_RE = r"(?![\s-](?:out|off|side|in)\b)"
-_NEGATION_CUE_RE = re.compile(
-    r"n['’]t\b|\b(?:not|no|never|rather than|instead of|more attractive than|"
-    r"premature|avoid|against|however|but|despite|nevertheless|nonetheless|"
-    r"missed opportunity|counter to|weak (?:or indirect )?signal|indirect signal)\b",
-    re.IGNORECASE,
-)
-_OPPOSITE_ACTION_WORDS = {
-    "BUY": re.compile(
-        rf"\b(sell|selling|exit|take profits?)\b{_BENIGN_COMPOUND_SUFFIX_RE}"
-        r"|\bshort(?:ing)?\b\s+(?:the stock|it|shares|a position)\b"
-        r"|\bgo short\b|\binitiate a short\b|\bshort position\b",
-        re.IGNORECASE,
-    ),
-    "SELL": re.compile(
-        rf"\b(buy|buying|accumulate|accumulating|add(?:ing)? (?:shares|to (?:a |the )?position)|initiate a (?:buy|long) position)\b{_BENIGN_COMPOUND_SUFFIX_RE}",
-        re.IGNORECASE,
-    ),
-    "HOLD": None,  # HOLD has no single "opposite" action to flag against
-}
-
-
-def _has_opposite_action_language(text: str, opposite_re, window: int = 100) -> bool:
-    """True if `text` contains real opposite-action language per
-    `opposite_re` - a match with no negation/hedge cue (n't, not,
-    however, counter to, etc. - see _NEGATION_CUE_RE) within `window`
-    characters on either side. See _OPPOSITE_ACTION_WORDS' own comment
-    for the false-positive classes this fixes and why the window checks
-    BOTH sides, not just the text before a match."""
-    for match in opposite_re.finditer(text):
-        span = text[max(0, match.start() - window):match.end() + window]
-        if _NEGATION_CUE_RE.search(span):
-            continue
-        return True
-    return False
 
 random.seed(42)
 task_a_rows, task_b_rows = [], []
@@ -406,12 +331,17 @@ def run_task_a_eval(label):
 
 
 def run_task_b_eval(label):
-    per_source = {s: {"total": 0, "json_ok": 0, "nonempty": 0, "consistent": 0} for s in VAL_FILES}
-    flagged_samples = []
+    per_source = {s: {"total": 0, "json_ok": 0, "nonempty": 0, "rec_correct": 0} for s in VAL_FILES}
+    # (news_reaction, valuation_bucket) -> {"total", "correct"} - the
+    # actual gate metric (see docs/task-b-learned-recommendation-plan.md):
+    # ships only if this clears ~90% agreement with fuse(), not averaged
+    # away across the 5x4=20 cells.
+    per_cell = {}
+    mismatches = []
 
     for i, row in enumerate(task_b_rows, 1):
         prompt = task_b_prompt.format(
-            row["ticker"], row["user_query"], row["news_reaction"], row["recommendation"],
+            row["ticker"], row["user_query"], row["news_reaction"],
             row["market_data"], row["valuation"], row["earnings"], row["news"], "",
         )
         text = generate(prompt, max_new_tokens=512)
@@ -427,33 +357,50 @@ def run_task_b_eval(label):
         if answer.strip() and reasoning.strip():
             stats["nonempty"] += 1
 
-        opposite_re = _OPPOSITE_ACTION_WORDS.get(row["recommendation"])
-        contradicts = bool(opposite_re and (_has_opposite_action_language(answer, opposite_re) or _has_opposite_action_language(reasoning, opposite_re)))
-        if not contradicts:
-            stats["consistent"] += 1
-        elif len(flagged_samples) < 20:
-            flagged_samples.append((row, text))
+        # Ground truth is row["recommendation"] - fuse()'s own output for
+        # this row's (news_reaction, gap_pct), saved at dataset-generation
+        # time (see generate_{real,synthetic}_dataset.py) rather than
+        # recomputed here, since gap_pct itself isn't persisted on the row.
+        expected = row["recommendation"]
+        rec_m = RECOMMENDATION_RE.search(text)
+        predicted = rec_m.group(1) if rec_m else None
+        is_correct = predicted == expected
+        stats["rec_correct"] += is_correct
+
+        cell = (row["news_reaction"], row.get("valuation_bucket") or "unknown")
+        cell_stats = per_cell.setdefault(cell, {"total": 0, "correct": 0})
+        cell_stats["total"] += 1
+        cell_stats["correct"] += is_correct
+
+        if not is_correct and len(mismatches) < 20:
+            mismatches.append((row, text, predicted))
 
         if i % 20 == 0:
             print(f"  [{label}/TaskB] {i}/{len(task_b_rows)} rows")
 
-    print(f"\n===== {label} - Task B (reasoning/answer generation) =====")
+    print(f"\n===== {label} - Task B (recommendation + reasoning/answer generation) =====")
     total = sum(s["total"] for s in per_source.values())
     json_ok = sum(s["json_ok"] for s in per_source.values())
     nonempty = sum(s["nonempty"] for s in per_source.values())
-    consistent = sum(s["consistent"] for s in per_source.values())
+    rec_correct = sum(s["rec_correct"] for s in per_source.values())
     if total:
-        print(f"Valid-JSON rate:                  {json_ok}/{total} = {json_ok / total:.1%}")
-        print(f"Non-empty reasoning+answer rate:  {nonempty}/{total} = {nonempty / total:.1%}")
-        print(f"Direction-consistency rate:       {consistent}/{total} = {consistent / total:.1%} (no explicit opposite-action language)")
+        print(f"Valid-JSON rate:                   {json_ok}/{total} = {json_ok / total:.1%}")
+        print(f"Non-empty reasoning+answer rate:   {nonempty}/{total} = {nonempty / total:.1%}")
+        print(f"Recommendation accuracy vs fuse(): {rec_correct}/{total} = {rec_correct / total:.1%}")
     for source, s in per_source.items():
         if s["total"]:
-            print(f"  {source:<12} json_ok={s['json_ok']}/{s['total']} consistent={s['consistent']}/{s['total']}")
+            print(f"  {source:<12} json_ok={s['json_ok']}/{s['total']} rec_correct={s['rec_correct']}/{s['total']}")
 
-    if flagged_samples:
-        print(f"\n----- Flagged possible direction-contradictions for {label} (up to 20) -----")
-        for row, text in flagged_samples:
-            print(f"\nGiven recommendation={row['recommendation']} news_reaction={row['news_reaction']} | ticker={row['ticker']}")
+    print("Recommendation accuracy per (news_reaction, valuation_bucket) cell:")
+    for cell in sorted(per_cell):
+        c = per_cell[cell]
+        print(f"  {cell[0]:<18} {cell[1]:<12} {c['correct']}/{c['total']} = {c['correct'] / c['total']:.1%}")
+
+    if mismatches:
+        print(f"\n----- Sample recommendation mismatches vs fuse() for {label} (up to 20) -----")
+        for row, text, predicted in mismatches:
+            print(f"\nfuse()-expected={row['recommendation']} predicted={predicted or 'UNPARSEABLE'} "
+                  f"news_reaction={row['news_reaction']} valuation_bucket={row.get('valuation_bucket')} | ticker={row['ticker']}")
             print(f"Model output:\n{text}")
     print()
     return per_source

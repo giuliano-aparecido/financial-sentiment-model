@@ -2698,6 +2698,7 @@ def _task_a_row(ticker, price_context, news_block, reaction):
         "news": news_block,
         "news_reaction": reaction,
         "recommendation": "",
+        "valuation_bucket": "",
         "output": json.dumps({"news_reaction": reaction}),
     }
 
@@ -2752,8 +2753,16 @@ def make_real_example(ticker, ticker_obj, fundamentals_history, title, publisher
             "earnings": earnings,
             "news": news_block,
             "news_reaction": reaction,
+            # Ground truth for eval's recommendation-accuracy check
+            # (fuse()'s own output, not shown to the model as input
+            # anymore - see docs/task-b-learned-recommendation-plan.md).
+            # valuation_bucket lets eval split accuracy by (news_reaction,
+            # valuation_bucket) cell without recomputing fuse().
             "recommendation": fusion_result.recommendation,
-            "output": json.dumps({"reasoning": reasoning, "answer": answer}, indent=2),
+            "valuation_bucket": fusion_result.valuation_bucket,
+            "output": json.dumps(
+                {"recommendation": fusion_result.recommendation, "reasoning": reasoning, "answer": answer}, indent=2,
+            ),
         })
 
     return examples, None

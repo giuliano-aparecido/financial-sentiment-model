@@ -9,13 +9,12 @@ both now retired); now it's a fixed, testable table instead of something
 trained into the model.
 
 This repo uses it to compute the `recommendation` given to Task B training
-rows (both real and synthetic) the same way production computes it at
-inference time - so the model always sees a direction that's actually
-consistent with the fusion rule, never one a stale/older rule produced.
-
-SYNCED FILE: byte-identical copy lives at financial-sentiment-api/app/
-services/fusion.py. Any change here must be copied to that file in the
-same commit/PR pair - see this repo's CONTRIBUTING.md sync-rule section.
+rows (both real and synthetic) as the label the model is taught to
+reproduce (see docs/task-b-learned-recommendation-plan.md) - Task B's LLM
+call now decides the recommendation itself at inference, so this file has
+no synced production counterpart anymore: financial-sentiment-api's
+former app/services/fusion.py was deleted once nothing there called it.
+This file stays here unchanged, purely a training-data concern.
 """
 
 from typing import NamedTuple, Optional
@@ -101,9 +100,11 @@ def valuation_bucket(gap_pct: Optional[float]) -> str:
 
 
 def fuse(news_reaction: str, gap_pct: Optional[float]) -> FusionResult:
-    """The only place BUY/SELL/HOLD is decided anywhere in this pipeline -
-    neither Task A nor Task B's LLM call ever produces a recommendation
-    itself. Raises ValueError for an unrecognized news_reaction; callers
+    """The deterministic recommendation used ONLY as the label Task B's
+    LLM call is trained to reproduce (see docs/task-b-learned-
+    recommendation-plan.md) - Task B decides the recommendation itself at
+    inference now, this is never called there anymore. Raises ValueError
+    for an unrecognized news_reaction; callers
     must normalize a bad/unparseable LLM classification (e.g. to "neutral")
     before calling this, so a real bug here is never silently masked by an
     accidental fallback recommendation.
