@@ -187,11 +187,16 @@ model.enable_input_require_grads()
 # load_dataset accepts a list of files per split and concatenates them, so
 # this is the whole mechanism. Both generators produce the identical
 # {task, ticker, user_query, price_context, market_data, valuation,
-# earnings, news, news_reaction, recommendation, output} superset schema
-# on purpose (task="reaction" rows leave market_data/valuation/earnings/
-# user_query/recommendation as ""; task="analysis" rows leave nothing
-# empty), specifically so this merge needs no reconciliation and
-# format_prompts below can branch on "task" alone. The real dataset's
+# earnings, news, news_reaction, recommendation, valuation_bucket, output}
+# superset schema on purpose (task="reaction" rows leave market_data/
+# valuation/earnings/user_query/recommendation/valuation_bucket as "";
+# task="analysis" rows leave nothing empty), specifically so this merge
+# needs no reconciliation and format_prompts below can branch on "task"
+# alone. recommendation/valuation_bucket are eval-only ground truth now
+# (see docs/task-b-learned-recommendation-plan.md) - format_prompts never
+# reads them, since the model must decide the recommendation itself and
+# it's already embedded in "output"'s JSON for the "analysis" case. The
+# real dataset's
 # Task A rows are rebalanced by news_reaction on the train side and left
 # at their natural distribution on the val side (see that generator's
 # docstring) - nothing further to do here.
@@ -228,13 +233,15 @@ dataset_dict = load_dataset(
 # the full redesign). Every training row now carries a "task" field:
 # task="reaction" rows train task_a_prompt (classify news_reaction from
 # the news + a recent price move, no direction anywhere in it);
-# task="analysis" rows train task_b_prompt (write reasoning/answer given
-# an ALREADY-DECIDED news_reaction + Recommended Action - never asked to
-# produce either). Both templates' ### Input: sections mirror financial-
-# sentiment-api's app/services/inference.py exactly (Task A: Target Stock/
-# Recent Price Move/Recent News & Results; Task B: adds News Reaction/
-# Recommended Action alongside the original Target Stock/User Question/
-# Current Market Data/Valuation/Recent Earnings/Recent News & Results).
+# task="analysis" rows train task_b_prompt (given an ALREADY-DECIDED
+# news_reaction, decide the recommendation itself AND write reasoning/
+# answer consistent with it - see docs/task-b-learned-recommendation-
+# plan.md; recommendation is no longer handed to it as an input). Both
+# templates' ### Input: sections mirror financial-sentiment-api's
+# app/services/inference.py exactly (Task A: Target Stock/Recent Price
+# Move/Recent News & Results; Task B: adds News Reaction alongside the
+# original Target Stock/User Question/Current Market Data/Valuation/
+# Recent Earnings/Recent News & Results).
 # Keep BOTH templates in sync any time inference.py's prompts change, and
 # in sync with ../gpu/train_model.py's copies of these same two strings
 # and the ../{gpu,tpu}/evaluate_*.py and runpod/*.py scripts' copies (see
@@ -269,17 +276,14 @@ task_b_prompt = """Below is an instruction that describes a task, paired with an
 
 ### Instruction:
 
-You are given a recommended action for this stock, already determined from valuation and news analysis - your job is to explain it, not decide it. Output JSON containing detailed reasoning and a direct answer to the user's question, in exactly this shape:
-{{"reasoning": "...", "answer": "..."}}
-
-Your reasoning and answer must be consistent with the Recommended Action below and must never advise the opposite. Treat News Reaction and Recommended Action as given facts, not conclusions to re-derive.
+Decide the recommended action for this stock (BUY, SELL, or HOLD) yourself from the news reaction, valuation, earnings, and market data below, then explain your reasoning and answer the user's question. Output JSON in exactly this shape:
+{{"recommendation": "BUY|SELL|HOLD", "reasoning": "...", "answer": "..."}}
 
 ### Input:
 
 Target Stock: {}
 User Question: {}
 News Reaction: {}
-Recommended Action: {}
 
 Current Market Data:
 {}
@@ -304,15 +308,18 @@ def format_prompts(examples):
     fields = zip(
         examples["task"], examples["ticker"], examples["user_query"], examples["price_context"],
         examples["market_data"], examples["valuation"], examples["earnings"], examples["news"],
-        examples["news_reaction"], examples["recommendation"], examples["output"],
+        examples["news_reaction"], examples["output"],
     )
-    for task, ticker, user_query, price_context, market_data, valuation, earnings, news, news_reaction, recommendation, output in fields:
+    for task, ticker, user_query, price_context, market_data, valuation, earnings, news, news_reaction, output in fields:
 
         if task == "reaction":
             text = task_a_prompt.format(ticker, price_context, news, output) + tokenizer.eos_token
         elif task == "analysis":
+            # recommendation is NOT an input here (see task_b_prompt's own
+            # comment) - it's inside `output`'s JSON, which the model must
+            # produce itself.
             text = task_b_prompt.format(
-                ticker, user_query, news_reaction, recommendation, market_data, valuation, earnings, news, output,
+                ticker, user_query, news_reaction, market_data, valuation, earnings, news, output,
             ) + tokenizer.eos_token
         else:
             raise ValueError(f"Unknown task: {task!r}")

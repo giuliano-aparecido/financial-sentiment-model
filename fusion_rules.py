@@ -101,9 +101,14 @@ def valuation_bucket(gap_pct: Optional[float]) -> str:
 
 
 def fuse(news_reaction: str, gap_pct: Optional[float]) -> FusionResult:
-    """The only place BUY/SELL/HOLD is decided anywhere in this pipeline -
-    neither Task A nor Task B's LLM call ever produces a recommendation
-    itself. Raises ValueError for an unrecognized news_reaction; callers
+    """The deterministic recommendation shown to users and used as the
+    label Task B's LLM call is trained to reproduce (see docs/task-b-
+    learned-recommendation-plan.md). Task B now also decides its own
+    recommendation from the same inputs, but this stays the production
+    source of truth and a shadow/consistency check against Task B's
+    output - see financial-sentiment-api's inference.py's analyze_two_stage
+    for where the two are compared and logged. Raises ValueError for an
+    unrecognized news_reaction; callers
     must normalize a bad/unparseable LLM classification (e.g. to "neutral")
     before calling this, so a real bug here is never silently masked by an
     accidental fallback recommendation.

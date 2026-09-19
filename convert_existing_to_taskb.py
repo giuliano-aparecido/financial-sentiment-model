@@ -130,7 +130,10 @@ def convert_file(in_path, out_path):
             "news": row["news"],
             "news_reaction": reaction,
             "recommendation": fusion_result.recommendation,
-            "output": json.dumps({"reasoning": reasoning, "answer": answer}, indent=2),
+            "valuation_bucket": fusion_result.valuation_bucket,
+            "output": json.dumps(
+                {"recommendation": fusion_result.recommendation, "reasoning": reasoning, "answer": answer}, indent=2,
+            ),
         })
 
     with open(out_path, "w", encoding="utf-8") as f:

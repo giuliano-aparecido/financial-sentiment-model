@@ -2356,8 +2356,8 @@ _DRIVING_CLAUSES = [
     "The news is routine, but {ticker}'s valuation - {bucket_word} by roughly {pct:.0f}% on a DCF basis - is doing the real work here.",
 ]
 _NEAR_FAIR_CLAUSES = [
-    "{ticker} is trading close to its estimated intrinsic value here, so valuation isn't a strong argument either way.",
-    "No real valuation edge either way for {ticker} right now - it's trading near fair value on a DCF basis.",
+    "{ticker} is trading close to its estimated intrinsic value here, so valuation isn't a strong argument either way - that leaves {recommendation} as the call.",
+    "No real valuation edge either way for {ticker} right now - it's trading near fair value on a DCF basis, so this stays at {recommendation}.",
 ]
 _NO_DATA_CLAUSES = [
     "No valuation estimate is available here, which tempers this to {recommendation}.",
@@ -2374,7 +2374,15 @@ def _fusion_explanation(ticker, reaction, fusion_result, gap_pct):
     if bucket == "no_data":
         return random.choice(_NO_DATA_CLAUSES).format(recommendation=fusion_result.recommendation)
     if bucket == "near_fair":
-        return random.choice(_NEAR_FAIR_CLAUSES).format(ticker=ticker)
+        # Regression fix (post-migration eval): unlike every other clause
+        # pool, this one used to never mention {recommendation} at all -
+        # near_fair rows' reasoning only described valuation as neutral,
+        # giving the model zero textual signal for fuse()'s actual call
+        # (often a dampened HOLD/SELL against the news reaction's own
+        # lean). Confirmed as the likely cause of near_fair's collapsed
+        # eval accuracy (e.g. neutral/near_fair 0/12, good/near_fair
+        # 2/14) - every other bucket's clauses always name the call.
+        return random.choice(_NEAR_FAIR_CLAUSES).format(ticker=ticker, recommendation=fusion_result.recommendation)
 
     bucket_word = "undervalued" if bucket == "undervalued" else "overvalued"
     naive_lean = _NAIVE_LEAN[reaction]
@@ -2533,6 +2541,7 @@ def make_example(company, reaction):
         "news": news_block,
         "news_reaction": reaction,
         "recommendation": "",
+        "valuation_bucket": "",
         "output": json.dumps({"news_reaction": reaction}),
         "_split": split,  # stripped before writing - see main()
     }
@@ -2546,8 +2555,16 @@ def make_example(company, reaction):
         "earnings": earnings_text,
         "news": news_block,
         "news_reaction": reaction,
+        # Ground truth for eval's recommendation-accuracy check (fuse()'s
+        # own output, not shown to the model as input anymore - see
+        # docs/task-b-learned-recommendation-plan.md). valuation_bucket
+        # lets eval split accuracy by (news_reaction, valuation_bucket)
+        # cell without recomputing fuse().
         "recommendation": fusion_result.recommendation,
-        "output": json.dumps({"reasoning": reasoning, "answer": answer}, indent=2),
+        "valuation_bucket": fusion_result.valuation_bucket,
+        "output": json.dumps(
+            {"recommendation": fusion_result.recommendation, "reasoning": reasoning, "answer": answer}, indent=2,
+        ),
         "_split": split,
     }
     return [task_a_row, task_b_row]

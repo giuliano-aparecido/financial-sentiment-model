@@ -22,10 +22,10 @@ git checkout -b fix/short-description
 Most of this repo runs by hand in Colab, against live external services
 (Google News RSS, yfinance, Hugging Face), so there's no CI and most of it
 can't be usefully mocked. There IS a real `tests/` suite for the pure-logic
-pieces that don't touch those services (the direction-consistency detector,
-`generate_real_dataset.py`'s filter/parsing helpers) — run `python -m
-pytest tests/` before opening a PR; it's cheap and catches real
-regressions. For everything else:
+pieces that don't touch those services (the recommendation-accuracy regex
+used by eval's fuse()-agreement check, `generate_real_dataset.py`'s
+filter/parsing helpers) — run `python -m pytest tests/` before opening a
+PR; it's cheap and catches real regressions. For everything else:
 
 - If you change a generator script, run it locally (both are plain Python;
   `generate_synthetic_dataset.py` needs no dependencies beyond the standard
