@@ -57,14 +57,16 @@ PR; it's cheap and catches real regressions. For everything else:
   the same "{ticker} moved {pct:+.1f}% over the last 3 trading days."
   price-context phrasing), since the model is trained on one shape and
   served against whatever these renderers actually produce.
-- Separately, `fusion_rules.py` (the deterministic news_reaction +
-  valuation-gap -> BUY/SELL/HOLD table - the only place a recommendation
-  is ever decided, in either training data generation or production) must
-  stay byte-identical between this repo's own `fusion_rules.py` and
-  `financial-sentiment-api`'s `app/services/fusion.py`. A drift here means
-  training data and production compute different recommendations for the
-  same (news_reaction, valuation gap) pair - a correctness bug, not just a
-  formatting one.
+- `fusion_rules.py` (the deterministic news_reaction + valuation-gap ->
+  BUY/SELL/HOLD table) no longer has a synced counterpart in
+  `financial-sentiment-api` - Task B's LLM call decides the
+  recommendation itself at inference now (see
+  docs/task-b-learned-recommendation-plan.md), and that sibling repo's
+  `app/services/fusion.py` was deleted once nothing there called it
+  anymore. `fusion_rules.py` still lives here, unchanged: it's the only
+  place `generate_real_dataset.py`/`generate_synthetic_dataset.py`/
+  `convert_existing_to_taskb.py` get the recommendation label a Task B
+  training row is taught to reproduce.
 - If you bump the Hugging Face model repo version (the `-financial-
   reasoner-vN` suffix, a different concept from the prompt/schema version
   above), run `python bump_model_version.py vN` instead of hand-editing

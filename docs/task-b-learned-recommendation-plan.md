@@ -137,13 +137,29 @@ unmeasured guess into a hard number — which is the actual gate below.
    (`docs/two-stage-task-a-redesign-plan.md`) — not neglected, just not
    worth the retrain cost yet.
 
-## Open question
+## Open question - resolved
 
 What should production do when the model's recommendation and `fuse()`'s
 disagree, even after this ships and clears the gate? Trust the model
 silently, trust `fuse()` silently, or surface the disagreement in the
-response? This changes what step 6's gate is actually gating, so it's
-worth deciding before shipping, not after.
+response?
+
+**Decided: trust the model silently.** After the retrain cleared the gate
+(95% recommendation-accuracy vs. `fuse()`, see below), `fuse()` was
+removed from `financial-sentiment-api`'s inference path entirely -
+`analyze_two_stage` no longer calls it, `app/services/fusion.py` was
+deleted (nothing else in that repo used it), and the shadow-comparison
+`model_recommendation` field was dropped in favor of a single
+`recommendation` field that's now Task B's own call. `fuse()`/
+`fusion_rules.py` continues to exist only in this repo, to build Task B's
+training labels - it has no production role anymore.
+
+One real, accepted tradeoff from this: unlike the old `fuse()`-backed
+design, a Task B parse failure now means a request has NO recommendation
+at all (previously `fuse()` was a deterministic fallback that never
+depended on Task B's own output succeeding). This was an explicit choice,
+not an oversight - see `financial-sentiment-api`'s `generate_analysis`
+docstring.
 
 ## Verification (once resumed)
 
