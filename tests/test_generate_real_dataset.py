@@ -8,15 +8,120 @@ Run from the repo root:
     python -m pytest tests/
 """
 
+import datetime
+from types import SimpleNamespace
+
 import pytest
 
+import generate_real_dataset
 from generate_real_dataset import (
+    _Assessment,
     _company_match_name,
     _is_low_content_headline,
     _is_low_quality_publisher,
     _is_relevant_headline,
     _parse_gemini_output,
+    classify_headlines,
+    select_window_headlines,
 )
+
+
+# --- Gemini headline screen ---
+
+
+def _fake_gemini(monkeypatch, parsed=None, errors=()):
+    calls = []
+    errors = list(errors)
+
+    def generate_content(model, contents, config):
+        calls.append(contents)
+        if errors:
+            raise errors.pop(0)
+        return SimpleNamespace(parsed=parsed)
+
+    monkeypatch.setattr(generate_real_dataset, "_gemini_client", SimpleNamespace(models=SimpleNamespace(generate_content=generate_content)))
+    monkeypatch.setattr(generate_real_dataset, "_screen_daily_quota_exhausted", False)
+    monkeypatch.setattr(generate_real_dataset.time, "sleep", lambda seconds: None)
+    return calls
+
+
+HEADLINES = [("Novo Sets Long-Term Targets", "Reuters"), ("Novo Banco reports profit surge", "Reuters")]
+
+
+def test_screen_returns_assessments_in_input_order_with_importance_clamped(monkeypatch):
+    calls = _fake_gemini(monkeypatch, [_Assessment(index=1, relevant=False, importance=0),
+                                       _Assessment(index=0, relevant=True, importance=9)])
+    assert classify_headlines("Novo Nordisk A/S", "NVO", "Healthcare", HEADLINES) == [(True, 5), (False, 1)]
+    assert "0. Novo Sets Long-Term Targets - Reuters" in calls[0]
+
+
+def test_screen_returns_none_on_an_incomplete_response(monkeypatch):
+    _fake_gemini(monkeypatch, [_Assessment(index=0, relevant=True, importance=4)])
+    assert classify_headlines("Novo Nordisk A/S", "NVO", None, HEADLINES) is None
+
+
+def test_screen_retries_a_rate_limit(monkeypatch):
+    calls = _fake_gemini(monkeypatch, [_Assessment(index=0, relevant=True, importance=4),
+                                       _Assessment(index=1, relevant=False, importance=1)],
+                         errors=[RuntimeError("429 RESOURCE_EXHAUSTED 'retryDelay': '1s'")])
+    assert classify_headlines("Novo Nordisk A/S", "NVO", None, HEADLINES) == [(True, 4), (False, 1)]
+    assert len(calls) == 2
+
+
+def test_screen_stops_calling_after_the_daily_quota_is_exhausted(monkeypatch):
+    calls = _fake_gemini(monkeypatch, errors=[RuntimeError("429 RequestsPerDayPerProjectPerModel")])
+    assert classify_headlines("Novo Nordisk A/S", "NVO", None, HEADLINES) is None
+    assert classify_headlines("Novo Nordisk A/S", "NVO", None, HEADLINES) is None
+    assert len(calls) == 1
+
+
+def test_screen_gives_up_after_one_non_rate_limit_error(monkeypatch):
+    calls = _fake_gemini(monkeypatch, errors=[RuntimeError("500 INTERNAL")])
+    assert classify_headlines("Novo Nordisk A/S", "NVO", None, HEADLINES) is None
+    assert len(calls) == 1
+
+
+def test_screen_gives_up_when_rate_limit_retries_run_out(monkeypatch):
+    calls = _fake_gemini(monkeypatch, errors=[RuntimeError("429 RESOURCE_EXHAUSTED")] * 3)
+    assert classify_headlines("Novo Nordisk A/S", "NVO", None, HEADLINES) is None
+    assert len(calls) == generate_real_dataset.GEMINI_MAX_RETRIES + 1
+
+
+def test_only_the_first_pool_of_a_window_is_screened(monkeypatch):
+    screened = []
+
+    def classify(company, ticker, sector, headlines):
+        screened.extend(headlines)
+        return [(True, 3)] * len(headlines)
+
+    monkeypatch.setattr(generate_real_dataset, "classify_headlines", classify)
+    headlines = [(f"Novo item {i}", "Reuters", None) for i in range(generate_real_dataset.SCREEN_POOL_SIZE + 5)]
+    selected = select_window_headlines("NVO", "Novo Nordisk A/S", None, headlines, {})
+    assert len(screened) == len(selected) == generate_real_dataset.SCREEN_POOL_SIZE
+
+
+def test_screened_headlines_are_kept_by_importance_then_recency(monkeypatch):
+    monkeypatch.setattr(generate_real_dataset, "classify_headlines",
+                        lambda company, ticker, sector, headlines: [(True, 3), (True, 5), (False, 5), (True, 2), (True, 3)])
+    day = lambda d: datetime.datetime(2026, 6, d)
+    headlines = [("Novo cuts prices", "TIKR", day(1)), ("Novo wins FDA approval", "Reuters", day(2)),
+                 ("Novo Banco profit", "Reuters", day(3)), ("Novo shares edge up", "Reuters", day(4)),
+                 ("Novo opens a plant", "Reuters", day(5))]
+    skips = {}
+    selected = select_window_headlines("NVO", "Novo Nordisk A/S", "Healthcare", headlines, skips)
+    assert [t for t, _, _ in selected] == ["Novo wins FDA approval", "Novo opens a plant", "Novo cuts prices"]
+    assert skips == {"screen_not_relevant": 1, "screen_unimportant": 1}
+
+
+def test_regex_filters_run_when_the_screen_cannot_answer(monkeypatch):
+    monkeypatch.setattr(generate_real_dataset, "classify_headlines", lambda *args: None)
+    headlines = [("Should You Buy Oracle Stock?", "Motley Fool", None),
+                 ("Oracle signs cloud deal", "MarketBeat", None),
+                 ("Oracle signs cloud deal with OpenAI", "Reuters", None)]
+    skips = {}
+    selected = select_window_headlines("ORCL", "Oracle", "Technology", headlines, skips)
+    assert [t for t, _, _ in selected] == ["Oracle signs cloud deal with OpenAI"]
+    assert skips == {"screen_fallback_windows": 1, "low_content_headline": 1, "low_quality_publisher": 1}
 
 
 # --- _is_low_content_headline ---
