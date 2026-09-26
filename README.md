@@ -8,9 +8,6 @@ training path and no CI. The pure-logic pieces (filters, parsing helpers)
 do have a real `tests/` suite that runs outside Colab via plain `pytest` —
 see CONTRIBUTING.md.
 
-Built as a portfolio/curriculum project — hardened and documented for the
-practice of doing it properly, not because it needs to scale.
-
 ## What this produces
 
 A LoRA-fine-tuned instruction model (Llama 3.2 3B by default; a few other
@@ -120,40 +117,20 @@ CUDA-only — Colab's free TPU v5e-1 tier has no support for either, so
 
 Practical consequences:
 
-- `colab/train/tpu/`'s `MODEL_REGISTRY` only has working entries for `llama-3.2-3b`
-  and `apertus-0.5b` — the default `llama-3.2-3b` repo is swapped to a
-  non-quantized bf16 mirror. `apertus-8b`, `qwen-2.5-7b`, and `mistral-7b`
-  are listed but blocked with a clear error if selected: bf16 with no
-  quantization makes 7B/8B a tight-to-unsafe fit on a single v5e-1's 16GB
-  HBM, and qwen/mistral have no confirmed non-quantized mirror.
-- `colab/train/tpu/train_model.py` installs no `unsloth`/`bitsandbytes` — just
-  `transformers peft trl accelerate datasets` (plus whatever `torch_xla`
-  build Colab's TPU runtime already ships).
-- Both paths push an **adapter-only** model to the same naming scheme
-  (`{HF_USER}/{model}-financial-reasoner-v1`), except the TPU path adds a
-  `-tpu` suffix so a TPU run never overwrites a GPU-trained adapter at the
-  same name, or vice versa. The trailing number is bumped by hand each time
-  a new training attempt is pushed (v4 → v7 so far), so it tracks
-  individual pushes, not the prompt/output schema - the schema itself has
-  stayed the "analyst pipeline" generation (market data/valuation/earnings
-  inputs plus the `answer` output field, introduced at v4) across all of
-  them. Older numbered repos remain on Hugging Face, untouched, for
-  comparison - **run `python bump_model_version.py v8`** (substituting
-  whatever the new number actually is) to bump every reference across the
-  whole repo in one shot instead of hand-editing each one; confirmed live
-  that hand-editing misses files that aren't in the "obvious" gpu/tpu set -
-  `run/run_model.py` and `docs/llm-training-primer.md` both drifted for
-  multiple version bumps before this script existed specifically to catch
-  that. For a quick, no-code-edit comparison in a single session (e.g.
-  "does v6 actually do worse than v7?") instead of a permanent bump, set
-  the optional `MODEL_VERSION` Secret instead - see "Required Colab
-  Secrets" below. The two are for different situations: the Secret is a
-  session-local override with no git trace, the script changes the
-  committed default everyone gets when they haven't set that Secret.
-- The TPU path hasn't been run end-to-end on real TPU hardware yet — the
-  GPU path is the proven one. If you hit an issue running `colab/train/tpu/`'s
-  scripts, that's expected first-run friction, not necessarily something
-  you did wrong.
+- `colab/train/tpu/`'s `MODEL_REGISTRY` only supports `llama-3.2-3b` and
+  `apertus-0.5b` — larger models don't fit a single v5e-1's 16GB HBM
+  without quantization.
+- `colab/train/tpu/train_model.py` installs `transformers`/`peft`/`trl`
+  instead of `unsloth`/`bitsandbytes`.
+- Both paths push an **adapter-only** model to
+  `{HF_USER}/{model}-financial-reasoner-vN`, with the TPU path adding a
+  `-tpu` suffix so the two never collide. Run
+  `python bump_model_version.py v8` to bump the version across every
+  reference in the repo at once (hand-editing reliably misses files); to
+  compare an older push in a single session without a permanent bump, set
+  the optional `MODEL_VERSION` Secret instead.
+- The TPU path hasn't been run end-to-end on real hardware yet — the GPU
+  path is the proven one.
 
 ## Serving the model
 
@@ -199,66 +176,34 @@ the whole point of pulling them from Colab/Kaggle Secrets instead.
 
 ## Key design decisions
 
-- **Two independently-generated datasets, deliberately mixed, not one.**
-  `generate_synthetic_dataset.py` produces hand-authored, template-based
-  examples with verified-by-construction labels — good coverage and clean
-  signal, but a fixed vocabulary a model could in principle memorize.
-  `generate_real_dataset.py` produces real headlines with *proxy* labels
-  (derived from actual subsequent price movement, not a human judgment) —
-  noisier, but real language the synthetic templates can't fully capture.
-  Both write the identical `{ticker, user_query, market_data, valuation,
-  earnings, news, output}` schema so either `train_model.py` (`colab/train/gpu/` or
-  `colab/train/tpu/`) can concatenate them with no reconciliation step.
-- **Real data is undersampled to balance classes, never duplicated**, to
-  avoid teaching the model to memorize repeated rows. The cost is fewer
-  total real-data rows; see `generate_real_dataset.py`'s docstring for the
-  reasoning, and `docs/dataset-fix-plan.md` for why the raw pool (tickers x
-  lookback window) needs to be grown rather than the sampling relaxed.
+- **Two independently-generated datasets, deliberately mixed.**
+  `generate_synthetic_dataset.py` gives clean, verified-by-construction
+  labels but a fixed vocabulary a model could memorize;
+  `generate_real_dataset.py` gives real headlines with noisier *proxy*
+  labels derived from actual subsequent price movement. Both write the
+  same schema so `train_model.py` can concatenate them directly.
+- **Real data is undersampled to balance classes, never duplicated** —
+  duplicating would teach the model to memorize repeated rows.
 - **Validation is held out by ticker AND by template**, not a random row
-  split — with this much template repetition, a random split would leak
-  near-duplicate phrasing into validation and produce a flattering,
-  meaningless accuracy number.
-- **Loss is not the metric that matters here.** The first full training
-  run's loss curves looked like classic overfitting, but the real
-  explanation was more specific — see `docs/training-results-analysis.md`.
-  Evaluate on direction accuracy (`evaluate_model.py`), not loss.
-- **Completion-only loss masking has a real tokenizer gotcha.** The
-  instruction/response markers (passed to unsloth's
-  `train_on_responses_only` in `colab/train/gpu/train_model.py`, or to trl's
-  `DataCollatorForCompletionOnlyLM` in `colab/train/tpu/train_model.py`) must match
-  the *exact* tokenization of the prompt template, including incidental
-  whitespace — a mismatched marker silently masks 100% of the training
-  signal rather than erroring loudly. See the comment above that call in
-  either file for the specific bug this project hit.
-- **The trained model has a measured NEUTRAL-hedging bias** on real,
-  ambiguous headlines (below-random-chance accuracy on real validation data
-  in the first trained model). `docs/dataset-fix-plan.md` documents the
-  diagnosis and the dataset changes made in response.
-- **Real data's `reasoning` text is LLM-written and headline-grounded, not
-  a fixed template.** The original template (`ticker moved X% -> DIRECTION`)
-  never referenced the headline at all — confirmed live as the cause of a
-  second failure mode (a *different* trained model reproducing an
-  identical memorized answer per ticker regardless of what headline it was
-  given, rather than reading it). `generate_real_dataset.py`'s
-  `generate_grounded_reasoning` calls Gemini (`gemini-3.5-flash-lite`) with
-  the headline and the already-decided direction, explicitly telling it not
-  to reference the future price move it doesn't have — direction/confidence
-  stay purely proxy-derived, only the reasoning text changes. Falls back to
-  the old template on an API failure so one bad call doesn't abort a
-  multi-hundred-row run.
-
-- **The model reasons over data, not just headlines, and answers the
-  user directly.** v4 added `market_data`/`valuation`/`earnings` to the
-  prompt and `answer` to the output. Valuation is always a deterministic
-  Graham Number (`sqrt(22.5 x EPS x book value/share)`) computed in code
-  from the row's own price/EPS/book-value — never LLM-generated or
-  hand-waved — so the model learns to read a real number, not to
-  hallucinate one. Any block that couldn't be fetched/computed renders as
-  exactly `Data unavailable.` in both training data and production, so the
-  model is trained on, not just hoped to handle, partial data gaps. See the
-  canonical prompt template comments above `task_a_prompt`/`task_b_prompt`
-  in `colab/train/gpu/train_model.py` and CONTRIBUTING.md's sync rule
-  before changing any of this.
+  split, since a random split would leak near-duplicate phrasing into
+  validation and produce a flattering, meaningless accuracy number.
+- **Direction accuracy is the metric, not loss.** The first training run's
+  loss curves looked like overfitting but weren't — see
+  `docs/training-results-analysis.md`.
+- **Completion-only loss masking needs exact tokenizer-matched markers**,
+  including incidental whitespace — a mismatched marker silently masks
+  100% of the training signal rather than erroring loudly.
+- **Real data's `reasoning` text is LLM-written and headline-grounded**,
+  not a fixed template — an earlier fixed template caused the model to
+  reproduce a memorized answer per ticker instead of reading the headline.
+  Falls back to the template on an API failure.
+- **The model reasons over data, not just headlines, and answers the user
+  directly.** `market_data`/`valuation`/`earnings` are in the prompt and
+  `answer` is in the output; valuation is always a deterministic Graham
+  Number computed in code, never LLM-generated, so the model learns to
+  read a real number instead of hallucinating one. A block that couldn't
+  be fetched renders as exactly `Data unavailable.` in both training data
+  and production.
 
 ## docs/
 
