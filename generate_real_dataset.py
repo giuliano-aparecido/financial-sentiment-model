@@ -307,17 +307,18 @@ and can be concatenated/mixed for training:
 
     data_files={"train": ["dataset_train.jsonl", "dataset_train_real.jsonl"], ...}
 
-By default (ENABLE_TASK_B_GENERATION=False) a plain run only ever
-produces free task="reaction" rows - no Gemini call, no cost. Flip that
-flag to True (GATE A in the two-stage-pipeline plan) to also produce
-task="analysis" rows, at the cost of one Gemini call per kept headline.
+By default (ENABLE_TASK_B_GENERATION=False) a plain run only produces
+task="reaction" rows, whose only Gemini cost is the headline screen - one
+HEADLINE_SCREEN_MODEL call per weekly window (~720 per full run; the free
+tier's daily cap is lower, after which the regex filters take over). Flip
+that flag to True (GATE A in the two-stage-pipeline plan) to also produce
+task="analysis" rows, at the cost of one more Gemini call per kept headline.
 
 Requirements: `pip install yfinance httpx feedparser google-genai pandas beautifulsoup4`
 (pandas is also a transitive yfinance dependency, so usually already
-present), network access, and - only if ENABLE_TASK_B_GENERATION is True -
-a Gemini API key (GEMINI_API_KEY, see generate_grounded_reasoning for
-where that's read from and why the model choice is gemini-3.5-flash-lite
-specifically).
+present), network access, and a Gemini API key (GEMINI_API_KEY, see
+get_secret for where that's read from; HEADLINE_SCREEN_MODEL and
+GEMINI_MODEL for the two models it pays for).
 Unlike the synthetic generator, this is NOT reproducible/deterministic -
 querying the same historical window twice can return different results as
 Google's index changes, and Gemini's reasoning text varies run to run even
@@ -368,6 +369,8 @@ try:
     import yfinance as yf
     from bs4 import BeautifulSoup
     from google import genai
+    from google.genai import types
+    from pydantic import BaseModel
 except ImportError as e:
     raise SystemExit(
         f"This script needs a package that isn't installed ({e.name}). "
@@ -1154,6 +1157,126 @@ def fetch_headlines_for_window(ticker, name, after_date, before_date):
         results.append((title, publisher, published_at))
 
     return results
+
+
+# Keep in sync with financial-sentiment-api's app/services/news_classifier.py.
+HEADLINE_SCREEN_MODEL = "gemini-2.5-flash"
+IMPORTANCE_THRESHOLD = 3
+SCREEN_POOL_SIZE = 30
+_SCREEN_TIMEOUT_MS = 15_000
+
+HEADLINE_SCREEN_PROMPT = (
+    "You are an equity research analyst screening news headlines for one company. "
+    "For each numbered headline decide:\n"
+    "- relevant: true if the headline is about this company, or reports an event that "
+    "directly affects its business or share price (e.g. a competitor's result in its core "
+    "market, a regulator ruling on its products or industry). The company may be referred to by a "
+    "shortened name, brand, product, subsidiary, ticker or executive. False if it is about a "
+    "different company that merely shares a word with this one, a separately listed affiliate "
+    "reporting its own local results, or only mentions it in passing.\n"
+    "- importance: 1-5, how likely the news is to influence the company's stock price or "
+    "fundamental outlook. Rate the concrete event the headline reports, not the company's size. "
+    "5 = material (earnings, guidance, M&A, major regulatory or legal outcome, CEO change, "
+    "large contract, pipeline readout). 3 = meaningful but secondary. "
+    "A headline about a share-price move is rated only by the cause it names; if it names no "
+    "concrete cause, importance is at most 2. 1 = no news event: stock-quote or news-listing "
+    "pages, valuation questions ('is X undervalued', 'should you buy', 'still attractive'), "
+    "listicles, opinion, analyst-rating or fund-holdings (13F) filings, promotional content.\n"
+    "Return one entry per headline, using its number as index."
+)
+
+_screen_daily_quota_exhausted = False
+
+
+class _Assessment(BaseModel):
+    index: int
+    relevant: bool
+    importance: int
+
+
+def classify_headlines(company, ticker, sector, headlines):
+    """One (relevant, importance) per (title, publisher), in input order.
+    None when the call fails or the response doesn't cover every headline.
+    Rate limits are retried like generate_grounded_reasoning's."""
+    global _screen_daily_quota_exhausted
+    if not headlines or _screen_daily_quota_exhausted:
+        return None
+
+    numbered = "\n".join(f"{i}. {title} - {publisher}" for i, (title, publisher) in enumerate(headlines))
+    prompt = f"Company: {company} (ticker {ticker}), sector: {sector or 'unknown'}\n\nHeadlines:\n{numbered}"
+    config = types.GenerateContentConfig(
+        system_instruction=HEADLINE_SCREEN_PROMPT,
+        temperature=0,
+        response_mime_type="application/json",
+        response_schema=list[_Assessment],
+        thinking_config=types.ThinkingConfig(thinking_budget=0),
+        automatic_function_calling=types.AutomaticFunctionCallingConfig(disable=True),
+        http_options=types.HttpOptions(timeout=_SCREEN_TIMEOUT_MS),
+    )
+    parsed = None
+    for attempt in range(GEMINI_MAX_RETRIES + 1):
+        try:
+            parsed = _gemini_client.models.generate_content(
+                model=HEADLINE_SCREEN_MODEL, contents=prompt, config=config
+            ).parsed
+            break
+        except Exception as e:
+            error_text = str(e)
+            if "RequestsPerDayPerProjectPerModel" in error_text:
+                _screen_daily_quota_exhausted = True
+                print("    Gemini DAILY quota exhausted for the headline screen - the rest of this run "
+                      "uses the regex filters.", flush=True)
+                return None
+            is_rate_limited = "RESOURCE_EXHAUSTED" in error_text or "429" in error_text
+            if is_rate_limited and attempt < GEMINI_MAX_RETRIES:
+                wait = _retry_delay_seconds(error_text)
+                print(f"    Headline screen rate limit hit for {ticker!r} - waiting {wait:.0f}s before retry {attempt + 1}/{GEMINI_MAX_RETRIES}...", flush=True)
+                time.sleep(wait)
+                continue
+            print(f"    Warning: headline screen failed for {ticker!r} ({e!r}) - using the regex filters.", flush=True)
+            return None
+
+    by_index = {a.index: a for a in parsed or [] if 0 <= a.index < len(headlines)}
+    if len(by_index) != len(headlines):
+        print(f"    Warning: headline screen for {ticker!r} covered {len(by_index)} of {len(headlines)} "
+              f"headlines - using the regex filters.", flush=True)
+        return None
+    return [(by_index[i].relevant, max(1, min(5, by_index[i].importance))) for i in range(len(headlines))]
+
+
+def select_window_headlines(ticker, name, sector, headlines, skips):
+    """The window's headlines worth labeling, best first: those among the
+    first SCREEN_POOL_SIZE the Gemini screen rates relevant and important,
+    by importance then recency; the regex quality/relevance filters in
+    original order when the screen can't answer. Tallies each rejection
+    into `skips`."""
+    pool = headlines[:SCREEN_POOL_SIZE]
+    assessments = classify_headlines(name, ticker, sector, [(t, p) for t, p, _ in pool])
+    if assessments is not None:
+        kept = []
+        for headline, (relevant, importance) in zip(pool, assessments):
+            if not relevant:
+                skips["screen_not_relevant"] = skips.get("screen_not_relevant", 0) + 1
+            elif importance < IMPORTANCE_THRESHOLD:
+                skips["screen_unimportant"] = skips.get("screen_unimportant", 0) + 1
+            else:
+                kept.append((importance, headline))
+        kept.sort(key=lambda ih: (ih[0], ih[1][2] or datetime.datetime.min), reverse=True)
+        return [headline for _, headline in kept]
+
+    if headlines:
+        skips["screen_fallback_windows"] = skips.get("screen_fallback_windows", 0) + 1
+    selected = []
+    for title, publisher, published_at in headlines:
+        if _is_low_quality_publisher(publisher):
+            skips["low_quality_publisher"] = skips.get("low_quality_publisher", 0) + 1
+        elif _is_low_content_headline(title):
+            skips["low_content_headline"] = skips.get("low_content_headline", 0) + 1
+        elif not _is_relevant_headline(ticker, name, sector, title):
+            skips["not_relevant"] = skips.get("not_relevant", 0) + 1
+        else:
+            selected.append((title, publisher, published_at))
+    return selected
 
 
 def measure_reaction_windows(ticker_obj, published_at, earnings_dates=None):
@@ -2836,8 +2959,8 @@ def process_ticker(ticker, name):
     here is shared across threads. The two things that ARE shared - the
     output files and the aggregate counters/skip totals - are written under
     _write_lock/_stats_lock by this function and its caller respectively.
-    _gemini_daily_quota_exhausted (see generate_grounded_reasoning) is also
-    shared but deliberately left unlocked - it's a monotonic, write-once
+    _gemini_daily_quota_exhausted and _screen_daily_quota_exhausted are also
+    shared but deliberately left unlocked - each is a monotonic, write-once
     bool; the worst case of an unsynchronized race on it is a handful of
     extra wasted Gemini calls right at the quota boundary, not a
     correctness bug, so a lock there would cost more than it protects.
@@ -2886,23 +3009,17 @@ def process_ticker(ticker, name):
         # wasting a price-lookup + Gemini call on a headline that would be
         # discarded anyway.
         kept_this_window = 0
-        for title, publisher, published_at in headlines:
+        unseen = []
+        for headline in headlines:
+            if headline[0] not in seen_titles:
+                seen_titles.add(headline[0])
+                unseen.append(headline)
+        selected = select_window_headlines(ticker, name, fundamentals_history.get("sector"), unseen, ticker_skips)
+        for title, publisher, published_at in selected:
             if kept >= MAX_HEADLINES_PER_TICKER:
                 break
             if kept_this_window >= MAX_HEADLINES_PER_WINDOW:
                 break
-            if title in seen_titles:
-                continue
-            seen_titles.add(title)
-            if _is_low_quality_publisher(publisher):
-                ticker_skips["low_quality_publisher"] = ticker_skips.get("low_quality_publisher", 0) + 1
-                continue
-            if _is_low_content_headline(title):
-                ticker_skips["low_content_headline"] = ticker_skips.get("low_content_headline", 0) + 1
-                continue
-            if not _is_relevant_headline(ticker, name, fundamentals_history.get("sector"), title):
-                ticker_skips["not_relevant"] = ticker_skips.get("not_relevant", 0) + 1
-                continue
 
             examples, skip_reason = make_real_example(
                 ticker, ticker_obj, fundamentals_history, title, publisher, published_at)
