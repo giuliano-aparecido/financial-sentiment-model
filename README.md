@@ -274,9 +274,16 @@ the whole point of pulling them from Colab/Kaggle Secrets instead.
 
 ## License
 
-Dual-licensed under either of
+The code in this repository (training/eval scripts, dataset tooling,
+docs) is dual-licensed under either of
 
 - [MIT license](LICENSE-MIT)
 - [Apache License, Version 2.0](LICENSE-APACHE)
 
 at your option.
+
+This does **not** extend to the fine-tuned model weights this pipeline
+produces. They are LoRA adapters trained on top of Llama 3.2, so their
+use is governed by [Meta's Llama 3.2 Community License](https://github.com/meta-llama/llama-models/blob/main/models/llama3_2/LICENSE)
+(attribution requirement, acceptable-use policy, and a required "Built
+with Llama" notice), independent of the MIT/Apache-2.0 terms above.
