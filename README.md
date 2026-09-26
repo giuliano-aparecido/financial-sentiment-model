@@ -271,3 +271,12 @@ the whole point of pulling them from Colab/Kaggle Secrets instead.
   curves were misleading, and what to measure instead.
 - `dataset-fix-plan.md` — the diagnosis and fix plan for the real-data
   accuracy gap found during evaluation.
+
+## License
+
+Dual-licensed under either of
+
+- [MIT license](LICENSE-MIT)
+- [Apache License, Version 2.0](LICENSE-APACHE)
+
+at your option.
