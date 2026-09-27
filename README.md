@@ -12,6 +12,10 @@ notebook (RunPod or any GPU box) — no CI either way. The pure-logic pieces
 (filters, parsing helpers) do have a real `tests/` suite that runs outside
 any notebook via plain `pytest` — see CONTRIBUTING.md.
 
+## Documentation
+
+- [`PROJECT.md`](PROJECT.md) — repo structure, key design decisions
+
 ## What this produces
 
 A LoRA-fine-tuned instruction model (Llama 3.2 3B by default; a few other
@@ -219,37 +223,6 @@ used, so it's exercised, known-good logic in a new context.
 `train_model.py`'s standalone-script path is new in this repo - the old
 RunPod copy never supported it - and hasn't been run end to end on real
 hardware yet.
-
-## Key design decisions
-
-- **Two independently-generated datasets, deliberately mixed.**
-  `generate_synthetic_dataset.py` gives clean, verified-by-construction
-  labels but a fixed vocabulary a model could memorize;
-  `generate_real_dataset.py` gives real headlines with noisier *proxy*
-  labels derived from actual subsequent price movement. Both write the
-  same schema so `train_model.py` can concatenate them directly.
-- **Real data is undersampled to balance classes, never duplicated** —
-  duplicating would teach the model to memorize repeated rows.
-- **Validation is held out by ticker AND by template**, not a random row
-  split, since a random split would leak near-duplicate phrasing into
-  validation and produce a flattering, meaningless accuracy number.
-- **Direction accuracy is the metric, not loss.** The first training run's
-  loss curves looked like overfitting but weren't measuring what actually
-  mattered.
-- **Completion-only loss masking needs exact tokenizer-matched markers**,
-  including incidental whitespace — a mismatched marker silently masks
-  100% of the training signal rather than erroring loudly.
-- **Real data's `reasoning` text is LLM-written and headline-grounded**,
-  not a fixed template — an earlier fixed template caused the model to
-  reproduce a memorized answer per ticker instead of reading the headline.
-  Falls back to the template on an API failure.
-- **The model reasons over data, not just headlines, and answers the user
-  directly.** `market_data`/`valuation`/`earnings` are in the prompt and
-  `answer` is in the output; valuation is always a deterministic Graham
-  Number computed in code, never LLM-generated, so the model learns to
-  read a real number instead of hallucinating one. A block that couldn't
-  be fetched renders as exactly `Data unavailable.` in both training data
-  and production.
 
 ## License
 
