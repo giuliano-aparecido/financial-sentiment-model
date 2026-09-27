@@ -91,7 +91,7 @@ class InferenceRequest(BaseModel):
 # Required so this endpoint isn't open to anyone who reaches the ngrok URL -
 # add an "ENDPOINT_AUTH_TOKEN" Colab/Kaggle Secret (or env var, off-platform)
 # with any random string, and set financial-sentiment-api's HF_API_TOKEN to
-# match. Same check as ../../modal/serve.py's serving alternative.
+# match. Same check as ../modal/serve.py's serving alternative.
 ENDPOINT_AUTH_TOKEN = get_secret("ENDPOINT_AUTH_TOKEN")
 auth_scheme = HTTPBearer()
 

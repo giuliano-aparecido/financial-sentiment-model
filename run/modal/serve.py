@@ -1,6 +1,6 @@
 """
 Serves one fine-tuned financial-reasoner model on Modal as its own
-scale-to-zero app, as an alternative to ../notebooks/run/run_model.py's
+scale-to-zero app, as an alternative to ../notebooks/run_model.py's
 Colab+ngrok tunnel. Same model-loading call (FastLanguageModel.from_pretrained,
 4-bit, HF_USER/MODEL_CHOICE/MODEL_VERSION resolution) and the exact same
 /generate request/response shape ({"inputs": ..., "parameters": {...}} in,
@@ -22,8 +22,8 @@ One deploy per model, parameterized by env vars read at `modal deploy` time:
                    confirmed live with apertus-8b (all-NaN logits, every token
                    id 0, empty output). llama-3.1-8b tolerates fp16 on a T4.
 
-    MODEL_CHOICE=apertus-8b GPU=L4 modal deploy modal/serve.py
-    MODEL_CHOICE=llama-3.1-8b        modal deploy modal/serve.py
+    MODEL_CHOICE=apertus-8b GPU=L4 modal deploy run/modal/serve.py
+    MODEL_CHOICE=llama-3.1-8b        modal deploy run/modal/serve.py
 
 Each model gets app financial-sentiment-reasoner-<MODEL> and volume
 financial-sentiment-model-cache-<MODEL>, so one model's traffic, cold starts
@@ -77,7 +77,7 @@ from pydantic import BaseModel
 
 MODEL_CHOICE = os.environ.get("MODEL_CHOICE")
 if not MODEL_CHOICE:
-    raise SystemExit("MODEL_CHOICE is required, e.g.: MODEL_CHOICE=apertus-8b GPU=L4 modal deploy modal/serve.py")
+    raise SystemExit("MODEL_CHOICE is required, e.g.: MODEL_CHOICE=apertus-8b GPU=L4 modal deploy run/modal/serve.py")
 MODEL_VERSION = os.environ.get("MODEL_VERSION", "v1")
 MODEL = os.environ.get("MODEL") or MODEL_CHOICE.split("-", 1)[0]
 GPU = os.environ.get("GPU", "T4")
