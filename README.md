@@ -4,7 +4,7 @@
 *Also an experiment in LoRA fine-tuning and self-hosting a small LLM.*
 
 Dataset generation, LoRA fine-tuning, and evaluation scripts for the LLM
-that powers [`financial-sentiment-api`](https://github.com/GiulianoAparecido/financial-sentiment-api)'s
+that powers [`financial-sentiment-api`](https://github.com/giuliano-aparecido/financial-sentiment-api)'s
 news-sentiment reasoning. The GPU training/eval scripts (`notebooks/train/gpu/`)
 are designed to be pasted into a Colab/Kaggle/RunPod notebook cell and run
 on a free/rented GPU, or run directly as a plain `python` script outside a
