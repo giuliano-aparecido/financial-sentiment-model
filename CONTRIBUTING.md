@@ -41,12 +41,12 @@ PR; it's cheap and catches real regressions. For everything else:
   classification, `task_b_prompt` for reasoning/answer generation - see
   the two-stage pipeline redesign in `generate_real_dataset.py`'s history)
   or the output JSON schema, keep SEVEN files in sync, all carrying BOTH
-  templates byte-identically: `colab/train/gpu/train_model.py`,
-  `colab/train/tpu/train_model.py`, their own `evaluate_model.py`/
+  templates byte-identically: `notebooks/train/gpu/train_model.py`,
+  `notebooks/train/tpu/train_model.py`, their own `evaluate_model.py`/
   `evaluate_base_model_only.py` copies (4 more copies, 6 total), and
   `financial-sentiment-api`'s `app/services/inference.py` (7 total) — a
   mismatch anywhere in that set silently trains or serves a different
-  shape than the others expect. (`colab/train/gpu/train_model.py`/
+  shape than the others expect. (`notebooks/train/gpu/train_model.py`/
   `evaluate_model.py` also cover RunPod/plain-GPU-box runs - paste into a
   notebook cell there, or run directly as a script, see their own
   docstrings - so there's no separate RunPod copy to keep in sync.) The
@@ -80,9 +80,9 @@ PR; it's cheap and catches real regressions. For everything else:
   version bumps.
 - If you change anything that affects the instruction/response markers
   used for completion-only loss masking (`train_on_responses_only`'s
-  `instruction_part`/`response_part` in `colab/train/gpu/train_model.py`, or
+  `instruction_part`/`response_part` in `notebooks/train/gpu/train_model.py`, or
   `DataCollatorForCompletionOnlyLM`'s `instruction_template`/
-  `response_template` in `colab/train/tpu/train_model.py`), re-verify the tokenization
+  `response_template` in `notebooks/train/tpu/train_model.py`), re-verify the tokenization
   match locally (load the target model's tokenizer, tokenize the marker in
   isolation and embedded in a real formatted example, confirm the token
   sequence actually appears) — see the comment above that call in either

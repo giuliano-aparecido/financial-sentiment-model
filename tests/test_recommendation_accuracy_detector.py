@@ -1,7 +1,7 @@
 """Tests for the Task B recommendation-accuracy regex (RECOMMENDATION_RE),
-duplicated byte-identically across 4 eval scripts (colab/train/{gpu,tpu}/
+duplicated byte-identically across 4 eval scripts (notebooks/train/{gpu,tpu}/
 evaluate_model.py and their evaluate_base_model_only.py siblings - see
-CONTRIBUTING.md's sync convention; colab/train/gpu/evaluate_model.py also
+CONTRIBUTING.md's sync convention; notebooks/train/gpu/evaluate_model.py also
 covers RunPod/plain-GPU-box runs, see its own docstring). Replaces
 test_direction_consistency_detector.py: that file tested the old
 _has_opposite_action_language/_OPPOSITE_ACTION_WORDS heuristic, which
@@ -32,10 +32,10 @@ import re
 import pytest
 
 EVAL_SCRIPT_PATHS = [
-    "colab/train/gpu/evaluate_model.py",
-    "colab/train/gpu/evaluate_base_model_only.py",
-    "colab/train/tpu/evaluate_model.py",
-    "colab/train/tpu/evaluate_base_model_only.py",
+    "notebooks/train/gpu/evaluate_model.py",
+    "notebooks/train/gpu/evaluate_base_model_only.py",
+    "notebooks/train/tpu/evaluate_model.py",
+    "notebooks/train/tpu/evaluate_base_model_only.py",
 ]
 
 

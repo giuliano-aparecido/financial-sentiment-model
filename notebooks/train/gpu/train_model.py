@@ -90,7 +90,7 @@ MODEL_REGISTRY = {
 
     # Default as of v1 - a real 8B-class instruct model (vs. llama-3.2-3b's
     # 3B) fits comfortably in this path's bnb-4bit quantization on a free
-    # T4/A100, unlike the TPU path (see colab/train/tpu/train_model.py's
+    # T4/A100, unlike the TPU path (see notebooks/train/tpu/train_model.py's
     # identically-named entry, which stays blocked there - bf16-only, no
     # quantization, makes 8B a tight/unsafe fit on a v5e-1's 16GB HBM).
     "llama-3.1-8b": {

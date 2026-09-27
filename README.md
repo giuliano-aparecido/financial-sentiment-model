@@ -2,17 +2,18 @@
 
 Dataset generation, LoRA fine-tuning, and evaluation scripts for the LLM
 that powers [`financial-sentiment-api`](https://github.com/GiulianoAparecido/financial-sentiment-api)'s
-news-sentiment reasoning. Everything here is designed to be pasted into
-Google Colab cells and run on Colab's free GPU tier — there's no local
-training path and no CI. The pure-logic pieces (filters, parsing helpers)
-do have a real `tests/` suite that runs outside Colab via plain `pytest` —
-see CONTRIBUTING.md.
+news-sentiment reasoning. The GPU training/eval scripts (`notebooks/train/gpu/`)
+are designed to be pasted into a Colab/Kaggle/RunPod notebook cell and run
+on a free/rented GPU, or run directly as a plain `python` script outside a
+notebook (RunPod or any GPU box) — no CI either way. The pure-logic pieces
+(filters, parsing helpers) do have a real `tests/` suite that runs outside
+any notebook via plain `pytest` — see CONTRIBUTING.md.
 
 ## What this produces
 
 A LoRA-fine-tuned instruction model (Llama 3.2 3B by default; a few other
-open models are supported via `MODEL_REGISTRY` in `colab/train/gpu/train_model.py` /
-`colab/train/tpu/train_model.py`), trained on TWO tasks rather than one -
+open models are supported via `MODEL_REGISTRY` in `notebooks/train/gpu/train_model.py` /
+`notebooks/train/tpu/train_model.py`), trained on TWO tasks rather than one -
 the two-stage pipeline redesign: the model itself only ever reasons about
 the unpredictable input (the news); a deterministic rule
 (`fusion_rules.py`) decides BUY/SELL/HOLD, never the model.
@@ -51,11 +52,21 @@ classification into the recommendation Task B is given. If you change
 either output schema or either prompt structure here, that repo needs a
 matching change (see CONTRIBUTING.md's sync rule).
 
-## Pipeline (run each of these as its own Colab cell, in order)
+**Training and running, at a glance:** generate datasets and train via
+the [Pipeline](#pipeline-training) below (Colab, Kaggle, or - see
+[Running on RunPod](#running-on-runpod-or-any-plain-gpu-box) - RunPod/any
+GPU box); once trained, [Serving the model](#serving-the-model) covers how
+`financial-sentiment-api` actually calls it in production.
 
-Steps 1-3 are hardware-agnostic and identical either way. Steps 4-5 branch
-depending on which free Colab accelerator you're using — pick **one** of
-`colab/train/gpu/` or `colab/train/tpu/`, not both, for a given training run.
+## Pipeline (training)
+
+Run each step as its own cell in a Colab/Kaggle/RunPod notebook, in order
+- step 4/5's `notebooks/train/gpu/` scripts also run as a plain
+  `python train_model.py`/`evaluate_model.py` on RunPod or any GPU box
+  (see "Running on RunPod" below). Steps 1-3 are hardware-agnostic and
+  identical either way. Steps 4-5 branch depending on which accelerator
+  you're using — pick **one** of `notebooks/train/gpu/` or
+  `notebooks/train/tpu/`, not both, for a given training run.
 
 1. **`!pip install -q yfinance httpx feedparser google-genai pandas`** —
    dependencies for the real-data generator (step 3; `pandas` is also a
@@ -82,11 +93,11 @@ depending on which free Colab accelerator you're using — pick **one** of
    several minutes given the number of tickers and historical windows it
    scans, plus one Gemini call per kept headline; this is expected, not a
    hang. Requires a `GEMINI_API_KEY` secret — see below.
-4. **`colab/train/gpu/train_model.py`** (T4) or **`colab/train/tpu/train_model.py`** (v5e-1) —
+4. **`notebooks/train/gpu/train_model.py`** (T4) or **`notebooks/train/tpu/train_model.py`** (v5e-1) —
    loads the base model, adds a LoRA adapter, mixes both datasets from
    steps 2-3, fine-tunes with early stopping, and pushes the result to
    your Hugging Face account.
-5. **`colab/train/gpu/evaluate_model.py`** or **`colab/train/tpu/evaluate_model.py`** (match
+5. **`notebooks/train/gpu/evaluate_model.py`** or **`notebooks/train/tpu/evaluate_model.py`** (match
    whichever you used for step 4) — self-contained: reuses
    `model`/`tokenizer`/`task_a_prompt`/`task_b_prompt` if run immediately after step 4 in
    the same session, or reloads the already-pushed model straight from
@@ -100,27 +111,27 @@ depending on which free Colab accelerator you're using — pick **one** of
    base-model (untrained) comparison so you know how much the fine-tune
    actually helped.
 
-`evaluate_base_model_only.py` (in the matching `colab/train/gpu/` or `colab/train/tpu/` directory)
+`evaluate_base_model_only.py` (in the matching `notebooks/train/gpu/` or `notebooks/train/tpu/` directory)
 is a standalone fallback for when you need *just* the base-model
 comparison on its own (e.g. you already have `evaluate_model.py`'s
 fine-tuned numbers from an earlier run and don't want to redo that pass) —
 same self-contained reload-or-reuse behavior as `evaluate_model.py` above,
 just skipping the tuned pass entirely.
 
-### GPU (`colab/train/gpu/`) vs TPU (`colab/train/tpu/`)
+### GPU (`notebooks/train/gpu/`) vs TPU (`notebooks/train/tpu/`)
 
 The two paths are **not** just a device-name swap. `unsloth` (fast LoRA
 loading/training) and `bitsandbytes` (4-bit quantization) are both
 CUDA-only — Colab's free TPU v5e-1 tier has no support for either, so
-`colab/train/tpu/`'s scripts are a separate implementation on plain `transformers` +
+`notebooks/train/tpu/`'s scripts are a separate implementation on plain `transformers` +
 `peft` + `trl`, training in bf16 with no quantization instead.
 
 Practical consequences:
 
-- `colab/train/tpu/`'s `MODEL_REGISTRY` only supports `llama-3.2-3b` and
+- `notebooks/train/tpu/`'s `MODEL_REGISTRY` only supports `llama-3.2-3b` and
   `apertus-0.5b` — larger models don't fit a single v5e-1's 16GB HBM
   without quantization.
-- `colab/train/tpu/train_model.py` installs `transformers`/`peft`/`trl`
+- `notebooks/train/tpu/train_model.py` installs `transformers`/`peft`/`trl`
   instead of `unsloth`/`bitsandbytes`.
 - Both paths push an **adapter-only** model to
   `{HF_USER}/{model}-financial-reasoner-vN`, with the TPU path adding a
@@ -140,10 +151,10 @@ HTTP - pick one, both speak the exact same `{"inputs": ..., "parameters":
 between them is just repointing that model's inference URL (its
 runtime-mutable `/api/update-inference-url` endpoint exists for exactly this):
 
-- **`colab/run/run_model.py`** (default) - paste into a Colab cell, loads the
+- **`notebooks/run/run_model.py`** (default) - paste into a Colab cell, loads the
   model on Colab's free GPU, exposes it through an ngrok tunnel. Free, but
   the tunnel dies with the Colab session (90-minute idle timeout, 12-hour
-  hard cap - see `colab/run/keep_running.py`), and needs a browser tab open.
+  hard cap - see `notebooks/run/keep_running.py`), and needs a browser tab open.
 - **`modal/serve.py`** - deploys to [Modal](https://modal.com) as a
   scale-to-zero serverless GPU function, one app per model
   (`MODEL_CHOICE=apertus-8b GPU=L4 modal deploy modal/serve.py`): no
@@ -176,7 +187,7 @@ the whole point of pulling them from Colab/Kaggle Secrets instead.
 
 ## Running on RunPod (or any plain GPU box)
 
-`colab/train/gpu/train_model.py` and `evaluate_model.py` work outside
+`notebooks/train/gpu/train_model.py` and `evaluate_model.py` work outside
 Colab/Kaggle too - paste either into a RunPod pod's Jupyter cell, or run
 directly as `python train_model.py` / `python evaluate_model.py`. Set the
 Secrets above (`HF_TOKEN`, `HF_USER`, etc.) as real environment variables
@@ -227,8 +238,8 @@ hardware yet.
 ## docs/
 
 - `llm-training-primer.md` — a from-zero explanation of what every part of
-  `colab/train/gpu/train_model.py` does, for anyone reading this without an ML
-  background. Written against the GPU/unsloth path; `colab/train/tpu/train_model.py`
+  `notebooks/train/gpu/train_model.py` does, for anyone reading this without an ML
+  background. Written against the GPU/unsloth path; `notebooks/train/tpu/train_model.py`
   swaps the same conceptual steps onto a different toolchain (see the
   "GPU vs TPU" section above).
 - `training-results-analysis.md` — why the first training run's loss

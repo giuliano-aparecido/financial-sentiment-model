@@ -1,6 +1,6 @@
 """
 Serves one fine-tuned financial-reasoner model on Modal as its own
-scale-to-zero app, as an alternative to ../colab/run/run_model.py's
+scale-to-zero app, as an alternative to ../notebooks/run/run_model.py's
 Colab+ngrok tunnel. Same model-loading call (FastLanguageModel.from_pretrained,
 4-bit, HF_USER/MODEL_CHOICE/MODEL_VERSION resolution) and the exact same
 /generate request/response shape ({"inputs": ..., "parameters": {...}} in,

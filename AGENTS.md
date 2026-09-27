@@ -3,7 +3,7 @@
 Full documentation lives in dedicated files, not duplicated here:
 
 - [`README.md`](README.md) — what this pipeline produces, the two-stage
-  Task A/Task B design, Colab-only training path
+  Task A/Task B design, notebook/standalone-script training path
 - [`CONTRIBUTING.md`](CONTRIBUTING.md) — **branch + PR is required here,
   never push directly to `main`** — see there for the exact workflow, the
   no-CI-so-run-it-yourself testing expectations, and the byte-identical

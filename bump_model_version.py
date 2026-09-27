@@ -1,8 +1,8 @@
 """
 Bumps the Hugging Face model repo version (e.g. "v7" -> "v8") across every
 file in this repo that references it, in one command instead of manually
-hunting through colab/train/gpu/train_model.py, evaluate_model.py,
-evaluate_base_model_only.py, colab/run/run_model.py, README.md, and
+hunting through notebooks/train/gpu/train_model.py, evaluate_model.py,
+evaluate_base_model_only.py, notebooks/run/run_model.py, README.md, and
 docs/llm-training-primer.md separately.
 
 Confirmed live this is worth automating: two prior manual bump passes
@@ -20,7 +20,7 @@ Usage:
     python bump_model_version.py v8
     python bump_model_version.py 8          # "v" prefix optional
 
-Auto-detects the CURRENT version from colab/train/gpu/train_model.py's own
+Auto-detects the CURRENT version from notebooks/train/gpu/train_model.py's own
 MODEL_VERSION_DEFAULT line (the canonical source of truth - the actual
 GPU training script that pushes the model), so you never type the old
 version and risk a stale or mistyped one silently no-op-ing.
