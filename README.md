@@ -174,6 +174,15 @@ running the whole notebook unattended via "Run all."
 None of these values are ever written into any file in this repo — that's
 the whole point of pulling them from Colab/Kaggle Secrets instead.
 
+## Running on RunPod (or any plain GPU box)
+
+`colab/train/gpu/train_model.py` and `evaluate_model.py` work unmodified
+outside Colab/Kaggle too - paste either into a RunPod pod's Jupyter cell,
+or run directly as `python train_model.py` / `python evaluate_model.py`.
+Set the Secrets above (`HF_TOKEN`, `HF_USER`, etc.) as real environment
+variables instead - `export HF_TOKEN=...` before running, or via your
+pod's env-var config. No separate RunPod-specific script to keep in sync.
+
 ## Key design decisions
 
 - **Two independently-generated datasets, deliberately mixed.**

@@ -1,43 +1,55 @@
-!pip install "unsloth[colab-new] @ git+https://github.com/unslothai/unsloth.git"
-!pip install --no-deps trl peft accelerate bitsandbytes
+"""
+Direction-accuracy evaluation for train_model.py's output. Paste as ONE
+cell into a Colab/Kaggle/RunPod notebook, or run directly as
+`python evaluate_model.py` on RunPod or any plain GPU box - both work
+unmodified: installs use subprocess rather than Jupyter `!pip` magic (a
+SyntaxError outside a notebook), get_secret() falls back to a plain
+environment variable outside Colab/Kaggle, and the reuse-vs-reload check
+below is a plain `try: model ... except NameError` - which already reloads
+correctly in a standalone script run, since `model` is never predefined
+there.
 
-# Direction-accuracy evaluation - paste as ONE Colab cell. Self-contained:
-# the two pip installs above match gpu/train_model.py's exactly - PR #16
-# made this script reload the model from HF instead of requiring the
-# training cell's variables in memory, but stopped short of installing its
-# own dependencies too, so a genuinely fresh session (no training cell run
-# at all this session) still hit ModuleNotFoundError on `unsloth` even
-# after that fix. These installs are safe to re-run if the training cell
-# already ran in this session too - pip just no-ops on an already-
-# satisfied requirement. Works whether the previous session is still alive
-# (reuses `model`,
-# `tokenizer`, `task_a_prompt`, `task_b_prompt` already in memory - the normal case,
-# right after the training cell) or crashed/expired (reloads the
-# finished, already-pushed model fresh from Hugging Face - e.g. re-running
-# this cell after a prior run of THIS SAME script crashed partway through,
-# such as the confusion-matrix sort TypeError this eval script used to hit
-# on any row with an unparseable model output; that crash happened after
-# training had already finished and pushed, so there was nothing left to
-# retrain - only this cell needed re-running). Either way, needs the
-# dataset_val*.jsonl files present on disk (regenerate
-# generate_synthetic_dataset.py/generate_real_dataset.py first if this is
-# a fresh session that doesn't have them).
-#
-# What it measures - the metric that actually matters, which token loss
-# doesn't (see docs/training-results-analysis.md):
-#   - recommendation accuracy (BUY/SELL/HOLD correct or not), overall
-#     and split by val source (synthetic vs real) and by class (confusion
-#     matrix per source, to spot "always answers HOLD"-style bias and
-#     whether it's source-specific)
-#   - JSON validity rate of the model's raw output
-#   - the same numbers for the BASE model (LoRA adapter temporarily
-#     disabled) as the missing baseline - the base-vs-tuned delta is the
-#     true value of the whole training pipeline.
-#
-# Runtime expectation: ~160 rows x 2 passes, one generation each - roughly
-# 15-30 minutes on a T4. Progress prints every 20 rows. The TUNED pass runs
-# FIRST so that if the session dies partway, the number you care most about
-# is already printed.
+Self-contained: the installs below match gpu/train_model.py's exactly, so
+a genuinely fresh run (no training cell/process before it) still gets
+`unsloth` installed rather than hitting ModuleNotFoundError. Safe to
+re-run if training already ran in this same session - pip just no-ops on
+an already-satisfied requirement. Works whether the previous session/
+process is still alive (reuses `model`/`tokenizer`/`task_a_prompt`/
+`task_b_prompt` already in memory - the normal notebook case, right after
+the training cell) or crashed/expired/never ran (reloads the finished,
+already-pushed model fresh from Hugging Face). Either way, needs the
+dataset_val*.jsonl files present on disk (regenerate
+generate_synthetic_dataset.py/generate_real_dataset.py first if this is a
+fresh environment that doesn't have them).
+
+What it measures - the metric that actually matters, which token loss
+doesn't (the first training run's loss curves looked like overfitting but
+weren't measuring what actually mattered):
+  - recommendation accuracy (BUY/SELL/HOLD correct or not), overall
+    and split by val source (synthetic vs real) and by class (confusion
+    matrix per source, to spot "always answers HOLD"-style bias and
+    whether it's source-specific)
+  - JSON validity rate of the model's raw output
+  - the same numbers for the BASE model (LoRA adapter temporarily
+    disabled) as the missing baseline - the base-vs-tuned delta is the
+    true value of the whole training pipeline. Set SKIP_BASE_MODEL_EVAL=1
+    (Colab/Kaggle Secret or env var) to skip this pass once you've already
+    established that baseline once - roughly halves runtime and, off
+    Colab's free tier, the GPU-billing cost of a routine eval run.
+
+Runtime expectation: ~160 rows x 2 passes, one generation each - roughly
+15-30 minutes on a T4-class GPU. Progress prints every 20 rows. The TUNED
+pass runs FIRST so that if the run dies partway, the number you care most
+about is already printed.
+"""
+
+import subprocess
+import sys
+
+subprocess.check_call([sys.executable, "-m", "pip", "install",
+                        "unsloth[colab-new] @ git+https://github.com/unslothai/unsloth.git"])
+subprocess.check_call([sys.executable, "-m", "pip", "install", "--no-deps",
+                        "trl", "peft", "accelerate", "bitsandbytes"])
 
 import json
 import os

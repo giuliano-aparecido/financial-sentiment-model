@@ -1,5 +1,25 @@
-!pip install "unsloth[colab-new] @ git+https://github.com/unslothai/unsloth.git"
-!pip install --no-deps trl peft accelerate bitsandbytes
+"""
+LoRA fine-tuning on any CUDA GPU with unsloth/bitsandbytes support - Colab
+(free T4), Kaggle, RunPod, or a plain GPU box. Paste this whole file into
+a Colab/Kaggle/RunPod notebook cell, or run it directly as
+`python train_model.py` on RunPod or any plain GPU box - both work
+unmodified: get_secret() below falls back to a plain environment variable
+outside Colab/Kaggle, and installs use subprocess rather than Jupyter
+`!pip` magic (a SyntaxError outside a notebook) for exactly this reason.
+
+Outside Colab/Kaggle, set HF_TOKEN/HF_USER (and optionally
+MODEL_CHOICE/MODEL_VERSION) as real environment variables instead of
+Secrets - see the README's "Required Colab Secrets" section, which
+applies here too, env-var-named instead of Secret-named.
+"""
+
+import subprocess
+import sys
+
+subprocess.check_call([sys.executable, "-m", "pip", "install",
+                        "unsloth[colab-new] @ git+https://github.com/unslothai/unsloth.git"])
+subprocess.check_call([sys.executable, "-m", "pip", "install", "--no-deps",
+                        "trl", "peft", "accelerate", "bitsandbytes"])
 
 import os
 import torch
@@ -241,8 +261,8 @@ dataset_dict = load_dataset(
 # Recent Earnings/Recent News & Results).
 # Keep BOTH templates in sync any time inference.py's prompts change, and
 # in sync with ../tpu/train_model.py's copies of these same two strings
-# and the ../{gpu,tpu}/evaluate_*.py and runpod/*.py scripts' copies (see
-# CONTRIBUTING.md's sync rule).
+# and the ../{gpu,tpu}/evaluate_*.py scripts' copies (see CONTRIBUTING.md's
+# sync rule).
 task_a_prompt = """Below is an instruction that describes a task, paired with an input that provides further context. Write a response that appropriately completes the request.
 
 ### Instruction:

@@ -1,7 +1,8 @@
 """Tests for the Task B recommendation-accuracy regex (RECOMMENDATION_RE),
-duplicated byte-identically across 5 eval scripts (colab/train/{gpu,tpu}/
-evaluate_model.py, their evaluate_base_model_only.py siblings, runpod/
-evaluate_model.py - see CONTRIBUTING.md's sync convention). Replaces
+duplicated byte-identically across 4 eval scripts (colab/train/{gpu,tpu}/
+evaluate_model.py and their evaluate_base_model_only.py siblings - see
+CONTRIBUTING.md's sync convention; colab/train/gpu/evaluate_model.py also
+covers RunPod/plain-GPU-box runs, see its own docstring). Replaces
 test_direction_consistency_detector.py: that file tested the old
 _has_opposite_action_language/_OPPOSITE_ACTION_WORDS heuristic, which
 existed only because Task B was handed a recommendation and merely had to
@@ -18,7 +19,7 @@ module already used there) - this exercises the REAL regex that ships in
 each file, not a hand-copied re-implementation that could silently drift
 from it.
 
-Parametrized across all 5 files so a future edit to only one of them (a
+Parametrized across all 4 files so a future edit to only one of them (a
 sync break) fails these tests, not just a manual eyeball diff.
 
 Run from the repo root:
@@ -34,7 +35,6 @@ EVAL_SCRIPT_PATHS = [
     "colab/train/gpu/evaluate_base_model_only.py",
     "colab/train/tpu/evaluate_model.py",
     "colab/train/tpu/evaluate_base_model_only.py",
-    "runpod/evaluate_model.py",
 ]
 
 

@@ -7,7 +7,7 @@ Full documentation lives in dedicated files, not duplicated here:
 - [`CONTRIBUTING.md`](CONTRIBUTING.md) — **branch + PR is required here,
   never push directly to `main`** — see there for the exact workflow, the
   no-CI-so-run-it-yourself testing expectations, and the byte-identical
-  sync requirement across the duplicated Colab/RunPod eval scripts
+  sync requirement across the GPU/TPU eval script copies
 - [`docs/`](docs) — design/audit notes written during specific pieces of
   work (dataset fixes, training results, valuation-prompt audits, the
   two-stage redesign) rather than living reference docs; check dates and

@@ -40,14 +40,17 @@ PR; it's cheap and catches real regressions. For everything else:
 - If you change either prompt template (`task_a_prompt` for news_reaction
   classification, `task_b_prompt` for reasoning/answer generation - see
   the two-stage pipeline redesign in `generate_real_dataset.py`'s history)
-  or the output JSON schema, keep NINE files in sync, all carrying BOTH
+  or the output JSON schema, keep SEVEN files in sync, all carrying BOTH
   templates byte-identically: `colab/train/gpu/train_model.py`,
   `colab/train/tpu/train_model.py`, their own `evaluate_model.py`/
-  `evaluate_base_model_only.py` copies (4 more copies, 6 total),
-  `runpod/train_model.py` and `runpod/evaluate_model.py` (2 more, 8
-  total), and `financial-sentiment-api`'s `app/services/inference.py` (9
-  total) — a mismatch anywhere in that set silently trains or serves a
-  different shape than the others expect. This also covers the
+  `evaluate_base_model_only.py` copies (4 more copies, 6 total), and
+  `financial-sentiment-api`'s `app/services/inference.py` (7 total) — a
+  mismatch anywhere in that set silently trains or serves a different
+  shape than the others expect. `colab/train/gpu/train_model.py`/
+  `evaluate_model.py` also cover RunPod/plain-GPU-box runs (paste into a
+  notebook cell there, or run directly as a script) - see their own
+  docstrings - so there's no separate RunPod copy to keep in sync. This
+  also covers the
   `market_data`/`valuation`/`earnings`/`price_context` block FORMATTING
   (not just the outer templates) — the block renderers in
   `generate_synthetic_dataset.py`, `generate_real_dataset.py`, and

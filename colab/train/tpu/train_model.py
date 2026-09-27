@@ -244,8 +244,8 @@ dataset_dict = load_dataset(
 # Recent Earnings/Recent News & Results).
 # Keep BOTH templates in sync any time inference.py's prompts change, and
 # in sync with ../gpu/train_model.py's copies of these same two strings
-# and the ../{gpu,tpu}/evaluate_*.py and runpod/*.py scripts' copies (see
-# CONTRIBUTING.md's sync rule).
+# and the ../{gpu,tpu}/evaluate_*.py scripts' copies (see CONTRIBUTING.md's
+# sync rule).
 task_a_prompt = """Below is an instruction that describes a task, paired with an input that provides further context. Write a response that appropriately completes the request.
 
 ### Instruction:
