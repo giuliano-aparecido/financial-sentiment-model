@@ -4,7 +4,7 @@
 *Also an experiment in LoRA fine-tuning and self-hosting a small LLM.*
 
 Dataset generation, LoRA fine-tuning, and evaluation scripts for the LLM
-that powers [`financial-sentiment-api`](https://github.com/GiulianoAparecido/financial-sentiment-api)'s
+that powers [`financial-sentiment-api`](https://github.com/giuliano-aparecido/financial-sentiment-api)'s
 news-sentiment reasoning. Everything here is designed to be pasted into
 Google Colab cells and run on Colab's free GPU tier — there's no local
 training path and no CI. The pure-logic pieces (filters, parsing helpers)
