@@ -61,13 +61,20 @@ actually calls it in production.
 
 ## Pipeline (training)
 
-Run each step as its own cell in a Colab/Kaggle/RunPod notebook, in order
-- step 4/5's `notebooks/train/gpu/` scripts also run as a plain
-  `python train_model.py`/`evaluate_model.py` on RunPod or any GPU box
-  (see "Running on RunPod" below). Steps 1-3 are hardware-agnostic and
-  identical either way. Steps 4-5 branch depending on which accelerator
-  you're using — pick **one** of `notebooks/train/gpu/` or
-  `notebooks/train/tpu/`, not both, for a given training run.
+**Prebuilt notebooks** do all of this for you: open
+`notebooks/train/gpu/train_and_evaluate.ipynb` (or `.../tpu/...`) directly
+in Colab, Kaggle, or RunPod's Jupyter, set the secrets/env vars its first
+cell lists, and Run All - it clones this repo fresh and runs steps 1-5
+below as its own cells. `evaluate_base_model_only.ipynb` and
+`notebooks/run/serve_model.ipynb` are the same idea for those two flows.
+
+Or run each step as its own cell by hand, in order - step 4/5's
+`notebooks/train/gpu/` scripts also run as a plain
+`python train_model.py`/`evaluate_model.py` on RunPod or any GPU box
+(see "Running on RunPod" below). Steps 1-3 are hardware-agnostic and
+identical either way. Steps 4-5 branch depending on which accelerator
+you're using — pick **one** of `notebooks/train/gpu/` or
+`notebooks/train/tpu/`, not both, for a given training run.
 
 1. **`!pip install -q yfinance httpx feedparser google-genai pandas`** —
    dependencies for the real-data generator (step 3; `pandas` is also a
@@ -152,10 +159,12 @@ HTTP - pick one, both speak the exact same `{"inputs": ..., "parameters":
 between them is just repointing that model's inference URL (its
 runtime-mutable `/api/update-inference-url` endpoint exists for exactly this):
 
-- **`notebooks/run/run_model.py`** (default) - paste into a Colab cell, loads the
-  model on Colab's free GPU, exposes it through an ngrok tunnel. Free, but
-  the tunnel dies with the Colab session (90-minute idle timeout, 12-hour
-  hard cap - see `notebooks/run/keep_running.py`), and needs a browser tab open.
+- **`notebooks/run/run_model.py`** (default) - paste into a Colab/Kaggle/RunPod
+  cell (or just open `notebooks/run/serve_model.ipynb` directly), loads the
+  model on a free/rented GPU, exposes it through an ngrok tunnel. Free on
+  Colab, but the tunnel dies with the Colab session (90-minute idle
+  timeout, 12-hour hard cap - see `notebooks/run/keep_running.py`), and
+  needs a browser tab open.
 - **`modal/serve.py`** - deploys to [Modal](https://modal.com) as a
   scale-to-zero serverless GPU function, one app per model
   (`MODEL_CHOICE=apertus-8b GPU=L4 modal deploy modal/serve.py`): no
@@ -189,7 +198,9 @@ the whole point of pulling them from Colab/Kaggle Secrets instead.
 ## Running on RunPod (or any plain GPU box)
 
 `notebooks/train/gpu/train_model.py` and `evaluate_model.py` work outside
-Colab/Kaggle too - paste either into a RunPod pod's Jupyter cell, or run
+Colab/Kaggle too - open `notebooks/train/gpu/train_and_evaluate.ipynb` in
+RunPod's Jupyter directly (clones the repo and chains every step for
+you), or paste either script into a cell by hand, or run
 directly as `python train_model.py` / `python evaluate_model.py`. Set the
 Secrets above (`HF_TOKEN`, `HF_USER`, etc.) as real environment variables
 instead - `export HF_TOKEN=...` before running, or via your pod's env-var
