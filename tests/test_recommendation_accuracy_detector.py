@@ -1,7 +1,8 @@
 """Tests for the Task B recommendation-accuracy regex (RECOMMENDATION_RE),
-duplicated byte-identically across 5 eval scripts (colab/train/{gpu,tpu}/
-evaluate_model.py, their evaluate_base_model_only.py siblings, runpod/
-evaluate_model.py - see CONTRIBUTING.md's sync convention). Replaces
+duplicated byte-identically across 4 eval scripts (notebooks/train/{gpu,tpu}/
+evaluate_model.py and their evaluate_base_model_only.py siblings - see
+CONTRIBUTING.md's sync convention; notebooks/train/gpu/evaluate_model.py also
+covers RunPod/plain-GPU-box runs, see its own docstring). Replaces
 test_direction_consistency_detector.py: that file tested the old
 _has_opposite_action_language/_OPPOSITE_ACTION_WORDS heuristic, which
 existed only because Task B was handed a recommendation and merely had to
@@ -10,15 +11,16 @@ docs/task-b-learned-recommendation-plan.md), so eval instead parses that
 recommendation straight out of the model's JSON and compares it to
 fuse()'s ground truth - RECOMMENDATION_RE is the parsing half of that.
 
-None of those scripts are directly importable: they open with Colab `!pip
-install` magic lines and depend on unsloth/torch/a live loaded model at
-import time. So each test here reads the source file as text and extracts
+None of those scripts are directly importable: they install dependencies
+via a top-level `subprocess` pip install and depend on unsloth/torch/a
+live loaded model at import time. So each test here reads the source
+file as text and extracts
 just the RECOMMENDATION_RE line (no external deps beyond the stdlib `re`
 module already used there) - this exercises the REAL regex that ships in
 each file, not a hand-copied re-implementation that could silently drift
 from it.
 
-Parametrized across all 5 files so a future edit to only one of them (a
+Parametrized across all 4 files so a future edit to only one of them (a
 sync break) fails these tests, not just a manual eyeball diff.
 
 Run from the repo root:
@@ -30,11 +32,10 @@ import re
 import pytest
 
 EVAL_SCRIPT_PATHS = [
-    "colab/train/gpu/evaluate_model.py",
-    "colab/train/gpu/evaluate_base_model_only.py",
-    "colab/train/tpu/evaluate_model.py",
-    "colab/train/tpu/evaluate_base_model_only.py",
-    "runpod/evaluate_model.py",
+    "notebooks/train/gpu/evaluate_model.py",
+    "notebooks/train/gpu/evaluate_base_model_only.py",
+    "notebooks/train/tpu/evaluate_model.py",
+    "notebooks/train/tpu/evaluate_base_model_only.py",
 ]
 
 

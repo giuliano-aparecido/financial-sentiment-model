@@ -1,10 +1,21 @@
-!pip install "unsloth[colab-new] @ git+https://github.com/unslothai/unsloth.git"
-!pip install --no-deps trl peft accelerate bitsandbytes
+import subprocess
+import sys
 
+subprocess.check_call([sys.executable, "-m", "pip", "install", "-q", "-U",
+                        "transformers", "peft", "trl", "accelerate", "datasets"])
+
+# torch_xla is expected to already be present and version-matched in a
+# Colab TPU v5e-1 runtime - pip-installing it separately here risks
+# pairing it with a mismatched torch build. If this import fails, the
+# runtime isn't actually set to TPU (Runtime > Change runtime type),
+# not a missing-package problem to pip install around.
 import os
 import torch
-from unsloth import FastLanguageModel
-from trl import SFTTrainer, SFTConfig
+import torch_xla.core.xla_model as xm
+
+from peft import LoraConfig, get_peft_model
+from transformers import AutoModelForCausalLM, AutoTokenizer
+from trl import SFTTrainer, SFTConfig, DataCollatorForCompletionOnlyLM
 from datasets import load_dataset
 
 # Pull config from Colab/Kaggle's own Secrets manager rather than
@@ -19,10 +30,9 @@ from datasets import load_dataset
 #
 # Checking whether `google.colab` IMPORTS is not a reliable way to detect
 # Colab vs Kaggle - some Kaggle base images ship a google-colab package
-# too (Kaggle also offers T4/P100 GPUs, so this path can run there too),
-# so the import succeeds and userdata.get() just hangs and times out
-# instead of raising. KAGGLE_KERNEL_RUN_TYPE is set by Kaggle's own
-# runtime on every notebook - check that directly instead.
+# too, so the import succeeds there and userdata.get() just hangs and
+# times out instead of raising. KAGGLE_KERNEL_RUN_TYPE is set by Kaggle's
+# own runtime on every notebook - check that directly instead.
 def get_secret(name):
     if os.environ.get("KAGGLE_KERNEL_RUN_TYPE"):
         from kaggle_secrets import UserSecretsClient
@@ -41,16 +51,15 @@ def get_secret(name):
 # MODEL_REGISTRY below to train. Add an OPTIONAL "MODEL_CHOICE" Colab/
 # Kaggle Secret (same mechanism as HF_USER/HF_TOKEN, see README's
 # "Required Colab Secrets") to switch base models ad-hoc in this session
-# only, without editing this file - e.g. set it to "apertus-8b" to try a
-# different family. Falls back to the default below if the secret was
-# never created (not just ungranted) - a broad except is deliberate here
-# since Colab/Kaggle raise different exception types for "no such
-# secret", and this one specific secret is optional by design, so any
-# failure to read it should silently fall back, never block or crash. An
-# override naming a key that doesn't exist in MODEL_REGISTRY still fails
-# loudly at the dict lookup below - not worth adding extra validation for
-# a typo in an advanced, opt-in override.
-MODEL_CHOICE_DEFAULT = "llama-3.1-8b"
+# only, without editing this file. Falls back to the default below if the
+# secret was never created (not just ungranted) - a broad except is
+# deliberate here since Colab/Kaggle raise different exception types for
+# "no such secret", and this one specific secret is optional by design,
+# so any failure to read it should silently fall back, never block or
+# crash. An override naming a key that doesn't exist in MODEL_REGISTRY
+# still fails loudly at the dict lookup below - not worth adding extra
+# validation for a typo in an advanced, opt-in override.
+MODEL_CHOICE_DEFAULT = "llama-3.2-3b"
 try:
     MODEL_CHOICE = get_secret("MODEL_CHOICE") or MODEL_CHOICE_DEFAULT
 except Exception:
@@ -60,36 +69,15 @@ MODEL_REGISTRY = {
 
     "llama-3.2-3b": {
 
-        "repo": "unsloth/Llama-3.2-3B-Instruct-bnb-4bit",
+        # Swapped from unsloth/Llama-3.2-3B-Instruct-bnb-4bit (the GPU
+        # script's repo) to the non-quantized bf16 mirror - bitsandbytes
+        # (and its pre-quantized checkpoints) has no TPU backend, so
+        # training here runs in plain bf16 instead of 4-bit.
+        "repo": "unsloth/Llama-3.2-3B-Instruct",
 
         "target_modules": ["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"],
 
         "max_seq_length": 2048,
-
-    },
-
-    # Default as of v1 - a real 8B-class instruct model (vs. llama-3.2-3b's
-    # 3B) fits comfortably in this path's bnb-4bit quantization on a free
-    # T4/A100, unlike the TPU path (see colab/train/tpu/train_model.py's
-    # identically-named entry, which stays blocked there - bf16-only, no
-    # quantization, makes 8B a tight/unsafe fit on a v5e-1's 16GB HBM).
-    "llama-3.1-8b": {
-
-        "repo": "unsloth/Meta-Llama-3.1-8B-Instruct-bnb-4bit",
-
-        "target_modules": ["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"],
-
-        "max_seq_length": 4096,
-
-    },
-
-    "apertus-8b": {
-
-        "repo": "swiss-ai/Apertus-8B-Instruct-2509",
-
-        "target_modules": ["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"],
-
-        "max_seq_length": 4096,
 
     },
 
@@ -103,29 +91,45 @@ MODEL_REGISTRY = {
 
     },
 
+    # Not enabled on the TPU path: bf16 with no quantization available
+    # (bitsandbytes is CUDA-only) makes 7B/8B a tight-to-unsafe fit on a
+    # single v5e-1's 16GB HBM, and qwen/mistral additionally have no
+    # confirmed non-quantized mirror the way llama-3.2-3b does. Kept as
+    # explicit entries with repo=None so picking one fails with a clear
+    # message below instead of a confusing bitsandbytes import error deep
+    # inside from_pretrained.
+    #
+    # llama-3.1-8b is the GPU/RunPod paths' default as of v1 (see
+    # ../gpu/train_model.py's identically-named entry) - deliberately NOT
+    # mirrored here as this file's default for the same reason apertus-8b
+    # below is blocked, not just deprioritized: no quantization on this
+    # path means the FULL bf16 8B footprint, not the ~4x-smaller bnb-4bit
+    # one GPU/RunPod actually use.
+    "llama-3.1-8b": {
+        "repo": None,
+        "blocked_reason": "bf16 8B params is a tight/unsafe fit on a single v5e-1's 16GB HBM alongside LoRA optimizer state and activations - not validated here. Use the GPU script instead (also covers RunPod).",
+    },
+    "apertus-8b": {
+        "repo": None,
+        "blocked_reason": "bf16 8B params is a tight/unsafe fit on a single v5e-1's 16GB HBM alongside LoRA optimizer state and activations - not validated here.",
+    },
+
     "qwen-2.5-7b": {
-
-        "repo": "unsloth/Qwen2.5-7B-Instruct-bnb-4bit",
-
-        "target_modules": ["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"],
-
-        "max_seq_length": 2048,
-
+        "repo": None,
+        "blocked_reason": "unsloth only publishes this as -bnb-4bit (bitsandbytes-only, no TPU support) - no non-quantized mirror confirmed.",
     },
 
     "mistral-7b": {
-
-        "repo": "unsloth/mistral-7b-instruct-v0.3-bnb-4bit",
-
-        "target_modules": ["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"],
-
-        "max_seq_length": 2048,
-
-    }
+        "repo": None,
+        "blocked_reason": "unsloth only publishes this as -bnb-4bit (bitsandbytes-only, no TPU support) - no non-quantized mirror confirmed.",
+    },
 
 }
 
 selected_config = MODEL_REGISTRY[MODEL_CHOICE]
+
+if selected_config["repo"] is None:
+    raise ValueError(f"{MODEL_CHOICE!r} isn't supported on the TPU path yet: {selected_config['blocked_reason']}")
 
 MODEL_NAME = selected_config["repo"]
 
@@ -135,25 +139,21 @@ TARGET_MODULES = selected_config["target_modules"]
 
 print(f"Loading Model Family: {MODEL_CHOICE} -> {MODEL_NAME}")
 
-# 3. Load 4-bit Quantized Model
+# 3. Load model in bf16 onto the TPU device (no quantization - bitsandbytes
+# has no TPU backend, and TPU v5e supports bf16 natively)
 
-model, tokenizer = FastLanguageModel.from_pretrained(
+device = xm.xla_device()
 
-    model_name = MODEL_NAME,
+tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME)
 
-    max_seq_length = MAX_SEQ_LENGTH,
-
-    dtype = None,
-
-    load_in_4bit = True,
-
-)
+model = AutoModelForCausalLM.from_pretrained(
+    MODEL_NAME,
+    torch_dtype=torch.bfloat16,
+).to(device)
 
 # 4. Add LoRA Adapters
 
-model = FastLanguageModel.get_peft_model(
-
-    model,
+lora_config = LoraConfig(
 
     r = 16,
 
@@ -171,9 +171,16 @@ model = FastLanguageModel.get_peft_model(
 
     bias = "none",
 
-    use_gradient_checkpointing = "unsloth",
+    task_type = "CAUSAL_LM",
 
 )
+
+model = get_peft_model(model, lora_config)
+
+# Required for gradients to reach the LoRA layers when the base model is
+# frozen and gradient checkpointing is on. unsloth's get_peft_model does
+# this internally; vanilla peft does not.
+model.enable_input_require_grads()
 
 # 5. Load and format dataset (upload all four files below to Colab -
 # dataset_train.jsonl/dataset_val.jsonl from generate_synthetic_dataset.py,
@@ -240,9 +247,9 @@ dataset_dict = load_dataset(
 # original Target Stock/User Question/Current Market Data/Valuation/
 # Recent Earnings/Recent News & Results).
 # Keep BOTH templates in sync any time inference.py's prompts change, and
-# in sync with ../tpu/train_model.py's copies of these same two strings
-# and the ../{gpu,tpu}/evaluate_*.py and runpod/*.py scripts' copies (see
-# CONTRIBUTING.md's sync rule).
+# in sync with ../gpu/train_model.py's copies of these same two strings
+# and the ../{gpu,tpu}/evaluate_*.py scripts' copies (see CONTRIBUTING.md's
+# sync rule).
 task_a_prompt = """Below is an instruction that describes a task, paired with an input that provides further context. Write a response that appropriately completes the request.
 
 ### Instruction:
@@ -333,6 +340,26 @@ eval_dataset = dataset_dict["validation"]
 # 6. Set up Trainer using SFTConfig
 from transformers import EarlyStoppingCallback
 
+# Completion-only loss masking - the vanilla-peft/trl equivalent of
+# unsloth's train_on_responses_only (unsloth-only, not available here).
+# IMPORTANT: these markers must match the LITERAL text exactly, including
+# incidental whitespace - both prompt templates have a blank line after each
+# header, so the actual text is "### Instruction:\n\n" / "###
+# Response:\n\n" (double newline), not "### Instruction:\n" / "###
+# Response:\n" (single newline). This is not cosmetic to a BPE tokenizer:
+# ":\n\n" tokenizes as one atomic token distinct from ":\n", so a
+# single-newline marker will never be found in the tokenized data at all,
+# silently masking every sample's loss to -100. Verify any change here by
+# loading the target model's tokenizer, tokenizing the marker in isolation
+# and embedded in a real formatted example, and confirming the token
+# sequence actually appears - don't assume a string that "looks like a
+# substring" tokenizes as one.
+collator = DataCollatorForCompletionOnlyLM(
+    instruction_template = "### Instruction:\n\n",
+    response_template = "### Response:\n\n",
+    tokenizer = tokenizer,
+)
+
 trainer = SFTTrainer(
     model = model,
     tokenizer = tokenizer,
@@ -346,6 +373,7 @@ trainer = SFTTrainer(
     max_seq_length = MAX_SEQ_LENGTH,
     dataset_num_proc = 2,
     packing = False,
+    data_collator = collator,
     args = SFTConfig(
         per_device_train_batch_size = 2,
         gradient_accumulation_steps = 4,
@@ -377,10 +405,15 @@ trainer = SFTTrainer(
         metric_for_best_model = "eval_loss",
         greater_is_better = False,
         learning_rate = 2e-4,
-        fp16 = not torch.cuda.is_bf16_supported(),
-        bf16 = torch.cuda.is_bf16_supported(),
+        # TPU v5e supports bf16 natively; there's no CUDA device here to
+        # query, so (unlike the GPU script) this isn't conditional.
+        fp16 = False,
+        bf16 = True,
+        # adamw_8bit is a bitsandbytes optimizer (CUDA-only) - plain
+        # adamw_torch instead.
+        optim = "adamw_torch",
+        gradient_checkpointing = True,
         logging_steps = 1,
-        optim = "adamw_8bit",
         output_dir = "outputs",
     ),
     # Stops training once eval_loss hasn't improved for 3 consecutive evals
@@ -388,39 +421,6 @@ trainer = SFTTrainer(
     # training all the way to num_train_epochs regardless.
     callbacks = [EarlyStoppingCallback(early_stopping_patience = 3)],
 )
-
-# Completion-only loss masking. Without this, SFTTrainer computes loss over
-# the ENTIRE text field - the "Below is an instruction that describes a
-# task..." preamble and the ### Instruction:/### Input: boilerplate
-# included, not just the ### Response: completion. That boilerplate is
-# nearly identical across every example, so the model can drive loss down
-# substantially just by memorizing it, which inflates the reported loss
-# numbers without reflecting how well it's actually learning to classify
-# sentiment. This masks the loss to only the ### Response: continuation,
-# matching task_a_prompt/task_b_prompt's own instruction/response markers.
-from unsloth.chat_templates import train_on_responses_only
-
-trainer = train_on_responses_only(
-    trainer,
-    # IMPORTANT: these markers must match the LITERAL text exactly,
-    # including incidental whitespace - both prompt templates have a blank line
-    # after each header, so the actual text is "### Instruction:\n\n" /
-    # "### Response:\n\n" (double newline), not "### Instruction:\n" /
-    # "### Response:\n" (single newline). This is not cosmetic to a BPE
-    # tokenizer: ":\n\n" tokenizes as one atomic token distinct from
-    # ":\n", so a single-newline marker will never be found in the
-    # tokenized data at all, silently masking every sample's loss to -100
-    # (train_on_responses_only raises a clear error when this happens - if
-    # you see "masked every label to -100... marker was not found," this
-    # mismatch is almost certainly why). Verify any change here by loading
-    # the target model's tokenizer, tokenizing the marker in isolation and
-    # embedded in a real formatted example, and confirming the token
-    # sequence actually appears - don't assume a string that "looks like a
-    # substring" tokenizes as one.
-    instruction_part = "### Instruction:\n\n",
-    response_part = "### Response:\n\n",
-)
-
 
 # 7. Train & Push Adapter to Hugging Face
 
@@ -438,18 +438,26 @@ HF_USER = get_secret("HF_USER")
 # overridden. Add an OPTIONAL "MODEL_VERSION" Colab/Kaggle Secret (same
 # mechanism as HF_USER/HF_TOKEN above, see README's "Required Colab
 # Secrets") to try a different push ad-hoc in this session only, without
-# editing this file at all - e.g. set it to "v6" to compare against an
-# older push. Falls back to the default below if the secret was never
-# created (not just ungranted) - a broad except is deliberate here since
-# Colab/Kaggle raise different exception types for "no such secret", and
-# this one specific secret is optional by design, so any failure to read
-# it should silently fall back, never block or crash.
+# editing this file at all. Falls back to the default below if the secret
+# was never created (not just ungranted) - a broad except is deliberate
+# here since Colab/Kaggle raise different exception types for "no such
+# secret", and this one specific secret is optional by design, so any
+# failure to read it should silently fall back, never block or crash.
 MODEL_VERSION_DEFAULT = "v1"
 try:
     MODEL_VERSION = get_secret("MODEL_VERSION") or MODEL_VERSION_DEFAULT
 except Exception:
     MODEL_VERSION = MODEL_VERSION_DEFAULT
 
-HF_REPO = f"{HF_USER}/{MODEL_CHOICE}-financial-reasoner-{MODEL_VERSION}"
+# "-tpu" suffix keeps this from silently overwriting the already-pushed
+# GPU-trained adapter at the plain (no "-tpu") name.
+HF_REPO = f"{HF_USER}/{MODEL_CHOICE}-financial-reasoner-{MODEL_VERSION}-tpu"
 
-model.push_to_hub_merged(HF_REPO, tokenizer, save_method = "lora", token = HF_TOKEN)
+# model.push_to_hub_merged(..., save_method="lora") in the GPU script
+# pushes the adapter only, not a merged model, despite the method name -
+# confirmed via unsloth's docs/issues. A PeftModel's own push_to_hub does
+# the same adapter-only push, which is what's actually served in
+# production (financial-sentiment-api points its inference URL directly
+# at this repo).
+model.push_to_hub(HF_REPO, token = HF_TOKEN)
+tokenizer.push_to_hub(HF_REPO, token = HF_TOKEN)

@@ -40,14 +40,17 @@ PR; it's cheap and catches real regressions. For everything else:
 - If you change either prompt template (`task_a_prompt` for news_reaction
   classification, `task_b_prompt` for reasoning/answer generation - see
   the two-stage pipeline redesign in `generate_real_dataset.py`'s history)
-  or the output JSON schema, keep NINE files in sync, all carrying BOTH
-  templates byte-identically: `colab/train/gpu/train_model.py`,
-  `colab/train/tpu/train_model.py`, their own `evaluate_model.py`/
-  `evaluate_base_model_only.py` copies (4 more copies, 6 total),
-  `runpod/train_model.py` and `runpod/evaluate_model.py` (2 more, 8
-  total), and `financial-sentiment-api`'s `app/services/inference.py` (9
-  total) — a mismatch anywhere in that set silently trains or serves a
-  different shape than the others expect. This also covers the
+  or the output JSON schema, keep SEVEN files in sync, all carrying BOTH
+  templates byte-identically: `notebooks/train/gpu/train_model.py`,
+  `notebooks/train/tpu/train_model.py`, their own `evaluate_model.py`/
+  `evaluate_base_model_only.py` copies (4 more copies, 6 total), and
+  `financial-sentiment-api`'s `app/services/inference.py` (7 total) — a
+  mismatch anywhere in that set silently trains or serves a different
+  shape than the others expect. (`notebooks/train/gpu/train_model.py`/
+  `evaluate_model.py` also cover RunPod/plain-GPU-box runs - paste into a
+  notebook cell there, or run directly as a script, see their own
+  docstrings - so there's no separate RunPod copy to keep in sync.) The
+  sync requirement also covers the
   `market_data`/`valuation`/`earnings`/`price_context` block FORMATTING
   (not just the outer templates) — the block renderers in
   `generate_synthetic_dataset.py`, `generate_real_dataset.py`, and
@@ -75,9 +78,9 @@ PR; it's cheap and catches real regressions. For everything else:
   `gpu/`/`tpu/` set) across multiple real version bumps.
 - If you change anything that affects the instruction/response markers
   used for completion-only loss masking (`train_on_responses_only`'s
-  `instruction_part`/`response_part` in `colab/train/gpu/train_model.py`, or
+  `instruction_part`/`response_part` in `notebooks/train/gpu/train_model.py`, or
   `DataCollatorForCompletionOnlyLM`'s `instruction_template`/
-  `response_template` in `colab/train/tpu/train_model.py`), re-verify the tokenization
+  `response_template` in `notebooks/train/tpu/train_model.py`), re-verify the tokenization
   match locally (load the target model's tokenizer, tokenize the marker in
   isolation and embedded in a real formatted example, confirm the token
   sequence actually appears) — see the comment above that call in either

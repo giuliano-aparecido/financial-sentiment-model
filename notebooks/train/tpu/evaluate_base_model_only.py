@@ -1,15 +1,19 @@
-!pip install "unsloth[colab-new] @ git+https://github.com/unslothai/unsloth.git"
-!pip install --no-deps trl peft accelerate bitsandbytes
+import subprocess
+import sys
 
-# Paste as ONE Colab cell. Self-contained, including these installs (match
-# gpu/train_model.py's exactly, and are safe to re-run if the training
-# cell already ran this session - pip no-ops on an already-satisfied
-# requirement): works whether the previous session is still alive (reuses
-# model/tokenizer already in memory) or crashed (reloads the finished
-# model fresh from Hugging Face). Runs ONLY the base-model (adapter-
-# disabled) pass - use this when you already have the fine-tuned numbers
-# from evaluate_model.py and just need the untrained baseline for
-# comparison, without redoing the tuned pass.
+subprocess.check_call([sys.executable, "-m", "pip", "install", "-q", "-U",
+                        "transformers", "peft", "accelerate"])
+
+# Paste as ONE Colab cell. Self-contained, including the install above
+# (matches tpu/train_model.py's, minus trl/datasets which this script
+# doesn't need; torch_xla intentionally excluded - see tpu/evaluate_
+# model.py's comment on the same install for why). Safe to re-run if the
+# training cell already ran this session. Works whether the previous
+# session is still alive (reuses model/tokenizer already in memory) or
+# crashed (reloads the finished model fresh from Hugging Face). Runs ONLY
+# the base-model (adapter-disabled) pass - use this when you already have
+# the fine-tuned numbers from evaluate_model.py and just need the
+# untrained baseline for comparison, without redoing the tuned pass.
 
 import json
 import os
@@ -17,15 +21,13 @@ import random
 import re
 
 import torch
-from unsloth import FastLanguageModel
 
 
 # Checking whether `google.colab` IMPORTS is not a reliable way to detect
 # Colab vs Kaggle - some Kaggle base images ship a google-colab package
-# too (Kaggle also offers T4/P100 GPUs, so this path can run there too),
-# so the import succeeds and userdata.get() just hangs and times out
-# instead of raising. KAGGLE_KERNEL_RUN_TYPE is set by Kaggle's own
-# runtime on every notebook - check that directly instead.
+# too, so the import succeeds there and userdata.get() just hangs and
+# times out instead of raising. KAGGLE_KERNEL_RUN_TYPE is set by Kaggle's
+# own runtime on every notebook - check that directly instead.
 def get_secret(name):
     if os.environ.get("KAGGLE_KERNEL_RUN_TYPE"):
         from kaggle_secrets import UserSecretsClient
@@ -47,19 +49,29 @@ try:
 except NameError:
     print("Model not in memory (new or crashed session) - reloading the "
           "already-trained, already-pushed model from Hugging Face...")
+    from peft import AutoPeftModelForCausalLM
+    from transformers import AutoTokenizer
+    import torch_xla.core.xla_model as xm
 
     # MODEL_CHOICE_DEFAULT is the git-committed baseline. Add an OPTIONAL
     # "MODEL_CHOICE" Colab/Kaggle Secret to reload a different base-model
     # family ad-hoc, without editing this file - must match whatever
     # MODEL_CHOICE the target HF_REPO was actually trained/pushed under.
-    MODEL_CHOICE_DEFAULT = "llama-3.1-8b"
+    MODEL_CHOICE_DEFAULT = "llama-3.2-3b"
     try:
         MODEL_CHOICE = get_secret("MODEL_CHOICE") or MODEL_CHOICE_DEFAULT
     except Exception:
         MODEL_CHOICE = MODEL_CHOICE_DEFAULT
 
-    MAX_SEQ_LENGTH = 2048
     HF_USER = get_secret("HF_USER")
+
+    # Only needed if HF_REPO below is private - broad except since a
+    # never-created (not just ungranted) Secret raises, and this one's
+    # optional by design, same reasoning as MODEL_CHOICE above/MODEL_VERSION below.
+    try:
+        HF_TOKEN = get_secret("HF_TOKEN")
+    except Exception:
+        HF_TOKEN = None
 
     # MODEL_VERSION_DEFAULT is the git-committed baseline (bumped by
     # bump_model_version.py). Add an OPTIONAL "MODEL_VERSION" Colab/Kaggle
@@ -70,16 +82,28 @@ except NameError:
     except Exception:
         MODEL_VERSION = MODEL_VERSION_DEFAULT
 
-    HF_REPO = f"{HF_USER}/{MODEL_CHOICE}-financial-reasoner-{MODEL_VERSION}"
+    # Matches the "-tpu" suffix train_model.py pushes to, so this reloads
+    # the TPU-trained adapter rather than the GPU-trained one at the plain
+    # (no "-tpu") name.
+    HF_REPO = f"{HF_USER}/{MODEL_CHOICE}-financial-reasoner-{MODEL_VERSION}-tpu"
 
-    model, tokenizer = FastLanguageModel.from_pretrained(
-        model_name=HF_REPO,
-        max_seq_length=MAX_SEQ_LENGTH,
-        dtype=None,
-        load_in_4bit=True,
-    )
+    # The pushed repo is adapter-only (see train_model.py's push-to-hub
+    # comment) - AutoPeftModelForCausalLM is peft's loader built
+    # specifically for that: it reads adapter_config.json, resolves the
+    # base model automatically, and wraps it with the adapter. This is the
+    # vanilla-peft equivalent of the GPU script's
+    # FastLanguageModel.from_pretrained(..., load_in_4bit=True) reload -
+    # bf16 here since bitsandbytes has no TPU backend.
+    model = AutoPeftModelForCausalLM.from_pretrained(
+        HF_REPO,
+        torch_dtype=torch.bfloat16,
+        token=HF_TOKEN,
+    ).to(xm.xla_device())
+    tokenizer = AutoTokenizer.from_pretrained(HF_REPO, token=HF_TOKEN)
 
-FastLanguageModel.for_inference(model)
+# unsloth's FastLanguageModel.for_inference(model) has no TPU equivalent
+# (unsloth doesn't support TPU) - plain eval mode is all that's needed.
+model.eval()
 
 task_a_prompt = """Below is an instruction that describes a task, paired with an input that provides further context. Write a response that appropriately completes the request.
 
@@ -351,53 +375,22 @@ def run_task_b_eval(label):
     return per_source
 
 
-torch.cuda.empty_cache()
-
-# Base repos for the fallback path below - mirrors gpu/train_model.py's
-# MODEL_REGISTRY "repo" field per MODEL_CHOICE (see CONTRIBUTING.md's sync
-# rule; keep in sync with that file, not just task_a_prompt/task_b_prompt).
-BASE_MODEL_REPO_BY_CHOICE = {
-    "llama-3.2-3b": "unsloth/Llama-3.2-3B-Instruct-bnb-4bit",
-    "llama-3.1-8b": "unsloth/Meta-Llama-3.1-8B-Instruct-bnb-4bit",
-    "apertus-8b": "swiss-ai/Apertus-8B-Instruct-2509",
-    "apertus-0.5b": "swiss-ai/Apertus-v1.1-0.5B-Instruct",
-    "qwen-2.5-7b": "unsloth/Qwen2.5-7B-Instruct-bnb-4bit",
-    "mistral-7b": "unsloth/mistral-7b-instruct-v0.3-bnb-4bit",
-}
-
-# Prefers temporarily disabling the LoRA adapter on the already-loaded
-# model (no second download, no extra memory). Confirmed live: this can
-# fail with "'LlamaForCausalLM' object has no attribute 'disable_adapter'"
-# - some unsloth code path can return/transform the model into something
-# that no longer exposes peft's disable_adapter() context manager. Since
-# this script's ENTIRE purpose is exactly the "reload fresh, then run
-# base-only" scenario most likely to trigger that, an unhandled crash here
-# would defeat the script - falls back to loading a genuinely separate,
-# adapter-free base model instance instead, which doesn't depend on
-# guessing which unsloth-internal transformation caused the first
-# approach to fail.
+# No CUDA cache to clear on TPU (see evaluate_model.py's equivalent
+# comment) - XLA's allocator has no manual-release call.
+#
+# Unlike the GPU scripts' unsloth-loaded model (confirmed live to
+# sometimes lose its disable_adapter() method after certain unsloth code
+# paths - see gpu/evaluate_base_model_only.py's comment on the same
+# call), this script's model comes from vanilla peft's
+# AutoPeftModelForCausalLM, which reliably supports disable_adapter() as
+# documented, standard behavior - no separate-model-load fallback needed
+# here. Still guarded, matching evaluate_model.py's TPU pass 2, so an
+# unexpected failure has a clear message instead of a bare traceback.
 try:
     with model.disable_adapter():
         base_a = run_task_a_eval("BASE model (adapter disabled)")
         base_b = run_task_b_eval("BASE model (adapter disabled)")
 except Exception as e:
-    print(f"model.disable_adapter() unavailable/failed ({e!r}) - loading a "
-          f"separate, genuinely adapter-free base model instance instead...")
-    _model_choice = globals().get("MODEL_CHOICE", "llama-3.1-8b")
-    _max_seq_length = globals().get("MAX_SEQ_LENGTH", 2048)
-    _base_repo = BASE_MODEL_REPO_BY_CHOICE[_model_choice]
-
-    base_model, base_tokenizer = FastLanguageModel.from_pretrained(
-        model_name=_base_repo,
-        max_seq_length=_max_seq_length,
-        dtype=None,
-        load_in_4bit=True,
-    )
-    FastLanguageModel.for_inference(base_model)
-
-    # generate()/run_task_{a,b}_eval() close over the module-level
-    # `model`/`tokenizer` names, looked up at call time - swap them to the
-    # base model for this pass.
-    model, tokenizer = base_model, base_tokenizer
-    base_a = run_task_a_eval("BASE model (separately loaded, no adapter)")
-    base_b = run_task_b_eval("BASE model (separately loaded, no adapter)")
+    print(f"Base-model pass failed ({e!r}). Fallback: reload the base "
+          "model fresh in a new cell and rerun run_task_a_eval/"
+          "run_task_b_eval, or share this error.")

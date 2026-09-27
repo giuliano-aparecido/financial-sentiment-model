@@ -1,41 +1,20 @@
-!pip install -q -U transformers peft accelerate
+import subprocess
+import sys
 
-# Direction-accuracy evaluation - paste as ONE Colab cell. Self-contained:
-# the install above matches tpu/train_model.py's (minus trl/datasets,
-# which this script doesn't need) and is safe to re-run if the training
+subprocess.check_call([sys.executable, "-m", "pip", "install",
+                        "unsloth[colab-new] @ git+https://github.com/unslothai/unsloth.git"])
+subprocess.check_call([sys.executable, "-m", "pip", "install", "--no-deps",
+                        "trl", "peft", "accelerate", "bitsandbytes"])
+
+# Paste as ONE Colab cell. Self-contained, including these installs (match
+# gpu/train_model.py's exactly, and are safe to re-run if the training
 # cell already ran this session - pip no-ops on an already-satisfied
-# requirement. torch_xla is intentionally NOT installed here, same
-# reasoning as tpu/train_model.py: it's expected to already be present and
-# version-matched in the Colab/Kaggle TPU runtime, and pip-installing it
-# separately risks a mismatched pairing. Works whether the previous
-# session is still alive (reuses `model`,
-# `tokenizer`, `task_a_prompt`, `task_b_prompt` already in memory - the normal case, right
-# after the training cell) or crashed/expired (reloads the finished,
-# already-pushed model fresh from Hugging Face - e.g. re-running this cell
-# after a prior run of THIS SAME script crashed partway through, such as
-# the confusion-matrix sort TypeError this eval script used to hit on any
-# row with an unparseable model output; that crash happened after training
-# had already finished and pushed, so there was nothing left to retrain -
-# only this cell needed re-running). Either way, needs the
-# dataset_val*.jsonl files present on disk (regenerate
-# generate_synthetic_dataset.py/generate_real_dataset.py first if this is
-# a fresh session that doesn't have them).
-#
-# What it measures - the metric that actually matters, which token loss
-# doesn't (see ../docs/training-results-analysis.md):
-#   - recommendation accuracy (BUY/SELL/HOLD correct or not), overall
-#     and split by val source (synthetic vs real) and by class (confusion
-#     matrix per source, to spot "always answers HOLD"-style bias and
-#     whether it's source-specific)
-#   - JSON validity rate of the model's raw output
-#   - the same numbers for the BASE model (LoRA adapter temporarily
-#     disabled) as the missing baseline - the base-vs-tuned delta is the
-#     true value of the whole training pipeline.
-#
-# Runtime expectation: unverified on TPU v5e-1 (the GPU version takes
-# roughly 15-30 minutes on a T4 for ~160 rows x 2 passes) - progress prints
-# every 20 rows regardless. The TUNED pass runs FIRST so that if the
-# session dies partway, the number you care most about is already printed.
+# requirement): works whether the previous session is still alive (reuses
+# model/tokenizer already in memory) or crashed (reloads the finished
+# model fresh from Hugging Face). Runs ONLY the base-model (adapter-
+# disabled) pass - use this when you already have the fine-tuned numbers
+# from evaluate_model.py and just need the untrained baseline for
+# comparison, without redoing the tuned pass.
 
 import json
 import os
@@ -43,29 +22,15 @@ import random
 import re
 
 import torch
-
-# Rows to sample per val source. Real val's actual row count depends on
-# how many headlines generate_real_dataset.py's non-deterministic fetch
-# turned up for VAL_HOLDOUT_TICKERS this run (widened to 6 tickers - was
-# 2 - specifically so this sample draws from more than one or two
-# companies' idiosyncratic news cycle; see that constant's own comment).
-# None = evaluate every row (slower: 657 synthetic rows).
-EVAL_SAMPLE_PER_SOURCE = 100
-
-# How many full generations to keep and print per (source, expected,
-# predicted) wrong-answer combination - the confusion matrix says WHAT
-# went wrong, this shows WHAT THE MODEL ACTUALLY WROTE for a handful of
-# those rows (ticker, headlines, full raw output), for cases where the
-# aggregate numbers alone don't explain a pattern (e.g. a class collapse
-# that isn't a straightforward data-imbalance artifact).
-SAMPLE_MISCLASSIFICATIONS_PER_PAIR = 3
+from unsloth import FastLanguageModel
 
 
 # Checking whether `google.colab` IMPORTS is not a reliable way to detect
 # Colab vs Kaggle - some Kaggle base images ship a google-colab package
-# too, so the import succeeds there and userdata.get() just hangs and
-# times out instead of raising. KAGGLE_KERNEL_RUN_TYPE is set by Kaggle's
-# own runtime on every notebook - check that directly instead.
+# too (Kaggle also offers T4/P100 GPUs, so this path can run there too),
+# so the import succeeds and userdata.get() just hangs and times out
+# instead of raising. KAGGLE_KERNEL_RUN_TYPE is set by Kaggle's own
+# runtime on every notebook - check that directly instead.
 def get_secret(name):
     if os.environ.get("KAGGLE_KERNEL_RUN_TYPE"):
         from kaggle_secrets import UserSecretsClient
@@ -82,27 +47,32 @@ def get_secret(name):
 
 
 try:
-    model, tokenizer, task_a_prompt, task_b_prompt
+    model, tokenizer
     print("Reusing model already in memory - skipping reload.")
 except NameError:
-    print("Model/tokenizer not in memory (new or crashed session) - "
-          "reloading the already-trained, already-pushed model from "
-          "Hugging Face...")
-    from peft import AutoPeftModelForCausalLM
-    from transformers import AutoTokenizer
-    import torch_xla.core.xla_model as xm
+    print("Model not in memory (new or crashed session) - reloading the "
+          "already-trained, already-pushed model from Hugging Face...")
 
     # MODEL_CHOICE_DEFAULT is the git-committed baseline. Add an OPTIONAL
     # "MODEL_CHOICE" Colab/Kaggle Secret to reload a different base-model
     # family ad-hoc, without editing this file - must match whatever
     # MODEL_CHOICE the target HF_REPO was actually trained/pushed under.
-    MODEL_CHOICE_DEFAULT = "llama-3.2-3b"
+    MODEL_CHOICE_DEFAULT = "llama-3.1-8b"
     try:
         MODEL_CHOICE = get_secret("MODEL_CHOICE") or MODEL_CHOICE_DEFAULT
     except Exception:
         MODEL_CHOICE = MODEL_CHOICE_DEFAULT
 
+    MAX_SEQ_LENGTH = 2048
     HF_USER = get_secret("HF_USER")
+
+    # Only needed if HF_REPO below is private - broad except since a
+    # never-created (not just ungranted) Secret raises, and this one's
+    # optional by design, same reasoning as MODEL_CHOICE above/MODEL_VERSION below.
+    try:
+        HF_TOKEN = get_secret("HF_TOKEN")
+    except Exception:
+        HF_TOKEN = None
 
     # MODEL_VERSION_DEFAULT is the git-committed baseline (bumped by
     # bump_model_version.py). Add an OPTIONAL "MODEL_VERSION" Colab/Kaggle
@@ -113,26 +83,19 @@ except NameError:
     except Exception:
         MODEL_VERSION = MODEL_VERSION_DEFAULT
 
-    # Matches the "-tpu" suffix train_model.py pushes to, so this reloads
-    # the TPU-trained adapter rather than the GPU-trained one at the plain
-    # (no "-tpu") name.
-    HF_REPO = f"{HF_USER}/{MODEL_CHOICE}-financial-reasoner-{MODEL_VERSION}-tpu"
+    HF_REPO = f"{HF_USER}/{MODEL_CHOICE}-financial-reasoner-{MODEL_VERSION}"
 
-    # The pushed repo is adapter-only - AutoPeftModelForCausalLM is peft's
-    # loader built specifically for that: it reads adapter_config.json,
-    # resolves the base model automatically, and wraps it with the
-    # adapter. bf16 since bitsandbytes has no TPU backend.
-    model = AutoPeftModelForCausalLM.from_pretrained(
-        HF_REPO,
-        torch_dtype=torch.bfloat16,
-    ).to(xm.xla_device())
-    tokenizer = AutoTokenizer.from_pretrained(HF_REPO)
+    model, tokenizer = FastLanguageModel.from_pretrained(
+        model_name=HF_REPO,
+        max_seq_length=MAX_SEQ_LENGTH,
+        dtype=None,
+        load_in_4bit=True,
+        token=HF_TOKEN,
+    )
 
-    # Must match tpu/train_model.py's task_a_prompt/task_b_prompt exactly
-    # (see CONTRIBUTING.md's sync rule) - these are separate copies because
-    # a reload means the training cell's own copies never ran in this
-    # session.
-    task_a_prompt = """Below is an instruction that describes a task, paired with an input that provides further context. Write a response that appropriately completes the request.
+FastLanguageModel.for_inference(model)
+
+task_a_prompt = """Below is an instruction that describes a task, paired with an input that provides further context. Write a response that appropriately completes the request.
 
 ### Instruction:
 
@@ -158,7 +121,7 @@ Recent News & Results:
 
 {}"""
 
-    task_b_prompt = """Below is an instruction that describes a task, paired with an input that provides further context. Write a response that appropriately completes the request.
+task_b_prompt = """Below is an instruction that describes a task, paired with an input that provides further context. Write a response that appropriately completes the request.
 
 ### Instruction:
 
@@ -187,24 +150,24 @@ Recent News & Results:
 
 {}"""
 
-# unsloth's FastLanguageModel.for_inference(model) has no TPU equivalent
-# (unsloth doesn't support TPU) - plain eval mode is all that's needed
-# here, unsloth's call is a generation-speed optimization, not a
-# correctness requirement.
-model.eval()
-
-VAL_FILES = {"synthetic": "dataset_val.jsonl", "real": "dataset_val_real.jsonl"}
-# Optional - only present if convert_existing_to_taskb.py or a GATE-A real
-# regen produced it (see train_model.py's own comment on this pair).
-if os.path.exists("dataset_val_real_taskb.jsonl"):
-    VAL_FILES["real_taskb"] = "dataset_val_real_taskb.jsonl"
-
 REACTION_RE = re.compile(r'"news_reaction"\s*:\s*"(good|bad|neutral|overreaction_down|overreaction_up)"')
 RECOMMENDATION_RE = re.compile(r'"recommendation"\s*:\s*"(BUY|SELL|HOLD)"')
 # Not used for accuracy scoring, just to surface the model's generated
 # text in the misclassification/flagged-sample dumps below.
 ANSWER_RE = re.compile(r'"answer"\s*:\s*"((?:[^"\\]|\\.)*)"')
 REASONING_RE = re.compile(r'"reasoning"\s*:\s*"((?:[^"\\]|\\.)*)"')
+
+EVAL_SAMPLE_PER_SOURCE = 100
+VAL_FILES = {"synthetic": "dataset_val.jsonl", "real": "dataset_val_real.jsonl"}
+# Optional - only present if convert_existing_to_taskb.py or a GATE-A real
+# regen produced it (see train_model.py's own comment on this pair).
+if os.path.exists("dataset_val_real_taskb.jsonl"):
+    VAL_FILES["real_taskb"] = "dataset_val_real_taskb.jsonl"
+
+# How many full generations to keep and print per (source, expected,
+# predicted) wrong-answer combination - see evaluate_model.py's comment
+# above the same constant for why.
+SAMPLE_MISCLASSIFICATIONS_PER_PAIR = 3
 
 random.seed(42)
 task_a_rows, task_b_rows = [], []
@@ -215,20 +178,18 @@ for source, path in VAL_FILES.items():
         row["_source"] = source
     a_rows = [r for r in rows if r["task"] == "reaction"]
     b_rows = [r for r in rows if r["task"] == "analysis"]
-    if EVAL_SAMPLE_PER_SOURCE is not None:
-        if len(a_rows) > EVAL_SAMPLE_PER_SOURCE:
-            a_rows = random.sample(a_rows, EVAL_SAMPLE_PER_SOURCE)
-        if len(b_rows) > EVAL_SAMPLE_PER_SOURCE:
-            b_rows = random.sample(b_rows, EVAL_SAMPLE_PER_SOURCE)
+    if len(a_rows) > EVAL_SAMPLE_PER_SOURCE:
+        a_rows = random.sample(a_rows, EVAL_SAMPLE_PER_SOURCE)
+    if len(b_rows) > EVAL_SAMPLE_PER_SOURCE:
+        b_rows = random.sample(b_rows, EVAL_SAMPLE_PER_SOURCE)
     task_a_rows.extend(a_rows)
     task_b_rows.extend(b_rows)
 
-print(f"Task A eval: {len(task_a_rows)} rows across {list(VAL_FILES)}. "
-      f"Task B eval: {len(task_b_rows)} rows across {list(VAL_FILES)}.")
+print(f"Evaluating base model - Task A: {len(task_a_rows)} rows, Task B: {len(task_b_rows)} rows "
+      f"across {list(VAL_FILES)}")
 
 
 def is_valid_json(text):
-    # The output should be a JSON object; grab the outermost braces.
     start, end = text.find("{"), text.rfind("}")
     if start == -1 or end <= start:
         return False
@@ -240,14 +201,12 @@ def is_valid_json(text):
 
 
 def generate(prompt, max_new_tokens):
-    # model.device is backend-agnostic - once the model has been placed on
-    # the XLA device during training, this just works.
     inputs = tokenizer(prompt, return_tensors="pt").to(model.device)
     with torch.no_grad():
         out = model.generate(
             **inputs,
             max_new_tokens=max_new_tokens,
-            do_sample=False,  # greedy = deterministic, comparable across passes
+            do_sample=False,
             pad_token_id=tokenizer.eos_token_id,
         )
     return tokenizer.decode(out[0][inputs.input_ids.shape[1]:], skip_special_tokens=True)
@@ -406,43 +365,53 @@ def run_task_b_eval(label):
     return per_source
 
 
-# Pass 1: the fine-tuned model (adapter active) - the numbers that matter.
-tuned_a = run_task_a_eval("FINE-TUNED model")
-tuned_b = run_task_b_eval("FINE-TUNED model")
+torch.cuda.empty_cache()
 
-# Pass 2 (base model) roughly doubles total eval time - worth it the FIRST
-# time you eval a given prompt/schema shape, since without it there's no
-# baseline to tell "65% accuracy" apart from "would have scored 65% doing
-# nothing" (see docs/training-results-analysis.md's "No baseline" section
-# - this pass exists specifically to fix that gap for recommendation accuracy,
-# not just loss). Once you've established that baseline once, it doesn't
-# need re-confirming on every subsequent quick-iteration eval - set
-# SKIP_BASE_MODEL_EVAL (Colab/Kaggle Secret or env var, same mechanism as
-# MODEL_CHOICE/MODEL_VERSION) to "1"/"true"/"yes" to skip straight to just
-# the tuned-model number.
-SKIP_BASE_MODEL_EVAL = (get_secret("SKIP_BASE_MODEL_EVAL") or "").strip().lower() in ("1", "true", "yes")
+# Base repos for the fallback path below - mirrors gpu/train_model.py's
+# MODEL_REGISTRY "repo" field per MODEL_CHOICE (see CONTRIBUTING.md's sync
+# rule; keep in sync with that file, not just task_a_prompt/task_b_prompt).
+BASE_MODEL_REPO_BY_CHOICE = {
+    "llama-3.2-3b": "unsloth/Llama-3.2-3B-Instruct-bnb-4bit",
+    "llama-3.1-8b": "unsloth/Meta-Llama-3.1-8B-Instruct-bnb-4bit",
+    "apertus-8b": "swiss-ai/Apertus-8B-Instruct-2509",
+    "apertus-0.5b": "swiss-ai/Apertus-v1.1-0.5B-Instruct",
+    "qwen-2.5-7b": "unsloth/Qwen2.5-7B-Instruct-bnb-4bit",
+    "mistral-7b": "unsloth/mistral-7b-instruct-v0.3-bnb-4bit",
+}
 
-if SKIP_BASE_MODEL_EVAL:
-    print("SKIP_BASE_MODEL_EVAL set - skipping the base-model comparison pass.")
-else:
-    # The GPU script clears the CUDA cache here between passes to avoid an
-    # OOM partway through pass 2 (this happened live during development on
-    # a free T4). XLA's memory allocator has no direct manual-release
-    # equivalent to CUDA's caching allocator, so there's nothing to call
-    # here - if pass 2 runs short on TPU memory, that's a real capacity
-    # issue to address (e.g. smaller EVAL_SAMPLE_PER_SOURCE), not a cache
-    # to clear.
+# Prefers temporarily disabling the LoRA adapter on the already-loaded
+# model (no second download, no extra memory). Confirmed live: this can
+# fail with "'LlamaForCausalLM' object has no attribute 'disable_adapter'"
+# - some unsloth code path can return/transform the model into something
+# that no longer exposes peft's disable_adapter() context manager. Since
+# this script's ENTIRE purpose is exactly the "reload fresh, then run
+# base-only" scenario most likely to trigger that, an unhandled crash here
+# would defeat the script - falls back to loading a genuinely separate,
+# adapter-free base model instance instead, which doesn't depend on
+# guessing which unsloth-internal transformation caused the first
+# approach to fail.
+try:
+    with model.disable_adapter():
+        base_a = run_task_a_eval("BASE model (adapter disabled)")
+        base_b = run_task_b_eval("BASE model (adapter disabled)")
+except Exception as e:
+    print(f"model.disable_adapter() unavailable/failed ({e!r}) - loading a "
+          f"separate, genuinely adapter-free base model instance instead...")
+    _model_choice = globals().get("MODEL_CHOICE", "llama-3.1-8b")
+    _max_seq_length = globals().get("MAX_SEQ_LENGTH", 2048)
+    _base_repo = BASE_MODEL_REPO_BY_CHOICE[_model_choice]
 
-    # Pass 2: the base model, by temporarily disabling the LoRA adapter on
-    # the same loaded model - no second download, no extra memory. This is
-    # the baseline that tells us whether training added value at all.
-    # Guarded so a surprise here can't erase the tuned results already
-    # printed above.
-    try:
-        with model.disable_adapter():
-            base_a = run_task_a_eval("BASE model (adapter disabled)")
-            base_b = run_task_b_eval("BASE model (adapter disabled)")
-    except Exception as e:
-        print(f"Base-model pass failed ({e!r}) - tuned results above still stand. "
-              "Fallback: reload the base model fresh in a new cell and rerun "
-              "run_task_a_eval/run_task_b_eval, or share this error.")
+    base_model, base_tokenizer = FastLanguageModel.from_pretrained(
+        model_name=_base_repo,
+        max_seq_length=_max_seq_length,
+        dtype=None,
+        load_in_4bit=True,
+    )
+    FastLanguageModel.for_inference(base_model)
+
+    # generate()/run_task_{a,b}_eval() close over the module-level
+    # `model`/`tokenizer` names, looked up at call time - swap them to the
+    # base model for this pass.
+    model, tokenizer = base_model, base_tokenizer
+    base_a = run_task_a_eval("BASE model (separately loaded, no adapter)")
+    base_b = run_task_b_eval("BASE model (separately loaded, no adapter)")

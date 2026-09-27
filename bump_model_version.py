@@ -1,8 +1,8 @@
 """
 Bumps the Hugging Face model repo version (e.g. "v7" -> "v8") across every
 file in this repo that references it, in one command instead of manually
-hunting through colab/train/gpu/train_model.py, evaluate_model.py,
-evaluate_base_model_only.py, colab/run/run_model.py, and README.md
+hunting through notebooks/train/gpu/train_model.py, evaluate_model.py,
+evaluate_base_model_only.py, serve/notebooks/run_model.py, and README.md
 separately.
 
 Confirmed live this is worth automating: two prior manual bump passes
@@ -20,7 +20,7 @@ Usage:
     python bump_model_version.py v8
     python bump_model_version.py 8          # "v" prefix optional
 
-Auto-detects the CURRENT version from colab/train/gpu/train_model.py's own
+Auto-detects the CURRENT version from notebooks/train/gpu/train_model.py's own
 MODEL_VERSION_DEFAULT line (the canonical source of truth - the actual
 GPU training script that pushes the model), so you never type the old
 version and risk a stale or mistyped one silently no-op-ing.
@@ -49,7 +49,7 @@ import sys
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parent
-CANONICAL_SOURCE = REPO_ROOT / "colab" / "train" / "gpu" / "train_model.py"
+CANONICAL_SOURCE = REPO_ROOT / "notebooks" / "train" / "gpu" / "train_model.py"
 
 DEFAULT_VAR_RE = re.compile(r'(MODEL_VERSION_DEFAULT\s*=\s*")v(\d+)(")')
 LITERAL_RE = re.compile(r"(financial-reasoner-v)(\d+)((?:-tpu)?)")
