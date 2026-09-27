@@ -16,8 +16,7 @@ BUY/SELL templates all use blatant, textbook-obvious signal language
 ("beat consensus by X%", "lowered guidance"), so the model may have learned
 "if the signal isn't textbook-clear, default to HOLD" - a habit that
 costs the most on real headlines, which are almost never phrased that
-plainly. See docs/training-results-analysis.md and docs/dataset-fix-plan.md
-for the full diagnosis.
+plainly.
 
 1. News is formatted as multi-headline blocks - `- [date] headline - Publisher`,
    one per line, several headlines per example - matching exactly what the
@@ -556,9 +555,8 @@ def value_screen_metrics(fnd):
     }
 
 
-# Graded confidence bands, not hard pass/fail cutoffs, matching standard
-# value-investing framing (e.g. P/E < 20 -> high confidence, 20-30 ->
-# medium, >30 -> low/negative). Deliberately only 3 tiers
+# Graded confidence bands, not hard pass/fail cutoffs (e.g. ROE >= 15% ->
+# high confidence, <= 8% -> low, between -> medium). Deliberately only 3 tiers
 # per metric (not a continuous score) since this maps to discrete
 # reasoning LANGUAGE the model can actually learn to reproduce, not a
 # numeric field in the output schema (the model outputs a sentiment label

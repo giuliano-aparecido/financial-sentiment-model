@@ -71,8 +71,8 @@ PR; it's cheap and catches real regressions. For everything else:
   above), run `python bump_model_version.py vN` instead of hand-editing
   each `HF_REPO =`/`MODEL_NAME =` line - it scans the whole repo tree
   rather than a fixed file list, specifically because hand-editing has
-  already missed files outside the "obvious" `gpu/`/`tpu/` set across
-  multiple real version bumps.
+  already missed `colab/run/run_model.py` (outside the "obvious"
+  `gpu/`/`tpu/` set) across multiple real version bumps.
 - If you change anything that affects the instruction/response markers
   used for completion-only loss masking (`train_on_responses_only`'s
   `instruction_part`/`response_part` in `colab/train/gpu/train_model.py`, or
