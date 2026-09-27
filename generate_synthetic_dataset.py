@@ -556,8 +556,9 @@ def value_screen_metrics(fnd):
     }
 
 
-# Graded confidence bands, not hard pass/fail cutoffs - see
-# value-investing-checklist.md's own framing. Deliberately only 3 tiers
+# Graded confidence bands, not hard pass/fail cutoffs, matching standard
+# value-investing framing (e.g. P/E < 20 -> high confidence, 20-30 ->
+# medium, >30 -> low/negative). Deliberately only 3 tiers
 # per metric (not a continuous score) since this maps to discrete
 # reasoning LANGUAGE the model can actually learn to reproduce, not a
 # numeric field in the output schema (the model outputs a sentiment label
