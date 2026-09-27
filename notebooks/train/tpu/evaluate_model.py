@@ -108,6 +108,15 @@ except NameError:
 
     HF_USER = get_secret("HF_USER")
 
+    # Only needed if HF_REPO below is private - broad except since a
+    # never-created (not just ungranted) Secret raises, and this one's
+    # optional by design, same reasoning as MODEL_CHOICE above/MODEL_VERSION
+    # below.
+    try:
+        HF_TOKEN = get_secret("HF_TOKEN")
+    except Exception:
+        HF_TOKEN = None
+
     # MODEL_VERSION_DEFAULT is the git-committed baseline (bumped by
     # bump_model_version.py). Add an OPTIONAL "MODEL_VERSION" Colab/Kaggle
     # Secret to reload a different push ad-hoc, without editing this file.
@@ -129,8 +138,9 @@ except NameError:
     model = AutoPeftModelForCausalLM.from_pretrained(
         HF_REPO,
         torch_dtype=torch.bfloat16,
+        token=HF_TOKEN,
     ).to(xm.xla_device())
-    tokenizer = AutoTokenizer.from_pretrained(HF_REPO)
+    tokenizer = AutoTokenizer.from_pretrained(HF_REPO, token=HF_TOKEN)
 
     # Must match tpu/train_model.py's task_a_prompt/task_b_prompt exactly
     # (see CONTRIBUTING.md's sync rule) - these are separate copies because

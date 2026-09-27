@@ -68,7 +68,7 @@ except NameError:
 
     # Only needed if HF_REPO below is private - broad except since a
     # never-created (not just ungranted) Secret raises, and this one's
-    # optional by design, same reasoning as MODEL_CHOICE/MODEL_VERSION above.
+    # optional by design, same reasoning as MODEL_CHOICE above/MODEL_VERSION below.
     try:
         HF_TOKEN = get_secret("HF_TOKEN")
     except Exception:
