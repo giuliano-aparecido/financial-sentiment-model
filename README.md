@@ -176,12 +176,22 @@ the whole point of pulling them from Colab/Kaggle Secrets instead.
 
 ## Running on RunPod (or any plain GPU box)
 
-`colab/train/gpu/train_model.py` and `evaluate_model.py` work unmodified
-outside Colab/Kaggle too - paste either into a RunPod pod's Jupyter cell,
-or run directly as `python train_model.py` / `python evaluate_model.py`.
-Set the Secrets above (`HF_TOKEN`, `HF_USER`, etc.) as real environment
-variables instead - `export HF_TOKEN=...` before running, or via your
-pod's env-var config. No separate RunPod-specific script to keep in sync.
+`colab/train/gpu/train_model.py` and `evaluate_model.py` work outside
+Colab/Kaggle too - paste either into a RunPod pod's Jupyter cell, or run
+directly as `python train_model.py` / `python evaluate_model.py`. Set the
+Secrets above (`HF_TOKEN`, `HF_USER`, etc.) as real environment variables
+instead - `export HF_TOKEN=...` before running, or via your pod's env-var
+config. Upload the dataset file(s) from Pipeline steps 2-3 into the same
+working directory first (`train_model.py` needs all four; `evaluate_model.py`
+only the two `dataset_val*.jsonl` ones). No separate RunPod-specific script
+to keep in sync.
+
+`evaluate_model.py`'s standalone-script path (`python evaluate_model.py`,
+no notebook) reuses the same reuse-vs-reload check the Colab path always
+used, so it's exercised, known-good logic in a new context.
+`train_model.py`'s standalone-script path is new in this repo - the old
+RunPod copy never supported it - and hasn't been run end to end on real
+hardware yet.
 
 ## Key design decisions
 

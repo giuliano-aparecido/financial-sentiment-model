@@ -421,10 +421,9 @@ tuned_b = run_task_b_eval("FINE-TUNED model")
 # Pass 2 (base model) roughly doubles total eval time (320 generations
 # instead of 160) - worth it the FIRST time you eval a given prompt/schema
 # shape, since without it there's no baseline to tell "65% accuracy" apart
-# from "would have scored 65% doing nothing" (see
-# docs/training-results-analysis.md's "No baseline" section - this pass
-# exists specifically to fix that gap for recommendation accuracy, not just
-# loss). Once you've established that baseline once, it doesn't need
+# from "would have scored 65% doing nothing" - this pass exists
+# specifically to fix that gap for recommendation accuracy, not just loss.
+# Once you've established that baseline once, it doesn't need
 # re-confirming on every subsequent quick-iteration eval - set
 # SKIP_BASE_MODEL_EVAL (Colab/Kaggle Secret or env var, same mechanism as
 # MODEL_CHOICE/MODEL_VERSION) to "1"/"true"/"yes" to skip straight to just

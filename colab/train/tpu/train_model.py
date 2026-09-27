@@ -103,7 +103,7 @@ MODEL_REGISTRY = {
     # one GPU/RunPod actually use.
     "llama-3.1-8b": {
         "repo": None,
-        "blocked_reason": "bf16 8B params is a tight/unsafe fit on a single v5e-1's 16GB HBM alongside LoRA optimizer state and activations - not validated here. Use the GPU or RunPod script instead.",
+        "blocked_reason": "bf16 8B params is a tight/unsafe fit on a single v5e-1's 16GB HBM alongside LoRA optimizer state and activations - not validated here. Use the GPU script instead (also covers RunPod).",
     },
     "apertus-8b": {
         "repo": None,

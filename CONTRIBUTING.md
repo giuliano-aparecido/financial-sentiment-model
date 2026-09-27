@@ -46,11 +46,11 @@ PR; it's cheap and catches real regressions. For everything else:
   `evaluate_base_model_only.py` copies (4 more copies, 6 total), and
   `financial-sentiment-api`'s `app/services/inference.py` (7 total) — a
   mismatch anywhere in that set silently trains or serves a different
-  shape than the others expect. `colab/train/gpu/train_model.py`/
-  `evaluate_model.py` also cover RunPod/plain-GPU-box runs (paste into a
-  notebook cell there, or run directly as a script) - see their own
-  docstrings - so there's no separate RunPod copy to keep in sync. This
-  also covers the
+  shape than the others expect. (`colab/train/gpu/train_model.py`/
+  `evaluate_model.py` also cover RunPod/plain-GPU-box runs - paste into a
+  notebook cell there, or run directly as a script, see their own
+  docstrings - so there's no separate RunPod copy to keep in sync.) The
+  sync requirement also covers the
   `market_data`/`valuation`/`earnings`/`price_context` block FORMATTING
   (not just the outer templates) — the block renderers in
   `generate_synthetic_dataset.py`, `generate_real_dataset.py`, and

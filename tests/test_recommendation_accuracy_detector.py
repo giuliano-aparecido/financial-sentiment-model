@@ -11,9 +11,10 @@ docs/task-b-learned-recommendation-plan.md), so eval instead parses that
 recommendation straight out of the model's JSON and compares it to
 fuse()'s ground truth - RECOMMENDATION_RE is the parsing half of that.
 
-None of those scripts are directly importable: they open with Colab `!pip
-install` magic lines and depend on unsloth/torch/a live loaded model at
-import time. So each test here reads the source file as text and extracts
+None of those scripts are directly importable: they install dependencies
+(via Colab `!pip install` magic or a top-level `subprocess` pip install)
+and depend on unsloth/torch/a live loaded model at import time. So each
+test here reads the source file as text and extracts
 just the RECOMMENDATION_RE line (no external deps beyond the stdlib `re`
 module already used there) - this exercises the REAL regex that ships in
 each file, not a hand-copied re-implementation that could silently drift
