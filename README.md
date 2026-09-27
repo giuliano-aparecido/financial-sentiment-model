@@ -1,5 +1,7 @@
 # Financial Sentiment Model — Training Pipeline
 
+*An experimental project exploring agentic coding workflows with Claude Code.*
+
 Dataset generation, LoRA fine-tuning, and evaluation scripts for the LLM
 that powers [`financial-sentiment-api`](https://github.com/GiulianoAparecido/financial-sentiment-api)'s
 news-sentiment reasoning. Everything here is designed to be pasted into
