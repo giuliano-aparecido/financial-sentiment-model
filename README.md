@@ -53,10 +53,11 @@ either output schema or either prompt structure here, that repo needs a
 matching change (see CONTRIBUTING.md's sync rule).
 
 **Training and running, at a glance:** generate datasets and train via
-the [Pipeline](#pipeline-training) below (Colab, Kaggle, or - see
-[Running on RunPod](#running-on-runpod-or-any-plain-gpu-box) - RunPod/any
-GPU box); once trained, [Serving the model](#serving-the-model) covers how
-`financial-sentiment-api` actually calls it in production.
+the [Pipeline](#pipeline-training) below (Colab, Kaggle, RunPod, or any
+GPU box — see [Running on RunPod](#running-on-runpod-or-any-plain-gpu-box)
+for the RunPod/plain-GPU-box path); once trained,
+[Serving the model](#serving-the-model) covers how `financial-sentiment-api`
+actually calls it in production.
 
 ## Pipeline (training)
 

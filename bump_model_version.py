@@ -49,7 +49,7 @@ import sys
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parent
-CANONICAL_SOURCE = REPO_ROOT / "colab" / "train" / "gpu" / "train_model.py"
+CANONICAL_SOURCE = REPO_ROOT / "notebooks" / "train" / "gpu" / "train_model.py"
 
 DEFAULT_VAR_RE = re.compile(r'(MODEL_VERSION_DEFAULT\s*=\s*")v(\d+)(")')
 LITERAL_RE = re.compile(r"(financial-reasoner-v)(\d+)((?:-tpu)?)")
