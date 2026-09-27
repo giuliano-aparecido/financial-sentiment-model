@@ -2,17 +2,17 @@
 Bumps the Hugging Face model repo version (e.g. "v7" -> "v8") across every
 file in this repo that references it, in one command instead of manually
 hunting through notebooks/train/gpu/train_model.py, evaluate_model.py,
-evaluate_base_model_only.py, notebooks/run/run_model.py, README.md, and
-docs/llm-training-primer.md separately.
+evaluate_base_model_only.py, notebooks/run/run_model.py, and README.md
+separately.
 
 Confirmed live this is worth automating: two prior manual bump passes
 (the original v3 -> v4 rollout, and a later v4 -> v7 catch-up) both missed
-run/run_model.py (still pointing at "v2") and docs/llm-training-primer.md
-(still at "v3") entirely, because neither file was in the "obvious" set
-anyone thought to check by hand - they're not in gpu/ or tpu/, so a search
-scoped to "the training/eval scripts" walks right past them. This script
-scans the WHOLE repo tree instead of a fixed file list, specifically so a
-future file that starts referencing the model name doesn't need this
+run/run_model.py (still pointing at "v2") entirely, because it wasn't in
+the "obvious" set anyone thought to check by hand - it's not in gpu/ or
+tpu/, so a search scoped to "the training/eval scripts" walks right past
+it. This script scans the WHOLE repo tree instead of a fixed file list,
+specifically so a future file that starts referencing the model name
+doesn't need this
 script's own logic updated too - it just needs one of the two string
 shapes below to be present.
 

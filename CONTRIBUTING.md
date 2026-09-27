@@ -63,8 +63,7 @@ PR; it's cheap and catches real regressions. For everything else:
 - `fusion_rules.py` (the deterministic news_reaction + valuation-gap ->
   BUY/SELL/HOLD table) no longer has a synced counterpart in
   `financial-sentiment-api` - Task B's LLM call decides the
-  recommendation itself at inference now (see
-  docs/task-b-learned-recommendation-plan.md), and that sibling repo's
+  recommendation itself at inference now, and that sibling repo's
   `app/services/fusion.py` was deleted once nothing there called it
   anymore. `fusion_rules.py` still lives here, unchanged: it's the only
   place `generate_real_dataset.py`/`generate_synthetic_dataset.py`/
@@ -75,9 +74,8 @@ PR; it's cheap and catches real regressions. For everything else:
   above), run `python bump_model_version.py vN` instead of hand-editing
   each `HF_REPO =`/`MODEL_NAME =` line - it scans the whole repo tree
   rather than a fixed file list, specifically because hand-editing has
-  already missed `run/run_model.py` and `docs/llm-training-primer.md`
-  (both outside the "obvious" `gpu/`/`tpu/` set) across multiple real
-  version bumps.
+  already missed `colab/run/run_model.py` (outside the "obvious"
+  `gpu/`/`tpu/` set) across multiple real version bumps.
 - If you change anything that affects the instruction/response markers
   used for completion-only loss masking (`train_on_responses_only`'s
   `instruction_part`/`response_part` in `notebooks/train/gpu/train_model.py`, or
