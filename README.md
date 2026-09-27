@@ -97,9 +97,10 @@ depending on which free Colab accelerator you're using — pick **one** of
    or this same script crashed partway through on a prior run — training
    already finished and pushed by that point, so there's nothing to
    retrain, just this cell to re-run). Either way needs the
-   `dataset_val*.jsonl` files present on disk. Reports direction accuracy
-   — not loss, see `docs/training-results-analysis.md` for why that
-   distinction matters — split by dataset source and by class, plus a
+   `dataset_val*.jsonl` files present on disk. Reports direction accuracy,
+   not loss — token loss looked like overfitting on the first training
+   run but wasn't measuring the thing that actually matters here — split
+   by dataset source and by class, plus a
    base-model (untrained) comparison so you know how much the fine-tune
    actually helped.
 
@@ -191,8 +192,8 @@ the whole point of pulling them from Colab/Kaggle Secrets instead.
   split, since a random split would leak near-duplicate phrasing into
   validation and produce a flattering, meaningless accuracy number.
 - **Direction accuracy is the metric, not loss.** The first training run's
-  loss curves looked like overfitting but weren't — see
-  `docs/training-results-analysis.md`.
+  loss curves looked like overfitting but weren't measuring what actually
+  mattered.
 - **Completion-only loss masking needs exact tokenizer-matched markers**,
   including incidental whitespace — a mismatched marker silently masks
   100% of the training signal rather than erroring loudly.
@@ -207,18 +208,6 @@ the whole point of pulling them from Colab/Kaggle Secrets instead.
   read a real number instead of hallucinating one. A block that couldn't
   be fetched renders as exactly `Data unavailable.` in both training data
   and production.
-
-## docs/
-
-- `llm-training-primer.md` — a from-zero explanation of what every part of
-  `colab/train/gpu/train_model.py` does, for anyone reading this without an ML
-  background. Written against the GPU/unsloth path; `colab/train/tpu/train_model.py`
-  swaps the same conceptual steps onto a different toolchain (see the
-  "GPU vs TPU" section above).
-- `training-results-analysis.md` — why the first training run's loss
-  curves were misleading, and what to measure instead.
-- `dataset-fix-plan.md` — the diagnosis and fix plan for the real-data
-  accuracy gap found during evaluation.
 
 ## License
 
