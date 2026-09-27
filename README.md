@@ -69,7 +69,7 @@ actually calls it in production.
 in Colab, Kaggle, or RunPod's Jupyter, set the secrets/env vars its first
 cell lists, and Run All - it clones this repo fresh and runs steps 1-5
 below as its own cells. `evaluate_base_model_only.ipynb` and
-`run/notebooks/serve_model.ipynb` are the same idea for those two flows.
+`serve/notebooks/serve_model.ipynb` are the same idea for those two flows.
 
 Or run each step as its own cell by hand, in order - step 4/5's
 `notebooks/train/gpu/` scripts also run as a plain
@@ -163,15 +163,15 @@ HTTP - pick one, both speak the exact same `{"inputs": ..., "parameters":
 between them is just repointing that model's inference URL (its
 runtime-mutable `/api/update-inference-url` endpoint exists for exactly this):
 
-- **`run/notebooks/run_model.py`** (default) - paste into a Colab/Kaggle/RunPod
-  cell (or just open `run/notebooks/serve_model.ipynb` directly), loads the
+- **`serve/notebooks/run_model.py`** (default) - paste into a Colab/Kaggle/RunPod
+  cell (or just open `serve/notebooks/serve_model.ipynb` directly), loads the
   model on a free/rented GPU, exposes it through an ngrok tunnel. Free on
   Colab, but the tunnel dies with the Colab session (90-minute idle
-  timeout, 12-hour hard cap - see `run/notebooks/keep_running.py`), and
+  timeout, 12-hour hard cap - see `serve/notebooks/keep_running.py`), and
   needs a browser tab open.
-- **`run/modal/serve.py`** - deploys to [Modal](https://modal.com) as a
+- **`serve/modal/serve.py`** - deploys to [Modal](https://modal.com) as a
   scale-to-zero serverless GPU function, one app per model
-  (`MODEL_CHOICE=apertus-8b GPU=L4 modal deploy run/modal/serve.py`): no
+  (`MODEL_CHOICE=apertus-8b GPU=L4 modal deploy serve/modal/serve.py`): no
   browser tab, no session limit, but you pay per-second of actual GPU use.
   For occasional personal-project traffic (a handful of requests a day)
   this lands well under Modal's $30/month free credit - see the file's own

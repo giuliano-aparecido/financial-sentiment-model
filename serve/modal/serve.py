@@ -22,8 +22,8 @@ One deploy per model, parameterized by env vars read at `modal deploy` time:
                    confirmed live with apertus-8b (all-NaN logits, every token
                    id 0, empty output). llama-3.1-8b tolerates fp16 on a T4.
 
-    MODEL_CHOICE=apertus-8b GPU=L4 modal deploy run/modal/serve.py
-    MODEL_CHOICE=llama-3.1-8b        modal deploy run/modal/serve.py
+    MODEL_CHOICE=apertus-8b GPU=L4 modal deploy serve/modal/serve.py
+    MODEL_CHOICE=llama-3.1-8b        modal deploy serve/modal/serve.py
 
 Each model gets app financial-sentiment-reasoner-<MODEL> and volume
 financial-sentiment-model-cache-<MODEL>, so one model's traffic, cold starts
@@ -77,7 +77,7 @@ from pydantic import BaseModel
 
 MODEL_CHOICE = os.environ.get("MODEL_CHOICE")
 if not MODEL_CHOICE:
-    raise SystemExit("MODEL_CHOICE is required, e.g.: MODEL_CHOICE=apertus-8b GPU=L4 modal deploy run/modal/serve.py")
+    raise SystemExit("MODEL_CHOICE is required, e.g.: MODEL_CHOICE=apertus-8b GPU=L4 modal deploy serve/modal/serve.py")
 MODEL_VERSION = os.environ.get("MODEL_VERSION", "v1")
 MODEL = os.environ.get("MODEL") or MODEL_CHOICE.split("-", 1)[0]
 GPU = os.environ.get("GPU", "T4")

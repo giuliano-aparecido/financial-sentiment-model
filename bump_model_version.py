@@ -2,7 +2,7 @@
 Bumps the Hugging Face model repo version (e.g. "v7" -> "v8") across every
 file in this repo that references it, in one command instead of manually
 hunting through notebooks/train/gpu/train_model.py, evaluate_model.py,
-evaluate_base_model_only.py, run/notebooks/run_model.py, and README.md
+evaluate_base_model_only.py, serve/notebooks/run_model.py, and README.md
 separately.
 
 Confirmed live this is worth automating: two prior manual bump passes

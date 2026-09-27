@@ -380,7 +380,7 @@ except ImportError as e:
 import fusion_rules
 
 # get_secret() works on both Colab (Secrets, key icon in the left sidebar)
-# and Kaggle (Add-ons -> Secrets) - same pattern the run/notebooks/ serving scripts
+# and Kaggle (Add-ons -> Secrets) - same pattern the serve/notebooks/ serving scripts
 # use for HF_TOKEN/NGROK_AUTH_TOKEN, reused here for GEMINI_API_KEY. Get a
 # free key at https://aistudio.google.com/apikey.
 #
