@@ -1,4 +1,8 @@
-!pip install -q -U transformers peft accelerate
+import subprocess
+import sys
+
+subprocess.check_call([sys.executable, "-m", "pip", "install", "-q", "-U",
+                        "transformers", "peft", "accelerate"])
 
 # Direction-accuracy evaluation - paste as ONE Colab cell. Self-contained:
 # the install above matches tpu/train_model.py's (minus trl/datasets,

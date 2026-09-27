@@ -1,8 +1,15 @@
 # Cell 1: Install packages - identical on Colab and Kaggle, no
 # platform-specific packages here (unsloth needs CUDA, which both
-# platforms' GPU runtimes provide).
+# platforms' GPU runtimes provide). subprocess, not Jupyter `!pip` magic,
+# so this also works via `%run -i` (a SyntaxError under plain `%run`,
+# since a target .py file is executed as plain Python, not through
+# IPython's line-magic transform) or as a standalone `python` script.
 
-!pip install unsloth fastapi uvicorn pyngrok nest-asyncio
+import subprocess
+import sys
+
+subprocess.check_call([sys.executable, "-m", "pip", "install",
+                        "unsloth", "fastapi", "uvicorn", "pyngrok", "nest-asyncio"])
 
 # ===== ADD THIS AT THE END OF CELL 1 =====
 import time

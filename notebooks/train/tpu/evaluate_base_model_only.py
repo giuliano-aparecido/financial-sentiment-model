@@ -1,4 +1,8 @@
-!pip install -q -U transformers peft accelerate
+import subprocess
+import sys
+
+subprocess.check_call([sys.executable, "-m", "pip", "install", "-q", "-U",
+                        "transformers", "peft", "accelerate"])
 
 # Paste as ONE Colab cell. Self-contained, including the install above
 # (matches tpu/train_model.py's, minus trl/datasets which this script
@@ -61,6 +65,14 @@ except NameError:
 
     HF_USER = get_secret("HF_USER")
 
+    # Only needed if HF_REPO below is private - broad except since a
+    # never-created (not just ungranted) Secret raises, and this one's
+    # optional by design, same reasoning as MODEL_CHOICE/MODEL_VERSION above.
+    try:
+        HF_TOKEN = get_secret("HF_TOKEN")
+    except Exception:
+        HF_TOKEN = None
+
     # MODEL_VERSION_DEFAULT is the git-committed baseline (bumped by
     # bump_model_version.py). Add an OPTIONAL "MODEL_VERSION" Colab/Kaggle
     # Secret to reload a different push ad-hoc, without editing this file.
@@ -85,8 +97,9 @@ except NameError:
     model = AutoPeftModelForCausalLM.from_pretrained(
         HF_REPO,
         torch_dtype=torch.bfloat16,
+        token=HF_TOKEN,
     ).to(xm.xla_device())
-    tokenizer = AutoTokenizer.from_pretrained(HF_REPO)
+    tokenizer = AutoTokenizer.from_pretrained(HF_REPO, token=HF_TOKEN)
 
 # unsloth's FastLanguageModel.for_inference(model) has no TPU equivalent
 # (unsloth doesn't support TPU) - plain eval mode is all that's needed.

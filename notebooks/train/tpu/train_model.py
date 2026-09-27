@@ -1,4 +1,8 @@
-!pip install -q -U transformers peft trl accelerate datasets
+import subprocess
+import sys
+
+subprocess.check_call([sys.executable, "-m", "pip", "install", "-q", "-U",
+                        "transformers", "peft", "trl", "accelerate", "datasets"])
 
 # torch_xla is expected to already be present and version-matched in a
 # Colab TPU v5e-1 runtime - pip-installing it separately here risks

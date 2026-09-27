@@ -43,6 +43,14 @@ def get_secret(name):
 
 HF_USER = get_secret("HF_USER")
 
+# Only needed if MODEL_NAME below is private - broad except since a
+# never-created (not just ungranted) Secret raises, and this one's
+# optional by design, same reasoning as MODEL_CHOICE/MODEL_VERSION below.
+try:
+    HF_TOKEN = get_secret("HF_TOKEN")
+except Exception:
+    HF_TOKEN = None
+
 # MODEL_CHOICE_DEFAULT is the git-committed baseline. Add an OPTIONAL
 # "MODEL_CHOICE" Colab/Kaggle Secret to serve a different base-model
 # family ad-hoc, without editing this file - must match whatever
@@ -71,6 +79,7 @@ model, tokenizer = FastLanguageModel.from_pretrained(
     model_name=MODEL_NAME,
     max_seq_length=2048,
     load_in_4bit=True,
+    token=HF_TOKEN,
 )
 FastLanguageModel.for_inference(model)
 
